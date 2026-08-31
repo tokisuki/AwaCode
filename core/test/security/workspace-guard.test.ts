@@ -141,6 +141,60 @@ async function createLinkOrSkip(
   }
 }
 
+test("rejects an embedded drive before listing can inspect an outside sentinel", async (context) => {
+  const workspace = await mkdtemp(join(process.cwd(), ".awacode-guard-drive-workspace-"));
+  temporaryDirectories.push(workspace);
+  const outside = await temporaryDirectory("embedded-drive-sentinel");
+  const outsideTarget = join(outside, "outside-target");
+  const outsideSentinel = join(outside, "outside-sentinel");
+  await mkdir(join(workspace, "inside"), { recursive: true });
+  await mkdir(outsideTarget);
+  if (!await createLinkOrSkip(context, outsideTarget, outsideSentinel, "junction")) {
+    return;
+  }
+  const guard = await WorkspaceGuard.create(workspace);
+  const embeddedOutsidePath = `inside/${outsideSentinel.replaceAll("\\", "/")}`;
+
+  await assert.rejects(guard.resolveListingDirectory(embeddedOutsidePath), (error: unknown) => {
+    assert.ok(error instanceof WorkspaceGuardError);
+    assert.equal(error.code, "invalid_path");
+    return true;
+  });
+});
+
+test("rejects Windows reset and reinterpretation syntax in every relative component", async () => {
+  const workspace = await temporaryDirectory("embedded-windows-syntax");
+  await mkdir(join(workspace, "inside"));
+  const guard = await WorkspaceGuard.create(workspace);
+
+  for (const unsafePath of [
+    "inside/C:/outside",
+    "inside/c:/outside",
+    "inside\\D:\\outside",
+    "inside/e:relative",
+    "inside/file.txt:secret",
+    "inside/file.txt:secret:$DATA",
+    "inside//server/share",
+    "inside\\\\server\\share",
+    "inside/\\\\?\\GLOBALROOT\\Device",
+    "inside/\\\\.\\pipe\\outside",
+    "inside/\\root-reset",
+  ]) {
+    for (const operation of [
+      () => guard.resolveListingDirectory(unsafePath),
+      () => guard.resolveDirectory(unsafePath),
+      () => guard.resolveFile(unsafePath),
+    ]) {
+      await assert.rejects(operation, (error: unknown) => {
+        assert.ok(error instanceof WorkspaceGuardError);
+        assert.equal(error.code, "invalid_path", unsafePath);
+        assert.equal(error.message, "Path must be a safe relative workspace path.");
+        return true;
+      });
+    }
+  }
+});
+
 test("allows internal links but rejects escaping file and directory links", async (context) => {
   const parent = await temporaryDirectory("links");
   const workspace = join(parent, "workspace");

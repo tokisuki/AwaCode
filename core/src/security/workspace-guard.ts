@@ -1,6 +1,6 @@
 import type { BigIntStats, Dir } from "node:fs";
 import { lstat, open, opendir, realpath, stat, type FileHandle } from "node:fs/promises";
-import { posix, relative, resolve, sep, win32 } from "node:path";
+import { join, posix, relative, resolve, sep, win32 } from "node:path";
 
 export type WorkspaceGuardErrorCode =
   | "invalid_workspace"
@@ -80,10 +80,11 @@ function validatedRelativePath(value: string): string {
     throw new WorkspaceGuardError("invalid_path");
   }
   const normalizedSeparators = value.replaceAll("\\", "/");
+  const components = normalizedSeparators.split("/");
   if (
     normalizedSeparators.startsWith("/")
-    || /^[a-zA-Z]:/.test(normalizedSeparators)
-    || normalizedSeparators.split("/").includes("..")
+    || normalizedSeparators.includes("//")
+    || components.some((component) => component === ".." || component.includes(":"))
   ) {
     throw new WorkspaceGuardError("invalid_path");
   }
@@ -135,7 +136,7 @@ export class WorkspaceGuard {
       if (component === "" || component === ".") {
         continue;
       }
-      currentPath = resolve(currentPath, component);
+      currentPath = join(currentPath, component);
       try {
         if ((await lstat(currentPath)).isSymbolicLink()) {
           throw new WorkspaceGuardError("unsafe_symlink");

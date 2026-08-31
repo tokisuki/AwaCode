@@ -254,6 +254,25 @@ test("converts abort and guard failures into stable non-throwing results", async
   assert.doesNotMatch(JSON.stringify(failure), /awacode-list|stack/i);
 });
 
+test("rejects embedded Windows path syntax through list_files", async () => {
+  const workspace = await temporaryDirectory("embedded-windows-syntax");
+  await mkdir(join(workspace, "inside"));
+  const path = "inside/C:/outside";
+
+  const result = await listFilesTool.execute(
+    listFilesTool.validate({ path }),
+    await toolContext(workspace),
+  );
+
+  assert.deepEqual(result, {
+    status: "failure",
+    summary: "Unable to list workspace files.",
+    content: "Path must be a safe relative workspace path.",
+    durationMs: 7,
+    metadata: { path, maxDepth: 4, error: "invalid_path" },
+  });
+});
+
 test("never returns outside entries when a listing directory becomes a junction after resolution", async (context) => {
   const parent = await temporaryDirectory("directory-swap");
   const workspacePath = join(parent, "workspace");

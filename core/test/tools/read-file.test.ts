@@ -206,6 +206,25 @@ test("converts abort, directory, and escaping paths into stable non-throwing res
   }
 });
 
+test("rejects embedded Windows path syntax through read_file", async () => {
+  const workspace = await temporaryDirectory("embedded-windows-syntax");
+  await mkdir(join(workspace, "inside"));
+  const path = "inside/file.txt:secret";
+
+  const result = await readFileTool.execute(
+    readFileTool.validate({ path }),
+    await toolContext(workspace),
+  );
+
+  assert.deepEqual(result, {
+    status: "failure",
+    summary: "Unable to read workspace file.",
+    content: "Path must be a safe relative workspace path.",
+    durationMs: 9,
+    metadata: { path, offsetLine: 1, limitLines: 200, error: "invalid_path" },
+  });
+});
+
 test("never reads outside bytes when an ancestor becomes a junction after resolution", async (context) => {
   const parent = await temporaryDirectory("ancestor-swap");
   const workspacePath = join(parent, "workspace");
