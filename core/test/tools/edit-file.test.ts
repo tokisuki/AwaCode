@@ -283,6 +283,79 @@ test("rechecks the approved digest immediately before replace and removes the pr
   assert.deepEqual(await readdir(workspacePath), ["sample.txt"]);
 });
 
+for (const change of ["rewrite", "swap"] as const) {
+  test(`rejects a ${change} of the temporary snapshot without deleting an unowned replacement`, async () => {
+    const workspacePath = await temporaryDirectory(`changed-temp-${change}`);
+    const targetPath = join(workspacePath, "sample.txt");
+    const temporaryName = `owned-${change}`;
+    const temporaryPath = join(workspacePath, `.awacode-edit-${temporaryName}.tmp`);
+    const attackerContent = `unapproved-${change}`;
+    await writeFile(targetPath, "before old after", "utf8");
+    const context = {
+      workspace: await WorkspaceGuard.create(workspacePath),
+      signal: new AbortController().signal,
+      now: () => 0,
+    };
+    const prepared = await prepareEditFile(
+      editFileTool.validate({ path: "sample.txt", old_text: "old", new_text: "new" }),
+      context,
+    );
+
+    await assert.rejects(
+      applyPreparedEditFile(prepared, context, {
+        createTemporaryName: () => temporaryName,
+        barrier: async () => {
+          if (change === "swap") {
+            await rm(temporaryPath);
+          }
+          await writeFile(temporaryPath, attackerContent, "utf8");
+        },
+      }),
+      (error: unknown) => error instanceof EditFileApplyError
+        && error.code === "temporary_file_changed",
+    );
+
+    assert.equal(await readFile(targetPath, "utf8"), "before old after");
+    if (change === "rewrite") {
+      assert.deepEqual(await readdir(workspacePath), ["sample.txt"]);
+    } else {
+      assert.equal(await readFile(temporaryPath, "utf8"), attackerContent);
+    }
+  });
+}
+
+test("rechecks the temporary snapshot after the replace operation hook", async () => {
+  const workspacePath = await temporaryDirectory("changed-temp-replace-hook");
+  const targetPath = join(workspacePath, "sample.txt");
+  const temporaryPath = join(workspacePath, ".awacode-edit-replace-hook.tmp");
+  await writeFile(targetPath, "before old after", "utf8");
+  const context = {
+    workspace: await WorkspaceGuard.create(workspacePath),
+    signal: new AbortController().signal,
+    now: () => 0,
+  };
+  const prepared = await prepareEditFile(
+    editFileTool.validate({ path: "sample.txt", old_text: "old", new_text: "new" }),
+    context,
+  );
+
+  await assert.rejects(
+    applyPreparedEditFile(prepared, context, {
+      createTemporaryName: () => "replace-hook",
+      async beforeOperation(operation) {
+        if (operation === "replace") {
+          await writeFile(temporaryPath, "unapproved-at-replace", "utf8");
+        }
+      },
+    }),
+    (error: unknown) => error instanceof EditFileApplyError
+      && error.code === "temporary_file_changed",
+  );
+
+  assert.equal(await readFile(targetPath, "utf8"), "before old after");
+  assert.deepEqual(await readdir(workspacePath), ["sample.txt"]);
+});
+
 test("rejects a final-file symlink before approval even when its target stays inside the workspace", async (context) => {
   const workspacePath = await temporaryDirectory("internal-link");
   const targetPath = join(workspacePath, "target.txt");

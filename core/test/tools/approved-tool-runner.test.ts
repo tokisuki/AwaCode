@@ -41,7 +41,11 @@ function identity(id: string, rootPath: string): ProjectIdentity {
   };
 }
 
-async function fixture(label: string, input: unknown) {
+async function fixture(
+  label: string,
+  input: unknown,
+  persisted: { toolName?: string; inputText?: string } = {},
+) {
   const root = await temporaryDirectory(`${label}-data`);
   const workspacePath = await temporaryDirectory(`${label}-workspace`);
   const connection = await openDatabase({ env: { AWACODE_DATA_DIR: root } });
@@ -58,8 +62,8 @@ async function fixture(label: string, input: unknown) {
     toolCalls: [{
       callId: `call-${label}`,
       ordinal: 0,
-      toolName: "edit_file",
-      inputText: JSON.stringify(input),
+      toolName: persisted.toolName ?? "edit_file",
+      inputText: persisted.inputText ?? JSON.stringify(input),
     }],
   });
   return {
@@ -148,6 +152,123 @@ test("persists pending to awaiting_approval to running to success around one app
   assert.deepEqual(stdoutWrites, []);
 });
 
+test("rejects a persisted tool-name mismatch before approval or file access", async () => {
+  const callerInput = { path: "sample.txt", old_text: "old", new_text: "new" };
+  const setup = await fixture("persisted-tool-mismatch", callerInput, {
+    toolName: "read_file",
+    inputText: JSON.stringify({ path: "audit.txt" }),
+  });
+  const targetPath = join(setup.workspacePath, "sample.txt");
+  await writeFile(targetPath, "before old after", "utf8");
+  let requests = 0;
+  const times = [150, 154];
+  try {
+    const result = await executeEditFile({
+      callId: setup.callId,
+      store: setup.store,
+      permissionClient: {
+        async requestPermission() {
+          requests += 1;
+          return "allow_once";
+        },
+      },
+      context: {
+        workspace: setup.workspace,
+        signal: new AbortController().signal,
+        now: () => times.shift() ?? 154,
+      },
+    });
+
+    assert.deepEqual(result, {
+      status: "failure",
+      summary: "Unable to edit workspace file.",
+      content: "Persisted tool call does not match edit_file.",
+      durationMs: 4,
+      metadata: { tool: "edit_file", phase: "preparation", error: "persisted_tool_mismatch" },
+    });
+    assert.equal(requests, 0);
+    assert.equal(await readFile(targetPath, "utf8"), "before old after");
+    assert.deepEqual(setup.store.loadToolCall(setup.callId).result, result);
+  } finally {
+    setup.connection.close();
+  }
+});
+
+test("approves and executes the persisted input rather than independent caller input", async () => {
+  const persistedInput = { path: "sample.txt", old_text: "old", new_text: "persisted" };
+  const callerInput = { path: "sample.txt", old_text: "old", new_text: "caller" };
+  const setup = await fixture("persisted-input", persistedInput);
+  const targetPath = join(setup.workspacePath, "sample.txt");
+  await writeFile(targetPath, "before old after", "utf8");
+  const requests: PermissionRequest[] = [];
+  try {
+    const result = await editFileTool.execute(editFileTool.validate(callerInput), {
+      workspace: setup.workspace,
+      signal: new AbortController().signal,
+      now: () => 175,
+      approvedToolRuntime: {
+        callId: setup.callId,
+        store: setup.store,
+        permissionClient: {
+          async requestPermission(request) {
+            requests.push(request);
+            return "allow_once";
+          },
+        },
+      },
+    });
+
+    assert.equal(result.status, "success");
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0]?.preview.after, "persisted");
+    assert.equal(await readFile(targetPath, "utf8"), "before persisted after");
+    assert.deepEqual(setup.store.loadToolCall(setup.callId).result, result);
+  } finally {
+    setup.connection.close();
+  }
+});
+
+test("persists malformed stored JSON as a stable failure without approval or file access", async () => {
+  const callerInput = { path: "sample.txt", old_text: "old", new_text: "caller" };
+  const setup = await fixture("malformed-persisted-input", callerInput, {
+    inputText: "{not-json",
+  });
+  const targetPath = join(setup.workspacePath, "sample.txt");
+  await writeFile(targetPath, "before old after", "utf8");
+  let requests = 0;
+  const times = [180, 186];
+  try {
+    const result = await executeEditFile({
+      callId: setup.callId,
+      store: setup.store,
+      permissionClient: {
+        async requestPermission() {
+          requests += 1;
+          return "allow_once";
+        },
+      },
+      context: {
+        workspace: setup.workspace,
+        signal: new AbortController().signal,
+        now: () => times.shift() ?? 186,
+      },
+    });
+
+    assert.deepEqual(result, {
+      status: "failure",
+      summary: "Unable to edit workspace file.",
+      content: "Persisted tool input is malformed.",
+      durationMs: 6,
+      metadata: { tool: "edit_file", phase: "preparation", error: "persisted_input_malformed" },
+    });
+    assert.equal(requests, 0);
+    assert.equal(await readFile(targetPath, "utf8"), "before old after");
+    assert.deepEqual(setup.store.loadToolCall(setup.callId).result, result);
+  } finally {
+    setup.connection.close();
+  }
+});
+
 test("persists an explicit deny as the only denied result and never edits", async () => {
   const input = { path: "sample.txt", old_text: "old", new_text: "new" };
   const setup = await fixture("deny", input);
@@ -158,7 +279,6 @@ test("persists an explicit deny as the only denied result and never edits", asyn
   try {
     const result = await executeEditFile({
       callId: setup.callId,
-      input,
       store: setup.store,
       permissionClient: {
         async requestPermission() {
@@ -204,7 +324,6 @@ test("persists validation and preparation failures from pending without requesti
     try {
       const result = await executeEditFile({
         callId: setup.callId,
-        input,
         store: setup.store,
         permissionClient: {
           async requestPermission() {
@@ -233,6 +352,50 @@ test("persists validation and preparation failures from pending without requesti
   }
 });
 
+test("persists cancellation at both preparation barriers as interrupted without approval or write", async () => {
+  for (const barrier of ["file_resolved", "file_opened"] as const) {
+    const input = { path: "sample.txt", old_text: "old", new_text: "new" };
+    const setup = await fixture(`preparation-abort-${barrier}`, input);
+    const targetPath = join(setup.workspacePath, "sample.txt");
+    await writeFile(targetPath, "before old after", "utf8");
+    const controller = new AbortController();
+    let requests = 0;
+    try {
+      const result = await executeEditFile({
+        callId: setup.callId,
+        store: setup.store,
+        permissionClient: {
+          async requestPermission() {
+            requests += 1;
+            return "allow_once";
+          },
+        },
+        context: {
+          workspace: setup.workspace,
+          signal: controller.signal,
+          now: () => 350,
+          async accessBarrier(event) {
+            if (event.kind === barrier) {
+              controller.abort(new Error(`cancel at ${barrier}`));
+            }
+          },
+        },
+      });
+
+      assert.equal(result.status, "interrupted", barrier);
+      assert.equal(result.metadata.error, "cancelled", barrier);
+      assert.equal(result.metadata.phase, "preparation", barrier);
+      assert.equal(requests, 0, barrier);
+      assert.equal(await readFile(targetPath, "utf8"), "before old after", barrier);
+      const stored = setup.store.loadToolCall(setup.callId);
+      assert.equal(stored.status, "interrupted", barrier);
+      assert.deepEqual(stored.result, result, barrier);
+    } finally {
+      setup.connection.close();
+    }
+  }
+});
+
 test("converges timeout, abort, disconnect, and protocol approval failures to interrupted", async () => {
   for (const [label, errorFactory, expectedError] of [
     ["timeout", () => new PermissionTimeoutError(), "approval_timeout"],
@@ -249,7 +412,6 @@ test("converges timeout, abort, disconnect, and protocol approval failures to in
     try {
       const result = await executeEditFile({
         callId: setup.callId,
-        input,
         store: setup.store,
         permissionClient: {
           async requestPermission() {
@@ -300,7 +462,6 @@ test("a losing duplicate runner observes the winner result without a second appr
   };
   const execute = () => executeEditFile({
     callId: setup.callId,
-    input,
     store: setup.store,
     permissionClient,
     context: {
@@ -341,7 +502,6 @@ test("a duplicate preparation-failure CAS loser observes the winner's durable re
   let requests = 0;
   const execute = () => executeEditFile({
     callId: setup.callId,
-    input,
     store: setup.store,
     permissionClient: {
       async requestPermission() {
@@ -397,7 +557,6 @@ test("cancel versus allow returns the competing interrupted result and never wri
   try {
     const running = executeEditFile({
       callId: setup.callId,
-      input,
       store: setup.store,
       permissionClient: {
         async requestPermission() {
@@ -441,7 +600,6 @@ test("recovery versus allow returns the not-started recovery result and never re
   try {
     const running = executeEditFile({
       callId: setup.callId,
-      input,
       store: setup.store,
       permissionClient: {
         async requestPermission() {
@@ -479,7 +637,6 @@ test("persists post-approval file changes as failure and running aborts as inter
     try {
       const result = await executeEditFile({
         callId: setup.callId,
-        input,
         store: setup.store,
         permissionClient: {
           async requestPermission() {

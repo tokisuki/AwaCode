@@ -1,6 +1,6 @@
 import { Buffer } from "node:buffer";
 import { createHash, randomUUID } from "node:crypto";
-import { open, rename, unlink, type FileHandle } from "node:fs/promises";
+import { lstat, open, rename, unlink, type FileHandle } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 import { WorkspaceGuardError } from "../security/workspace-guard.ts";
@@ -11,7 +11,7 @@ import {
   type ToolContext,
   type ToolDefinition,
 } from "./contracts.ts";
-import { runApprovedTool } from "./approved-tool-runner.ts";
+import { ApprovedToolBindingError, runApprovedTool } from "./approved-tool-runner.ts";
 import type { ApprovalInterruptionCode } from "./approved-tool-runner.ts";
 import { PERMISSION_TEXT_PREVIEW_BYTES, type PermissionRequest } from "./permission.ts";
 import type { PermissionClient } from "./permission.ts";
@@ -62,7 +62,11 @@ export interface AppliedEditFile {
   replaceAll: boolean;
 }
 
-export type EditFileApplyErrorCode = "file_changed" | "atomic_replace_failed" | "interrupted";
+export type EditFileApplyErrorCode =
+  | "file_changed"
+  | "temporary_file_changed"
+  | "atomic_replace_failed"
+  | "interrupted";
 
 export class EditFileApplyError extends Error {
   readonly code: EditFileApplyErrorCode;
@@ -93,7 +97,6 @@ export interface ApplyPreparedEditFileOptions {
 
 export interface ExecuteEditFileOptions {
   callId: string;
-  input: unknown;
   store: SessionStore;
   permissionClient: PermissionClient;
   context: ToolContext;
@@ -138,6 +141,16 @@ function replaceExact(text: string, oldText: string, newText: string, replaceAll
 }
 
 function editFileFailure(error: unknown, phase: "preparation" | "execution") {
+  if (error instanceof ApprovedToolBindingError) {
+    return {
+      status: "failure" as const,
+      summary: "Unable to edit workspace file.",
+      content: error.code === "persisted_tool_mismatch"
+        ? "Persisted tool call does not match edit_file."
+        : "Persisted tool input is malformed.",
+      metadata: { tool: "edit_file", phase, error: error.code },
+    };
+  }
   if (error instanceof ToolValidationError) {
     return {
       status: "failure" as const,
@@ -189,7 +202,9 @@ function editFileFailure(error: unknown, phase: "preparation" | "execution") {
       summary: "Unable to edit workspace file.",
       content: error.code === "file_changed"
         ? "The file changed after approval; no replacement was performed."
-        : "Atomic file replacement failed; the original target was preserved.",
+        : error.code === "temporary_file_changed"
+          ? "The prepared replacement changed before use; no replacement was performed."
+          : "Atomic file replacement failed; the original target was preserved.",
       metadata: {
         tool: "edit_file",
         phase,
@@ -303,6 +318,72 @@ async function runAtomicOperation<T>(
   }
 }
 
+function hasIdentity(
+  stats: { dev: bigint; ino: bigint; isFile(): boolean },
+  identity: EditFileIdentity,
+): boolean {
+  return stats.isFile()
+    && stats.dev !== 0n
+    && stats.ino !== 0n
+    && stats.dev === identity.dev
+    && stats.ino === identity.ino;
+}
+
+async function verifyTemporarySnapshot(
+  temporaryPath: string,
+  identity: EditFileIdentity,
+  expectedDigest: string,
+  context: ToolContext,
+): Promise<void> {
+  let handle: FileHandle | undefined;
+  try {
+    throwIfApplyAborted(context.signal);
+    const beforeOpen = await lstat(temporaryPath, { bigint: true });
+    if (!hasIdentity(beforeOpen, identity)) {
+      throw new EditFileApplyError("temporary_file_changed");
+    }
+    handle = await open(temporaryPath, "r");
+    const bytes = await handle.readFile();
+    const openedStats = await handle.stat({ bigint: true });
+    const afterRead = await lstat(temporaryPath, { bigint: true });
+    throwIfApplyAborted(context.signal);
+    if (
+      !hasIdentity(openedStats, identity)
+      || !hasIdentity(afterRead, identity)
+      || createHash("sha256").update(bytes).digest("hex") !== expectedDigest
+    ) {
+      throw new EditFileApplyError("temporary_file_changed");
+    }
+  } catch (error) {
+    if (error instanceof EditFileApplyError) {
+      throw error;
+    }
+    if (context.signal.aborted || (error instanceof Error && error.name === "AbortError")) {
+      throw new EditFileApplyError("interrupted");
+    }
+    throw new EditFileApplyError("temporary_file_changed");
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+async function removeOwnedTemporary(
+  temporaryPath: string,
+  identity: EditFileIdentity | undefined,
+): Promise<void> {
+  if (identity === undefined) {
+    return;
+  }
+  try {
+    const current = await lstat(temporaryPath, { bigint: true });
+    if (hasIdentity(current, identity)) {
+      await unlink(temporaryPath);
+    }
+  } catch {
+    // Cleanup is best-effort; never delete a path whose owned identity cannot be proven.
+  }
+}
+
 export async function prepareEditFile(input: EditFileInput, context: ToolContext): Promise<PreparedEditFile> {
   let handle: FileHandle | undefined;
   try {
@@ -366,6 +447,11 @@ export async function prepareEditFile(input: EditFileInput, context: ToolContext
         },
       },
     };
+  } catch (error) {
+    if (context.signal.aborted) {
+      throw new EditFilePreparationError("interrupted");
+    }
+    throw error;
   } finally {
     await handle?.close().catch(() => undefined);
   }
@@ -378,6 +464,7 @@ export async function applyPreparedEditFile(
 ): Promise<AppliedEditFile> {
   let temporaryHandle: FileHandle | undefined;
   let temporaryPath: string | undefined;
+  let temporaryIdentity: EditFileIdentity | undefined;
   let temporaryCreated = false;
   let replaced = false;
   try {
@@ -388,6 +475,8 @@ export async function applyPreparedEditFile(
       prepared.input.newText,
       prepared.input.replaceAll,
     );
+    const replacementBytes = Buffer.from(replacement, "utf8");
+    const replacementDigest = createHash("sha256").update(replacementBytes).digest("hex");
 
     const name = options.createTemporaryName?.() ?? randomUUID();
     const createdPath = join(dirname(opened.absolutePath), `.awacode-edit-${name}.tmp`);
@@ -396,8 +485,14 @@ export async function applyPreparedEditFile(
       open(createdPath, "wx", prepared.mode & 0o777));
     temporaryHandle = createdHandle;
     temporaryCreated = true;
+    const createdStats = await runAtomicOperation("create", context, options, () =>
+      createdHandle.stat({ bigint: true }));
+    if (!createdStats.isFile() || createdStats.dev === 0n || createdStats.ino === 0n) {
+      throw new EditFileApplyError("atomic_replace_failed", "create");
+    }
+    temporaryIdentity = { dev: createdStats.dev, ino: createdStats.ino };
     await runAtomicOperation("write", context, options, async () => {
-      await createdHandle.writeFile(Buffer.from(replacement, "utf8"));
+      await createdHandle.writeFile(replacementBytes);
       await createdHandle.chmod(prepared.mode & 0o777);
     });
     await runAtomicOperation("sync", context, options, async () => {
@@ -409,8 +504,16 @@ export async function applyPreparedEditFile(
     await options.barrier?.("before_replace");
     const finalSnapshot = await readApprovedSnapshot(prepared, context);
     throwIfApplyAborted(context.signal);
+    const pathToReplace = temporaryPath;
+    const identityToReplace = temporaryIdentity;
     await runAtomicOperation("replace", context, options, async () => {
-      await (options.atomicReplace ?? nodeAtomicReplace).replace(temporaryPath as string, finalSnapshot.absolutePath);
+      await verifyTemporarySnapshot(
+        pathToReplace,
+        identityToReplace,
+        replacementDigest,
+        context,
+      );
+      await (options.atomicReplace ?? nodeAtomicReplace).replace(pathToReplace, finalSnapshot.absolutePath);
     });
     replaced = true;
     return {
@@ -421,7 +524,7 @@ export async function applyPreparedEditFile(
   } finally {
     await temporaryHandle?.close().catch(() => undefined);
     if (temporaryPath !== undefined && temporaryCreated && !replaced) {
-      await unlink(temporaryPath).catch(() => undefined);
+      await removeOwnedTemporary(temporaryPath, temporaryIdentity);
     }
   }
 }
@@ -429,7 +532,6 @@ export async function applyPreparedEditFile(
 export function executeEditFile(options: ExecuteEditFileOptions) {
   return runApprovedTool({
     callId: options.callId,
-    input: options.input,
     store: options.store,
     permissionClient: options.permissionClient,
     context: options.context,
@@ -502,19 +604,13 @@ export const editFileTool: ToolDefinition<EditFileInput> = {
   },
   approval: "write",
   validate: validateEditFileInput,
-  execute(input, context) {
+  execute(_input, context) {
     const runtime = context.approvedToolRuntime;
     if (runtime === undefined) {
       throw new ToolExecutionError();
     }
     return executeEditFile({
       callId: runtime.callId,
-      input: {
-        path: input.path,
-        old_text: input.oldText,
-        new_text: input.newText,
-        replace_all: input.replaceAll,
-      },
       store: runtime.store,
       permissionClient: runtime.permissionClient,
       context,

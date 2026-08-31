@@ -19,6 +19,24 @@ export type ApprovalInterruptionCode =
   | "approval_disconnected"
   | "approval_protocol_failure";
 
+export class ApprovedToolBindingError extends Error {
+  readonly code: "persisted_tool_mismatch" | "persisted_input_malformed";
+
+  constructor(code: ApprovedToolBindingError["code"]) {
+    super("Persisted approved tool call is invalid.");
+    this.name = "ApprovedToolBindingError";
+    this.code = code;
+  }
+}
+
+function parsePersistedInput(inputText: string): unknown {
+  try {
+    return JSON.parse(inputText);
+  } catch {
+    throw new ApprovedToolBindingError("persisted_input_malformed");
+  }
+}
+
 export interface ApprovedToolSpec<TInput, TPrepared> {
   name: string;
   validate(value: unknown): TInput;
@@ -32,7 +50,6 @@ export interface ApprovedToolSpec<TInput, TPrepared> {
 
 export interface ApprovedToolRunOptions<TInput, TPrepared> {
   callId: string;
-  input: unknown;
   store: SessionStore;
   permissionClient: PermissionClient;
   context: ToolContext;
@@ -93,7 +110,11 @@ export async function runApprovedTool<TInput, TPrepared>(
   let input: TInput;
   let prepared: TPrepared;
   try {
-    input = options.tool.validate(options.input);
+    const persistedCall = options.store.loadToolCall(options.callId);
+    if (persistedCall.toolName !== options.tool.name) {
+      throw new ApprovedToolBindingError("persisted_tool_mismatch");
+    }
+    input = options.tool.validate(parsePersistedInput(persistedCall.inputText));
     prepared = await options.tool.prepare(input, options.context);
   } catch (error) {
     const result = complete(options.tool.failed(error, "preparation"));

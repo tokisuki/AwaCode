@@ -11,12 +11,8 @@ if (dataRoot === undefined || workspacePath === undefined || callId === undefine
 const connection = await openDatabase({ env: { AWACODE_DATA_DIR: dataRoot } });
 const store = new SessionStore(connection.db);
 const workspace = await WorkspaceGuard.create(workspacePath);
-const call = store.loadToolCall(callId);
-const input = JSON.parse(call.inputText) as unknown;
-
 await executeEditFile({
   callId,
-  input,
   store,
   permissionClient: {
     async requestPermission() {
