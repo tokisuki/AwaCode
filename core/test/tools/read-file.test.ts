@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -204,4 +204,114 @@ test("converts abort, directory, and escaping paths into stable non-throwing res
     });
     assert.doesNotMatch(JSON.stringify(result), /awacode-read|stack/i);
   }
+});
+
+test("never reads outside bytes when an ancestor becomes a junction after resolution", async (context) => {
+  const parent = await temporaryDirectory("ancestor-swap");
+  const workspacePath = join(parent, "workspace");
+  const insideDirectory = join(workspacePath, "safe");
+  const outsideDirectory = join(parent, "outside");
+  await mkdir(insideDirectory, { recursive: true });
+  await mkdir(outsideDirectory);
+  await writeFile(join(insideDirectory, "data.txt"), "INSIDE", "utf8");
+  await writeFile(join(outsideDirectory, "data.txt"), "OUTSIDE-SECRET", "utf8");
+
+  const workspace = await WorkspaceGuard.create(workspacePath);
+  const resolveFile = workspace.resolveFile.bind(workspace);
+  let swapped = false;
+  Object.defineProperty(workspace, "resolveFile", {
+    configurable: true,
+    value: async (path: string) => {
+      const resolved = await resolveFile(path);
+      if (!swapped) {
+        await rename(insideDirectory, join(workspacePath, "safe-original"));
+        try {
+          await symlink(outsideDirectory, insideDirectory, "junction");
+        } catch (error) {
+          const code = typeof error === "object" && error !== null && "code" in error
+            ? String((error as { code: unknown }).code)
+            : "unknown";
+          if (["EACCES", "EPERM", "UNKNOWN"].includes(code)) {
+            context.skip(`directory links unavailable: ${code}`);
+            return resolved;
+          }
+          throw error;
+        }
+        swapped = true;
+      }
+      return resolved;
+    },
+  });
+  const times = [300, 311];
+  let barrierObserved = false;
+  const toolContextWithBarrier: ToolContext = {
+    workspace,
+    signal: new AbortController().signal,
+    now: () => times.shift() ?? 311,
+    accessBarrier: async (event) => {
+      barrierObserved = true;
+      assert.deepEqual(event, { kind: "file_resolved", path: "safe/data.txt" });
+    },
+  };
+
+  const result = await readFileTool.execute(
+    readFileTool.validate({ path: "safe/data.txt" }),
+    toolContextWithBarrier,
+  );
+
+  assert.equal(swapped, true);
+  assert.equal(barrierObserved, true);
+  assert.equal(result.status, "failure");
+  assert.doesNotMatch(JSON.stringify(result), /OUTSIDE-SECRET|awacode-read-ancestor-swap/i);
+});
+
+test("rejects an opened outside file when the lexical path is restored before post-open validation", async (context) => {
+  const parent = await temporaryDirectory("identity-swap");
+  const workspacePath = join(parent, "workspace");
+  const insideDirectory = join(workspacePath, "safe");
+  const savedInsideDirectory = join(workspacePath, "safe-original");
+  const outsideDirectory = join(parent, "outside");
+  await mkdir(insideDirectory, { recursive: true });
+  await mkdir(outsideDirectory);
+  await writeFile(join(insideDirectory, "data.txt"), "INSIDE", "utf8");
+  await writeFile(join(outsideDirectory, "data.txt"), "OUTSIDE-SECRET", "utf8");
+
+  const observedEvents: string[] = [];
+  const times = [500, 517];
+  const toolContextWithBarrier: ToolContext = {
+    workspace: await WorkspaceGuard.create(workspacePath),
+    signal: new AbortController().signal,
+    now: () => times.shift() ?? 517,
+    accessBarrier: async (event) => {
+      observedEvents.push(event.kind);
+      if (event.kind === "file_resolved") {
+        await rename(insideDirectory, savedInsideDirectory);
+        try {
+          await symlink(outsideDirectory, insideDirectory, "junction");
+        } catch (error) {
+          const code = typeof error === "object" && error !== null && "code" in error
+            ? String((error as { code: unknown }).code)
+            : "unknown";
+          if (["EACCES", "EPERM", "UNKNOWN"].includes(code)) {
+            context.skip(`directory links unavailable: ${code}`);
+            return;
+          }
+          throw error;
+        }
+      } else if (event.kind === "file_opened") {
+        await unlink(insideDirectory);
+        await rename(savedInsideDirectory, insideDirectory);
+      }
+    },
+  };
+
+  const result = await readFileTool.execute(
+    readFileTool.validate({ path: "safe/data.txt" }),
+    toolContextWithBarrier,
+  );
+
+  assert.equal(result.status, "failure");
+  assert.equal(result.metadata.error, "path_changed");
+  assert.deepEqual(observedEvents, ["file_resolved", "file_opened"]);
+  assert.doesNotMatch(JSON.stringify(result), /OUTSIDE-SECRET|awacode-read-identity-swap/i);
 });

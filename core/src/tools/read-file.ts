@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { createReadStream } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
 
 import { WorkspaceGuardError } from "../security/workspace-guard.ts";
 import {
@@ -88,9 +88,22 @@ export const readFileTool: ToolDefinition<ReadFileInput> = {
   async execute(input, context) {
     const startedAt = context.now();
     const durationMs = () => Math.max(0, context.now() - startedAt);
+    let openedHandle: FileHandle | undefined;
     try {
       throwIfAborted(context.signal);
-      const resolved = await context.workspace.resolveFile(input.path);
+      const opened = await context.workspace.openFile(
+        input.path,
+        async (resolved) => {
+          await context.accessBarrier?.({ kind: "file_resolved", path: resolved.relativePath });
+          throwIfAborted(context.signal);
+        },
+        async (resolved) => {
+          await context.accessBarrier?.({ kind: "file_opened", path: resolved.relativePath });
+          throwIfAborted(context.signal);
+        },
+      );
+      openedHandle = opened.handle;
+      const resolved = opened.resolved;
       throwIfAborted(context.signal);
       const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
       const output = new BoundedUtf8Collector();
@@ -161,11 +174,17 @@ export const readFileTool: ToolDefinition<ReadFileInput> = {
         }
       };
 
-      const stream = createReadStream(resolved.absolutePath, { signal: context.signal });
-      for await (const chunk of stream) {
+      const readBuffer = Buffer.allocUnsafe(64 * 1024);
+      let readPosition = 0;
+      while (true) {
         throwIfAborted(context.signal);
-        const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-        originalBytes += bytes.length;
+        const { bytesRead } = await opened.handle.read(readBuffer, 0, readBuffer.length, readPosition);
+        if (bytesRead === 0) {
+          break;
+        }
+        readPosition += bytesRead;
+        originalBytes += bytesRead;
+        const bytes = readBuffer.subarray(0, bytesRead);
         if (bytes.includes(0)) {
           throw new UnsupportedFileError();
         }
@@ -244,6 +263,10 @@ export const readFileTool: ToolDefinition<ReadFileInput> = {
           error: guardedError?.code ?? "filesystem_error",
         },
       };
+    } finally {
+      if (openedHandle !== undefined) {
+        await openedHandle.close().catch(() => undefined);
+      }
     }
   },
 };

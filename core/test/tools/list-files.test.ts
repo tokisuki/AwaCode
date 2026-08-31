@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { Buffer } from "node:buffer";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -120,10 +120,24 @@ test("interprets depth relative to the requested directory and never descends at
   assert.equal(customDepth.content, ["a.txt", "src/", "src/b.ts", "src/nested/", "z.txt"].join("\n"));
 });
 
+test("orders traversal by final emitted keys including the directory slash", async () => {
+  const workspace = await temporaryDirectory("emitted-order");
+  await mkdir(join(workspace, "a"));
+  await writeFile(join(workspace, "a", "z.txt"), "z", "utf8");
+  await writeFile(join(workspace, "a-0.txt"), "dash", "utf8");
+
+  const result = await listFilesTool.execute(listFilesTool.validate({}), await toolContext(workspace));
+
+  assert.equal(result.content, ["a-0.txt", "a/", "a/z.txt"].join("\n"));
+});
+
 test("stops deterministically at 2,000 entries and reports the independent entry cap", async () => {
   const workspace = await temporaryDirectory("entry-cap");
-  await Promise.all(Array.from({ length: 2_001 }, (_, index) =>
-    writeFile(join(workspace, `item-${String(index).padStart(4, "0")}.txt`), "", "utf8")));
+  await mkdir(join(workspace, "a"));
+  await writeFile(join(workspace, "a", "z.txt"), "", "utf8");
+  await writeFile(join(workspace, "a-0.txt"), "", "utf8");
+  await Promise.all(Array.from({ length: 1_998 }, (_, index) =>
+    writeFile(join(workspace, `z-${String(index).padStart(4, "0")}.txt`), "", "utf8")));
 
   const result = await listFilesTool.execute(listFilesTool.validate({}), await toolContext(workspace));
   const entries = result.content.split("\n");
@@ -132,8 +146,8 @@ test("stops deterministically at 2,000 entries and reports the independent entry
   assert.equal(result.metadata.entryLimitTruncated, true);
   assert.equal(result.metadata.contentTruncated, false);
   assert.equal(entries.length, 2_000);
-  assert.equal(entries[0], "item-0000.txt");
-  assert.equal(entries.at(-1), "item-1999.txt");
+  assert.deepEqual(entries.slice(0, 3), ["a-0.txt", "a/", "a/z.txt"]);
+  assert.equal(entries.at(-1), "z-1996.txt");
 });
 
 test("applies the 50 KiB content cap independently of the entry cap", async () => {
@@ -178,6 +192,37 @@ test("includes safe directory links without traversing them and omits escaping l
   assert.equal(result.metadata.unsafeSymlinkCount, 1);
 });
 
+test("rejects an explicit listing start whose final or ancestor component is a directory link", async (context) => {
+  const workspace = await temporaryDirectory("linked-start");
+  await mkdir(join(workspace, "real", "nested"), { recursive: true });
+  await writeFile(join(workspace, "real", "nested", "secret.txt"), "inside", "utf8");
+  try {
+    await symlink(join(workspace, "real"), join(workspace, "safe-link"), "junction");
+  } catch (error) {
+    const code = typeof error === "object" && error !== null && "code" in error
+      ? String((error as { code: unknown }).code)
+      : "unknown";
+    if (["EACCES", "EPERM", "UNKNOWN"].includes(code)) {
+      context.skip(`directory links unavailable: ${code}`);
+      return;
+    }
+    throw error;
+  }
+
+  const parentResult = await listFilesTool.execute(listFilesTool.validate({}), await toolContext(workspace));
+  assert.equal(
+    parentResult.content,
+    ["real/", "real/nested/", "real/nested/secret.txt", "safe-link/"].join("\n"),
+  );
+
+  for (const path of ["safe-link", "safe-link/nested"]) {
+    const result = await listFilesTool.execute(listFilesTool.validate({ path }), await toolContext(workspace));
+    assert.equal(result.status, "failure");
+    assert.equal(result.metadata.error, "unsafe_symlink");
+    assert.doesNotMatch(result.content, /secret|inside/i);
+  }
+});
+
 test("converts abort and guard failures into stable non-throwing results", async () => {
   const workspace = await temporaryDirectory("results");
   const controller = new AbortController();
@@ -207,4 +252,62 @@ test("converts abort and guard failures into stable non-throwing results", async
     metadata: { path: "missing-private-name", maxDepth: 4, error: "not_found" },
   });
   assert.doesNotMatch(JSON.stringify(failure), /awacode-list|stack/i);
+});
+
+test("never returns outside entries when a listing directory becomes a junction after resolution", async (context) => {
+  const parent = await temporaryDirectory("directory-swap");
+  const workspacePath = join(parent, "workspace");
+  const insideDirectory = join(workspacePath, "scan");
+  const outsideDirectory = join(parent, "outside");
+  await mkdir(insideDirectory, { recursive: true });
+  await mkdir(outsideDirectory);
+  await writeFile(join(insideDirectory, "inside.txt"), "inside", "utf8");
+  await writeFile(join(outsideDirectory, "OUTSIDE-SECRET.txt"), "secret", "utf8");
+
+  const workspace = await WorkspaceGuard.create(workspacePath);
+  const resolveListingDirectory = workspace.resolveListingDirectory.bind(workspace);
+  let swapped = false;
+  Object.defineProperty(workspace, "resolveListingDirectory", {
+    configurable: true,
+    value: async (path: string) => {
+      const resolved = await resolveListingDirectory(path);
+      if (!swapped) {
+        await rename(insideDirectory, join(workspacePath, "scan-original"));
+        try {
+          await symlink(outsideDirectory, insideDirectory, "junction");
+        } catch (error) {
+          const code = typeof error === "object" && error !== null && "code" in error
+            ? String((error as { code: unknown }).code)
+            : "unknown";
+          if (["EACCES", "EPERM", "UNKNOWN"].includes(code)) {
+            context.skip(`directory links unavailable: ${code}`);
+            return resolved;
+          }
+          throw error;
+        }
+        swapped = true;
+      }
+      return resolved;
+    },
+  });
+  const times = [400, 413];
+  const observedEvents: string[] = [];
+  const contextWithBarrier: ToolContext = {
+    workspace,
+    signal: new AbortController().signal,
+    now: () => times.shift() ?? 413,
+    accessBarrier: async (event) => {
+      observedEvents.push(`${event.kind}:${event.path}`);
+    },
+  };
+
+  const result = await listFilesTool.execute(
+    listFilesTool.validate({ path: "scan" }),
+    contextWithBarrier,
+  );
+
+  assert.equal(swapped, true);
+  assert.equal(result.status, "failure");
+  assert.doesNotMatch(JSON.stringify(result), /OUTSIDE-SECRET|awacode-list-directory-swap/i);
+  assert.deepEqual(observedEvents, ["directory_resolved:scan", "directory_opened:scan"]);
 });

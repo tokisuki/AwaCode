@@ -1,4 +1,5 @@
-import { realpath, stat } from "node:fs/promises";
+import type { BigIntStats, Dir } from "node:fs";
+import { lstat, open, opendir, realpath, stat, type FileHandle } from "node:fs/promises";
 import { posix, relative, resolve, sep, win32 } from "node:path";
 
 export type WorkspaceGuardErrorCode =
@@ -8,7 +9,9 @@ export type WorkspaceGuardErrorCode =
   | "not_found"
   | "inaccessible"
   | "not_file"
-  | "not_directory";
+  | "not_directory"
+  | "path_changed"
+  | "unsafe_symlink";
 
 const ERROR_MESSAGES: Record<WorkspaceGuardErrorCode, string> = {
   invalid_workspace: "Workspace must be an existing directory.",
@@ -18,6 +21,8 @@ const ERROR_MESSAGES: Record<WorkspaceGuardErrorCode, string> = {
   inaccessible: "Path is not accessible.",
   not_file: "Path is not a regular file.",
   not_directory: "Path is not a directory.",
+  path_changed: "Path changed during guarded access.",
+  unsafe_symlink: "Directory path contains a symbolic link.",
 };
 
 export class WorkspaceGuardError extends Error {
@@ -33,6 +38,22 @@ export class WorkspaceGuardError extends Error {
 export interface ResolvedWorkspacePath {
   absolutePath: string;
   relativePath: string;
+}
+
+export interface OpenedWorkspaceFile {
+  handle: FileHandle;
+  resolved: ResolvedWorkspacePath;
+}
+
+export interface OpenedWorkspaceDirectory {
+  directory: Dir;
+  identityHandle: FileHandle;
+  requestedPath: string;
+  resolved: ResolvedWorkspacePath;
+}
+
+function sameStableIdentity(left: BigIntStats, right: BigIntStats): boolean {
+  return left.ino !== 0n && right.ino !== 0n && left.dev === right.dev && left.ino === right.ino;
 }
 
 export function isPathWithinWorkspace(
@@ -105,6 +126,112 @@ export class WorkspaceGuard {
 
   async resolveDirectory(path: string): Promise<ResolvedWorkspacePath> {
     return this.resolveExisting(path, "directory");
+  }
+
+  async resolveListingDirectory(path: string): Promise<ResolvedWorkspacePath> {
+    const safeRelativePath = validatedRelativePath(path);
+    let currentPath = this.rootPath;
+    for (const component of safeRelativePath.split("/")) {
+      if (component === "" || component === ".") {
+        continue;
+      }
+      currentPath = resolve(currentPath, component);
+      try {
+        if ((await lstat(currentPath)).isSymbolicLink()) {
+          throw new WorkspaceGuardError("unsafe_symlink");
+        }
+      } catch (error) {
+        if (error instanceof WorkspaceGuardError) {
+          throw error;
+        }
+        throw filesystemError(error);
+      }
+    }
+    return this.resolveDirectory(path);
+  }
+
+  async openFile(
+    path: string,
+    afterInitialResolution?: (resolved: ResolvedWorkspacePath) => Promise<void>,
+    afterFileOpen?: (resolved: ResolvedWorkspacePath) => Promise<void>,
+  ): Promise<OpenedWorkspaceFile> {
+    const initial = await this.resolveFile(path);
+    await afterInitialResolution?.(initial);
+    let handle: FileHandle | undefined;
+    try {
+      handle = await open(initial.absolutePath, "r");
+      const openedStat = await handle.stat({ bigint: true });
+      if (!openedStat.isFile()) {
+        throw new WorkspaceGuardError("path_changed");
+      }
+      await afterFileOpen?.(initial);
+      const revalidated = await this.resolveFile(path);
+      const pathStat = await stat(revalidated.absolutePath, { bigint: true });
+      if (!sameStableIdentity(openedStat, pathStat)) {
+        throw new WorkspaceGuardError("path_changed");
+      }
+      return { handle, resolved: revalidated };
+    } catch (error) {
+      if (handle !== undefined) {
+        await handle.close().catch(() => undefined);
+      }
+      if (error instanceof WorkspaceGuardError) {
+        throw error;
+      }
+      throw filesystemError(error);
+    }
+  }
+
+  async openListingDirectory(
+    path: string,
+    afterInitialResolution?: (resolved: ResolvedWorkspacePath) => Promise<void>,
+    afterDirectoryOpen?: (resolved: ResolvedWorkspacePath) => Promise<void>,
+  ): Promise<OpenedWorkspaceDirectory> {
+    const initial = await this.resolveListingDirectory(path);
+    await afterInitialResolution?.(initial);
+    let identityHandle: FileHandle | undefined;
+    let directory: Dir | undefined;
+    try {
+      identityHandle = await open(initial.absolutePath, "r");
+      const openedStat = await identityHandle.stat({ bigint: true });
+      if (!openedStat.isDirectory()) {
+        throw new WorkspaceGuardError("path_changed");
+      }
+      directory = await opendir(initial.absolutePath);
+      await afterDirectoryOpen?.(initial);
+      const opened = { directory, identityHandle, requestedPath: path, resolved: initial };
+      opened.resolved = await this.revalidateOpenedDirectory(opened);
+      return opened;
+    } catch (error) {
+      if (directory !== undefined) {
+        await directory.close().catch(() => undefined);
+      }
+      if (identityHandle !== undefined) {
+        await identityHandle.close().catch(() => undefined);
+      }
+      if (error instanceof WorkspaceGuardError) {
+        throw error;
+      }
+      throw filesystemError(error);
+    }
+  }
+
+  async revalidateOpenedDirectory(opened: OpenedWorkspaceDirectory): Promise<ResolvedWorkspacePath> {
+    const revalidated = await this.resolveListingDirectory(opened.requestedPath);
+    let openedStat: BigIntStats;
+    let pathStat: BigIntStats;
+    try {
+      [openedStat, pathStat] = await Promise.all([
+        opened.identityHandle.stat({ bigint: true }),
+        stat(revalidated.absolutePath, { bigint: true }),
+      ]);
+    } catch (error) {
+      throw filesystemError(error);
+    }
+    if (!openedStat.isDirectory() || !pathStat.isDirectory() || !sameStableIdentity(openedStat, pathStat)) {
+      throw new WorkspaceGuardError("path_changed");
+    }
+    return revalidated;
   }
 
   private async resolveExisting(path: string, expected: "file" | "directory"): Promise<ResolvedWorkspacePath> {

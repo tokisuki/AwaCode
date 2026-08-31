@@ -1,6 +1,3 @@
-import { readdir } from "node:fs/promises";
-import { join } from "node:path";
-
 import { WorkspaceGuardError } from "../security/workspace-guard.ts";
 import {
   assertExactPlainObject,
@@ -56,12 +53,11 @@ export const listFilesTool: ToolDefinition<ListFilesInput> = {
     const durationMs = () => Math.max(0, context.now() - startedAt);
     try {
       throwIfAborted(context.signal);
-      const startingDirectory = await context.workspace.resolveDirectory(input.path);
-      throwIfAborted(context.signal);
       const entries: string[] = [];
       let ignoredCount = 0;
       let unsafeSymlinkCount = 0;
       let entryLimitTruncated = false;
+      let startingRelativePath = input.path;
 
       const addEntry = (entry: string): boolean => {
         if (entries.length === MAX_ENTRIES) {
@@ -72,11 +68,41 @@ export const listFilesTool: ToolDefinition<ListFilesInput> = {
         return true;
       };
 
-      const walk = async (absoluteDirectory: string, relativeDirectory: string, depthRemaining: number): Promise<boolean> => {
-        throwIfAborted(context.signal);
-        const children = await readdir(absoluteDirectory, { withFileTypes: true });
-        throwIfAborted(context.signal);
-        children.sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
+      const walk = async (requestedDirectory: string, depthRemaining: number, starting: boolean): Promise<boolean> => {
+        const opened = await context.workspace.openListingDirectory(
+          requestedDirectory,
+          async (resolved) => {
+            await context.accessBarrier?.({ kind: "directory_resolved", path: resolved.relativePath });
+            throwIfAborted(context.signal);
+          },
+          async (resolved) => {
+            await context.accessBarrier?.({ kind: "directory_opened", path: resolved.relativePath });
+            throwIfAborted(context.signal);
+          },
+        );
+        const children = [];
+        try {
+          throwIfAborted(context.signal);
+          for await (const child of opened.directory) {
+            throwIfAborted(context.signal);
+            children.push(child);
+          }
+          await context.workspace.revalidateOpenedDirectory(opened);
+          throwIfAborted(context.signal);
+        } finally {
+          await opened.directory.close().catch(() => undefined);
+          await opened.identityHandle.close().catch(() => undefined);
+        }
+
+        const relativeDirectory = opened.resolved.relativePath;
+        if (starting) {
+          startingRelativePath = relativeDirectory;
+        }
+        const listedChildren: Array<{
+          descend: boolean;
+          key: string;
+          relativePath: string;
+        }> = [];
         for (const child of children) {
           throwIfAborted(context.signal);
           if (IGNORED_DIRECTORY_NAMES.has(child.name)) {
@@ -88,17 +114,13 @@ export const listFilesTool: ToolDefinition<ListFilesInput> = {
             try {
               await context.workspace.resolveDirectory(relativePath);
               throwIfAborted(context.signal);
-              if (!addEntry(`${relativePath}/`)) {
-                return false;
-              }
+              listedChildren.push({ descend: false, key: `${relativePath}/`, relativePath });
             } catch (error) {
               if (error instanceof WorkspaceGuardError && error.code === "not_directory") {
                 try {
                   await context.workspace.resolveFile(relativePath);
                   throwIfAborted(context.signal);
-                  if (!addEntry(relativePath)) {
-                    return false;
-                  }
+                  listedChildren.push({ descend: false, key: relativePath, relativePath });
                 } catch {
                   unsafeSymlinkCount += 1;
                 }
@@ -109,24 +131,27 @@ export const listFilesTool: ToolDefinition<ListFilesInput> = {
             continue;
           }
           if (child.isDirectory()) {
-            if (!addEntry(`${relativePath}/`)) {
+            listedChildren.push({ descend: true, key: `${relativePath}/`, relativePath });
+          } else {
+            listedChildren.push({ descend: false, key: relativePath, relativePath });
+          }
+        }
+        throwIfAborted(context.signal);
+        listedChildren.sort((left, right) => left.key < right.key ? -1 : left.key > right.key ? 1 : 0);
+        for (const child of listedChildren) {
+          if (!addEntry(child.key)) {
+            return false;
+          }
+          if (child.descend && depthRemaining > 0) {
+            if (!await walk(child.relativePath, depthRemaining - 1, false)) {
               return false;
             }
-            if (depthRemaining > 0) {
-              const guardedChild = await context.workspace.resolveDirectory(relativePath);
-              throwIfAborted(context.signal);
-              if (!await walk(guardedChild.absolutePath, relativePath, depthRemaining - 1)) {
-                return false;
-              }
-            }
-          } else if (!addEntry(relativePath)) {
-            return false;
           }
         }
         return true;
       };
 
-      await walk(startingDirectory.absolutePath, startingDirectory.relativePath, input.maxDepth);
+      await walk(input.path, input.maxDepth, true);
       throwIfAborted(context.signal);
       const content = truncateUtf8Output(entries.join("\n"));
       return {
@@ -135,7 +160,7 @@ export const listFilesTool: ToolDefinition<ListFilesInput> = {
         content: content.text,
         durationMs: durationMs(),
         metadata: {
-          path: startingDirectory.relativePath,
+          path: startingRelativePath,
           maxDepth: input.maxDepth,
           entryCount: entries.length,
           ignoredCount,

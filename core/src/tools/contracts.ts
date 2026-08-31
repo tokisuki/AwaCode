@@ -2,10 +2,16 @@ import type { WorkspaceGuard } from "../security/workspace-guard.ts";
 
 export type ApprovalKind = "none" | "write" | "command";
 
+export interface ToolAccessEvent {
+  kind: "file_resolved" | "file_opened" | "directory_resolved" | "directory_opened";
+  path: string;
+}
+
 export interface ToolContext {
   workspace: WorkspaceGuard;
   signal: AbortSignal;
   now: () => number;
+  accessBarrier?: (event: ToolAccessEvent) => Promise<void>;
 }
 
 export interface ToolResult {
