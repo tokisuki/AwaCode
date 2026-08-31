@@ -2,3 +2,37 @@
 /推免考核题目学生版.md
 /.local/
 .idea/
+
+# Node.js and TypeScript
+**/node_modules/
+**/.npm-cache/
+**/dist/
+**/coverage/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# CMake and Qt
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+Makefile
+*.cmake.user
+*.qtc.user
+*.pro.user
+
+# Demo workspaces and generated test/build artifacts
+demo/workspace/
+demo/.workspace/
+test-results/
+playwright-report/
+*.lcov
+
+# Local environment, authentication, and configuration
+.env*
+auth.json
+config.local.json
+*.local.json

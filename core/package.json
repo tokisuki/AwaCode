@@ -1,0 +1,19 @@
+{
+  "name": "@awacode/core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "C:\\Users\\47643\\.cache\\codex-runtimes\\codex-primary-runtime\\dependencies\\node\\bin\\node.exe ./node_modules/typescript/bin/tsc -p tsconfig.json",
+    "typecheck": "C:\\Users\\47643\\.cache\\codex-runtimes\\codex-primary-runtime\\dependencies\\node\\bin\\node.exe ./node_modules/typescript/bin/tsc --noEmit -p tsconfig.json",
+    "test": "C:\\Users\\47643\\.cache\\codex-runtimes\\codex-primary-runtime\\dependencies\\node\\bin\\node.exe --test test/index.test.ts",
+    "verify": "C:\\Users\\47643\\.cache\\codex-runtimes\\codex-primary-runtime\\dependencies\\node\\bin\\node.exe ./node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && C:\\Users\\47643\\.cache\\codex-runtimes\\codex-primary-runtime\\dependencies\\node\\bin\\node.exe --test test/index.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.8.0"
+  }
+}
