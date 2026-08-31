@@ -384,6 +384,14 @@ async function removeOwnedTemporary(
   }
 }
 
+async function readRegularFileIdentity(handle: FileHandle): Promise<EditFileIdentity | undefined> {
+  const stats = await handle.stat({ bigint: true });
+  if (!stats.isFile() || stats.dev === 0n || stats.ino === 0n) {
+    return undefined;
+  }
+  return { dev: stats.dev, ino: stats.ino };
+}
+
 export async function prepareEditFile(input: EditFileInput, context: ToolContext): Promise<PreparedEditFile> {
   let handle: FileHandle | undefined;
   try {
@@ -481,16 +489,18 @@ export async function applyPreparedEditFile(
     const name = options.createTemporaryName?.() ?? randomUUID();
     const createdPath = join(dirname(opened.absolutePath), `.awacode-edit-${name}.tmp`);
     temporaryPath = createdPath;
-    const createdHandle = await runAtomicOperation("create", context, options, () =>
-      open(createdPath, "wx", prepared.mode & 0o777));
-    temporaryHandle = createdHandle;
-    temporaryCreated = true;
-    const createdStats = await runAtomicOperation("create", context, options, () =>
-      createdHandle.stat({ bigint: true }));
-    if (!createdStats.isFile() || createdStats.dev === 0n || createdStats.ino === 0n) {
-      throw new EditFileApplyError("atomic_replace_failed", "create");
-    }
-    temporaryIdentity = { dev: createdStats.dev, ino: createdStats.ino };
+    const created = await runAtomicOperation("create", context, options, async () => {
+      const handle = await open(createdPath, "wx", prepared.mode & 0o777);
+      temporaryHandle = handle;
+      temporaryCreated = true;
+      const identity = await readRegularFileIdentity(handle);
+      if (identity === undefined) {
+        throw new EditFileApplyError("atomic_replace_failed", "create");
+      }
+      temporaryIdentity = identity;
+      return { handle, identity };
+    });
+    const createdHandle = created.handle;
     await runAtomicOperation("write", context, options, async () => {
       await createdHandle.writeFile(replacementBytes);
       await createdHandle.chmod(prepared.mode & 0o777);
@@ -502,10 +512,9 @@ export async function applyPreparedEditFile(
     temporaryHandle = undefined;
     throwIfApplyAborted(context.signal);
     await options.barrier?.("before_replace");
-    const finalSnapshot = await readApprovedSnapshot(prepared, context);
     throwIfApplyAborted(context.signal);
     const pathToReplace = temporaryPath;
-    const identityToReplace = temporaryIdentity;
+    const identityToReplace = created.identity;
     await runAtomicOperation("replace", context, options, async () => {
       await verifyTemporarySnapshot(
         pathToReplace,
@@ -513,6 +522,8 @@ export async function applyPreparedEditFile(
         replacementDigest,
         context,
       );
+      const finalSnapshot = await readApprovedSnapshot(prepared, context);
+      throwIfApplyAborted(context.signal);
       await (options.atomicReplace ?? nodeAtomicReplace).replace(pathToReplace, finalSnapshot.absolutePath);
     });
     replaced = true;
@@ -522,6 +533,9 @@ export async function applyPreparedEditFile(
       replaceAll: prepared.input.replaceAll,
     };
   } finally {
+    if (temporaryIdentity === undefined && temporaryHandle !== undefined) {
+      temporaryIdentity = await readRegularFileIdentity(temporaryHandle).catch(() => undefined);
+    }
     await temporaryHandle?.close().catch(() => undefined);
     if (temporaryPath !== undefined && temporaryCreated && !replaced) {
       await removeOwnedTemporary(temporaryPath, temporaryIdentity);

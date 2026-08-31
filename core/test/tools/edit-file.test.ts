@@ -356,6 +356,35 @@ test("rechecks the temporary snapshot after the replace operation hook", async (
   assert.deepEqual(await readdir(workspacePath), ["sample.txt"]);
 });
 
+test("rechecks the target snapshot after the replace operation hook", async () => {
+  const workspacePath = await temporaryDirectory("changed-target-replace-hook");
+  const targetPath = join(workspacePath, "sample.txt");
+  await writeFile(targetPath, "before old after", "utf8");
+  const context = {
+    workspace: await WorkspaceGuard.create(workspacePath),
+    signal: new AbortController().signal,
+    now: () => 0,
+  };
+  const prepared = await prepareEditFile(
+    editFileTool.validate({ path: "sample.txt", old_text: "old", new_text: "new" }),
+    context,
+  );
+
+  await assert.rejects(
+    applyPreparedEditFile(prepared, context, {
+      async beforeOperation(operation) {
+        if (operation === "replace") {
+          await writeFile(targetPath, "changed by replace hook old", "utf8");
+        }
+      },
+    }),
+    (error: unknown) => error instanceof EditFileApplyError && error.code === "file_changed",
+  );
+
+  assert.equal(await readFile(targetPath, "utf8"), "changed by replace hook old");
+  assert.deepEqual(await readdir(workspacePath), ["sample.txt"]);
+});
+
 test("rejects a final-file symlink before approval even when its target stays inside the workspace", async (context) => {
   const workspacePath = await temporaryDirectory("internal-link");
   const targetPath = join(workspacePath, "target.txt");
@@ -413,6 +442,91 @@ test("exclusive temp creation never deletes a colliding file it did not create",
   assert.equal(await readFile(targetPath, "utf8"), "before old after");
   assert.equal(await readFile(collisionPath, "utf8"), "belongs to another operation");
 });
+
+for (const secondHookEffect of ["throw", "cancel"] as const) {
+  test(`captures temp ownership in one create operation when a repeated hook would ${secondHookEffect}`, async () => {
+    const workspacePath = await temporaryDirectory(`single-create-${secondHookEffect}`);
+    const targetPath = join(workspacePath, "sample.txt");
+    await writeFile(targetPath, "before old after", "utf8");
+    const controller = new AbortController();
+    const context = {
+      workspace: await WorkspaceGuard.create(workspacePath),
+      signal: controller.signal,
+      now: () => 0,
+    };
+    const prepared = await prepareEditFile(
+      editFileTool.validate({ path: "sample.txt", old_text: "old", new_text: "new" }),
+      context,
+    );
+    let createHooks = 0;
+
+    const outcome = await applyPreparedEditFile(prepared, context, {
+      createTemporaryName: () => `single-${secondHookEffect}`,
+      beforeOperation(operation) {
+        if (operation === "create") {
+          createHooks += 1;
+          if (createHooks === 2) {
+            if (secondHookEffect === "cancel") {
+              controller.abort(new Error("cancelled during repeated create hook"));
+            } else {
+              throw new Error("failed during repeated create hook");
+            }
+          }
+        }
+      },
+    }).then(
+      (value) => ({ value }),
+      (error: unknown) => ({ error }),
+    );
+
+    assert.deepEqual(await readdir(workspacePath), ["sample.txt"]);
+    assert.equal(createHooks, 1);
+    assert.ok("value" in outcome);
+    assert.equal(await readFile(targetPath, "utf8"), "before new after");
+  });
+}
+
+for (const firstHookEffect of ["throw", "cancel"] as const) {
+  test(`a ${firstHookEffect} in the single create hook fails before ownership begins without a leak`, async () => {
+    const workspacePath = await temporaryDirectory(`first-create-${firstHookEffect}`);
+    const targetPath = join(workspacePath, "sample.txt");
+    await writeFile(targetPath, "before old after", "utf8");
+    const controller = new AbortController();
+    const context = {
+      workspace: await WorkspaceGuard.create(workspacePath),
+      signal: controller.signal,
+      now: () => 0,
+    };
+    const prepared = await prepareEditFile(
+      editFileTool.validate({ path: "sample.txt", old_text: "old", new_text: "new" }),
+      context,
+    );
+    let createHooks = 0;
+
+    await assert.rejects(
+      applyPreparedEditFile(prepared, context, {
+        createTemporaryName: () => `first-${firstHookEffect}`,
+        beforeOperation(operation) {
+          if (operation === "create") {
+            createHooks += 1;
+            if (firstHookEffect === "cancel") {
+              controller.abort(new Error("cancelled before create"));
+            } else {
+              throw new Error("failed before create");
+            }
+          }
+        },
+      }),
+      (error: unknown) => error instanceof EditFileApplyError
+        && error.code === (firstHookEffect === "cancel" ? "interrupted" : "atomic_replace_failed")
+        && (firstHookEffect === "cancel" || error.operation === "create"),
+    );
+
+    assert.equal(createHooks, 1);
+    assert.deepEqual(await readdir(workspacePath), ["sample.txt"]);
+    assert.equal(await readFile(targetPath, "utf8"), "before old after");
+  });
+}
 
 test("injected write, sync, and replace failures preserve the target and leak no temp files", async () => {
   for (const operation of ["write", "sync", "replace"] as const) {
