@@ -7,6 +7,7 @@ import test from "node:test";
 import {
   acquireMigrationLock,
   canonicalDatabaseKey,
+  migrationLockRetryDelayMs,
   type MigrationLock,
 } from "../../src/persistence/migration-lock.ts";
 
@@ -41,6 +42,13 @@ function platformKey(path: string): string {
 
 test.after(async () => {
   await Promise.all(temporaryDirectories.map((directory) => rm(directory, { recursive: true, force: true })));
+});
+
+test("migration lock retry delay grows from a small yield and caps at 100 ms", () => {
+  assert.deepEqual(
+    [1, 2, 3, 4, 5, 6, 7, 100].map(migrationLockRetryDelayMs),
+    [5, 10, 20, 40, 80, 100, 100, 100],
+  );
 });
 
 test("canonical database keys preserve a nonexistent suffix below the nearest physical ancestor", async () => {

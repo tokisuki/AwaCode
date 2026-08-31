@@ -25,6 +25,7 @@ export interface OpenDatabaseOptions extends DataPathOptions {
     afterSnapshotClassification?(): void | Promise<void>;
     beforeBackupPublish?(temporaryPath: string): void | Promise<void>;
     migrationLockBusy?(): void | Promise<void>;
+    migrationLockRetryWait?(attempt: number): Promise<void>;
   };
 }
 
@@ -262,6 +263,9 @@ export async function openDatabase(options: OpenDatabaseOptions = {}): Promise<D
     ...(options.testHooks?.migrationLockBusy === undefined
       ? {}
       : { onBusy: options.testHooks.migrationLockBusy }),
+    ...(options.testHooks?.migrationLockRetryWait === undefined
+      ? {}
+      : { waitBeforeRetry: options.testHooks.migrationLockRetryWait }),
   });
 
   try {

@@ -13,6 +13,8 @@ export interface MigrationLockOptions {
   onBusy?(): void | Promise<void>;
   /** @internal Deterministic queue observation used only by lock tests. */
   onProcessMutexQueued?(waiting: boolean): void | Promise<void>;
+  /** @internal Deterministic retry barrier used only by real-process tests. */
+  waitBeforeRetry?(attempt: number): Promise<void>;
 }
 
 const processMutexTails = new Map<string, Promise<void>>();
@@ -94,8 +96,15 @@ function isBusyError(error: unknown): boolean {
     && error.errcode === 5;
 }
 
-function yieldToEventLoop(): Promise<void> {
-  return new Promise((resolveYield) => setImmediate(resolveYield));
+export function migrationLockRetryDelayMs(attempt: number): number {
+  if (!Number.isSafeInteger(attempt) || attempt < 1) {
+    throw new RangeError("migration lock retry attempt must be a positive integer");
+  }
+  return Math.min(5 * (2 ** Math.min(attempt - 1, 5)), 100);
+}
+
+function waitBeforeMigrationLockRetry(attempt: number): Promise<void> {
+  return new Promise((resolveWait) => setTimeout(resolveWait, migrationLockRetryDelayMs(attempt)));
 }
 
 export async function acquireMigrationLock(
@@ -110,6 +119,7 @@ export async function acquireMigrationLock(
   const lockDirectory = resolve(tmpdir(), "awacode-migration-locks");
   try {
     await mkdir(lockDirectory, { recursive: true });
+    let busyAttempts = 0;
     for (;;) {
       const lock = new DatabaseSync(resolve(lockDirectory, lockName(canonicalKey)));
       try {
@@ -143,8 +153,9 @@ export async function acquireMigrationLock(
         if (!isBusyError(error)) {
           throw error;
         }
+        busyAttempts += 1;
         await options.onBusy?.();
-        await yieldToEventLoop();
+        await (options.waitBeforeRetry ?? waitBeforeMigrationLockRetry)(busyAttempts);
       }
     }
   } catch (error) {

@@ -1,6 +1,4 @@
 import assert from "node:assert/strict";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { once } from "node:events";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,6 +9,10 @@ import {
   SessionStore,
   StoreNotFoundError,
 } from "../../src/persistence/session-store.ts";
+import {
+  disposeChildChannels,
+  spawnChildChannel,
+} from "../support/child-process.ts";
 import type { ProjectIdentity } from "../../src/project/project-identity.ts";
 
 const temporaryDirectories: string[] = [];
@@ -217,50 +219,6 @@ function cleanEnvironment(): NodeJS.ProcessEnv {
     !/(?:TOKEN|SECRET|PASSWORD|API_KEY|ACCESS_KEY|PRIVATE_KEY|OPENAI|ANTHROPIC|AZURE|AWS)/i.test(name)));
 }
 
-function lineReader(child: ChildProcessWithoutNullStreams): { next(): Promise<string> } {
-  const lines: string[] = [];
-  const waiters: Array<{ resolve(line: string): void; reject(error: Error): void }> = [];
-  const diagnostics: Buffer[] = [];
-  let partial = "";
-  let terminalError: Error | undefined;
-  child.stderr.on("data", (chunk: Buffer) => diagnostics.push(Buffer.from(chunk)));
-  child.stdout.on("data", (chunk: Buffer) => {
-    partial += chunk.toString("utf8");
-    let newline = partial.indexOf("\n");
-    while (newline >= 0) {
-      const line = partial.slice(0, newline).replace(/\r$/, "");
-      partial = partial.slice(newline + 1);
-      const waiter = waiters.shift();
-      if (waiter === undefined) {
-        lines.push(line);
-      } else {
-        waiter.resolve(line);
-      }
-      newline = partial.indexOf("\n");
-    }
-  });
-  child.once("exit", (code, signal) => {
-    terminalError = new Error(
-      `message inserter exited before its next line (code=${String(code)}, signal=${String(signal)}): ${Buffer.concat(diagnostics).toString("utf8")}`,
-    );
-    for (const waiter of waiters.splice(0)) {
-      waiter.reject(terminalError);
-    }
-  });
-  return {
-    next() {
-      const line = lines.shift();
-      if (line !== undefined) {
-        return Promise.resolve(line);
-      }
-      if (terminalError !== undefined) {
-        return Promise.reject(terminalError);
-      }
-      return new Promise<string>((resolve, reject) => waiters.push({ resolve, reject }));
-    },
-  };
-}
-
 test("two store processes released together allocate distinct message sequences", async () => {
   const root = await dataRoot("message-race");
   const setupConnection = await openDatabase({ env: { AWACODE_DATA_DIR: root } });
@@ -271,16 +229,14 @@ test("two store processes released together allocate distinct message sequences"
 
   const fixture = join(import.meta.dirname, "..", "..", "test-fixtures", "message-insert-child.ts");
   const channels = ["left", "right"].map((marker) => {
-    const child = spawn(process.execPath, [fixture, root, "session-race", marker], {
+    const channel = spawnChildChannel(process.execPath, [fixture, root, "session-race", marker], {
       env: cleanEnvironment(),
-      stdio: ["pipe", "pipe", "pipe"],
     });
-    const reader = lineReader(child);
-    return { child, reader, ready: reader.next(), exited: once(child, "exit") };
+    return { ...channel, ready: channel.lines.nextLine() };
   });
   try {
     assert.deepEqual(await Promise.all(channels.map((channel) => channel.ready)), ["READY", "READY"]);
-    const results = channels.map((channel) => channel.reader.next());
+    const results = channels.map((channel) => channel.lines.nextLine());
     for (const channel of channels) {
       channel.child.stdin.end("GO\n");
     }
@@ -292,11 +248,7 @@ test("two store processes released together allocate distinct message sequences"
       [0, 0],
     );
   } finally {
-    for (const channel of channels) {
-      if (channel.child.exitCode === null) {
-        channel.child.kill();
-      }
-    }
+    await disposeChildChannels(channels, "message-insert child cleanup");
   }
 
   const verifiedConnection = await openDatabase({ env: { AWACODE_DATA_DIR: root } });

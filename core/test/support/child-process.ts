@@ -1,15 +1,35 @@
-import type { ChildProcessWithoutNullStreams } from "node:child_process";
-import { once } from "node:events";
+import {
+  execFile,
+  spawn,
+  type ChildProcessWithoutNullStreams,
+  type SpawnOptionsWithoutStdio,
+} from "node:child_process";
+import { resolve } from "node:path";
 
 export interface ChildLineReader {
   nextLine(timeoutMs?: number): Promise<string>;
   close(): void;
 }
 
+export type ChildExit = [code: number | null, signal: NodeJS.Signals | null];
+
 export interface ChildChannel {
-  child: ChildProcessWithoutNullStreams;
-  lines: ChildLineReader;
-  exited: Promise<[number | null, NodeJS.Signals | null]>;
+  readonly child: ChildProcessWithoutNullStreams;
+  readonly lines: ChildLineReader;
+  readonly exited: Promise<ChildExit>;
+  readonly closed: Promise<ChildExit>;
+  readonly processGroup: boolean;
+  isClosed(): boolean;
+  disposeListeners(): void;
+}
+
+export interface ChildChannelOptions {
+  processGroup?: boolean;
+}
+
+export interface ChildTerminationOptions {
+  gracefulTimeoutMs?: number;
+  forceTimeoutMs?: number;
 }
 
 export function childLineReader(child: ChildProcessWithoutNullStreams): ChildLineReader {
@@ -22,9 +42,26 @@ export function childLineReader(child: ChildProcessWithoutNullStreams): ChildLin
   const diagnostics: Buffer[] = [];
   let partial = "";
   let terminalError: Error | undefined;
-  let closed = false;
+  let disposed = false;
 
+  const rejectWaiters = (error: Error) => {
+    for (const waiter of waiters.splice(0)) {
+      clearTimeout(waiter.timeout);
+      waiter.reject(error);
+    }
+  };
+  const finishStdout = (detail: string) => {
+    if (terminalError !== undefined) {
+      return;
+    }
+    const incomplete = partial.length === 0 ? "" : `; incomplete stdout: ${JSON.stringify(partial)}`;
+    terminalError = new Error(
+      `child stdout ${detail} before its next line${incomplete}: ${Buffer.concat(diagnostics).toString("utf8")}`,
+    );
+    rejectWaiters(terminalError);
+  };
   const onStderr = (chunk: Buffer) => diagnostics.push(Buffer.from(chunk));
+  const onStderrError = (error: Error) => diagnostics.push(Buffer.from(error.message));
   const onStdout = (chunk: Buffer) => {
     partial += chunk.toString("utf8");
     let newline = partial.indexOf("\n");
@@ -41,18 +78,15 @@ export function childLineReader(child: ChildProcessWithoutNullStreams): ChildLin
       newline = partial.indexOf("\n");
     }
   };
-  const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
-    terminalError = new Error(
-      `initializer exited before its next line (code=${String(code)}, signal=${String(signal)}): ${Buffer.concat(diagnostics).toString("utf8")}`,
-    );
-    for (const waiter of waiters.splice(0)) {
-      clearTimeout(waiter.timeout);
-      waiter.reject(terminalError);
-    }
-  };
+  const onStdoutEnd = () => finishStdout("ended");
+  const onStdoutClose = () => finishStdout("closed");
+  const onStdoutError = (error: Error) => finishStdout(`failed (${error.message})`);
   child.stderr.on("data", onStderr);
+  child.stderr.on("error", onStderrError);
   child.stdout.on("data", onStdout);
-  child.once("exit", onExit);
+  child.stdout.once("end", onStdoutEnd);
+  child.stdout.once("close", onStdoutClose);
+  child.stdout.once("error", onStdoutError);
 
   return {
     nextLine(timeoutMs = 5000) {
@@ -72,38 +106,90 @@ export function childLineReader(child: ChildProcessWithoutNullStreams): ChildLin
             if (index >= 0) {
               waiters.splice(index, 1);
             }
-            rejectLine(new Error(`initializer did not emit its next line within ${timeoutMs} ms`));
+            rejectLine(new Error(`child did not emit its next line within ${timeoutMs} ms`));
           }, timeoutMs),
         };
         waiters.push(waiter);
       });
     },
     close() {
-      if (closed) {
+      if (disposed) {
         return;
       }
-      closed = true;
+      disposed = true;
       child.stderr.off("data", onStderr);
+      child.stderr.off("error", onStderrError);
       child.stdout.off("data", onStdout);
-      child.off("exit", onExit);
+      child.stdout.off("end", onStdoutEnd);
+      child.stdout.off("close", onStdoutClose);
+      child.stdout.off("error", onStdoutError);
       terminalError = new Error("child line reader closed");
-      for (const waiter of waiters.splice(0)) {
-        clearTimeout(waiter.timeout);
-        waiter.reject(terminalError);
-      }
+      rejectWaiters(terminalError);
     },
   };
 }
 
-export function createChildChannel(child: ChildProcessWithoutNullStreams): ChildChannel {
+export function createChildChannel(
+  child: ChildProcessWithoutNullStreams,
+  options: ChildChannelOptions = {},
+): ChildChannel {
+  const lines = childLineReader(child);
+  let resolveExit = (_result: ChildExit) => {};
+  let resolveClose = (_result: ChildExit) => {};
+  let closed = false;
+  let disposed = false;
+  const exited = new Promise<ChildExit>((resolveExited) => {
+    resolveExit = resolveExited;
+  });
+  const closePromise = new Promise<ChildExit>((resolveClosed) => {
+    resolveClose = resolveClosed;
+  });
+  const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+    resolveExit([code, signal]);
+  };
+  const onClose = (code: number | null, signal: NodeJS.Signals | null) => {
+    closed = true;
+    resolveClose([code, signal]);
+  };
+  const onError = () => {
+    // A failed spawn is followed by close; this listener prevents an unhandled error event.
+  };
+  child.once("exit", onExit);
+  child.once("close", onClose);
+  child.on("error", onError);
+
   return {
     child,
-    lines: childLineReader(child),
-    exited: once(child, "exit").then(([code, signal]) => [
-      code as number | null,
-      signal as NodeJS.Signals | null,
-    ]),
+    lines,
+    exited,
+    closed: closePromise,
+    processGroup: options.processGroup ?? false,
+    isClosed: () => closed,
+    disposeListeners() {
+      if (disposed) {
+        return;
+      }
+      disposed = true;
+      lines.close();
+      child.off("exit", onExit);
+      child.off("close", onClose);
+      child.off("error", onError);
+    },
   };
+}
+
+export function spawnChildChannel(
+  command: string,
+  args: readonly string[],
+  options: SpawnOptionsWithoutStdio = {},
+): ChildChannel {
+  const processGroup = process.platform !== "win32";
+  const child = spawn(command, [...args], {
+    ...options,
+    detached: processGroup,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  return createChildChannel(child, { processGroup });
 }
 
 export async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
@@ -122,22 +208,122 @@ export async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, lab
   }
 }
 
+function timeoutValue(value: number | undefined, fallback: number, name: string): number {
+  const timeout = value ?? fallback;
+  if (!Number.isFinite(timeout) || timeout < 0) {
+    throw new RangeError(`${name} must be a finite non-negative number`);
+  }
+  return timeout;
+}
+
+function windowsTaskkill(pid: number, force: boolean, timeoutMs: number): Promise<boolean> {
+  const systemRoot = process.env.SystemRoot?.trim();
+  const executable = systemRoot === undefined || systemRoot.length === 0
+    ? "taskkill.exe"
+    : resolve(systemRoot, "System32", "taskkill.exe");
+  const args = ["/PID", String(pid), "/T", ...(force ? ["/F"] : [])];
+  return new Promise((resolveTaskkill) => {
+    execFile(executable, args, {
+      windowsHide: true,
+      timeout: Math.max(1, timeoutMs),
+    }, (error) => resolveTaskkill(error === null));
+  });
+}
+
+function signalPosix(channel: ChildChannel, signal: NodeJS.Signals): void {
+  const pid = channel.child.pid;
+  if (pid === undefined) {
+    return;
+  }
+  try {
+    if (channel.processGroup) {
+      process.kill(-pid, signal);
+    } else {
+      channel.child.kill(signal);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
+      throw error;
+    }
+  }
+}
+
+function requestTermination(
+  channel: ChildChannel,
+  force: boolean,
+  timeoutMs: number,
+): Promise<void> {
+  const pid = channel.child.pid;
+  if (pid === undefined) {
+    return Promise.resolve();
+  }
+  if (process.platform === "win32") {
+    return windowsTaskkill(pid, force, timeoutMs).then((treeTerminated) => {
+      if (!treeTerminated && !channel.isClosed()) {
+        channel.child.kill(force ? "SIGKILL" : "SIGTERM");
+      }
+    });
+  }
+  signalPosix(channel, force ? "SIGKILL" : "SIGTERM");
+  return Promise.resolve();
+}
+
+async function requestAndConfirmTermination(
+  channel: ChildChannel,
+  force: boolean,
+  timeoutMs: number,
+  label: string,
+): Promise<void> {
+  await requestTermination(channel, force, timeoutMs);
+  await withTimeout(channel.closed, timeoutMs, label);
+}
+
+async function terminateChild(
+  channel: ChildChannel,
+  label: string,
+  options: ChildTerminationOptions,
+): Promise<void> {
+  const gracefulTimeoutMs = timeoutValue(options.gracefulTimeoutMs, 5000, "gracefulTimeoutMs");
+  const forceTimeoutMs = timeoutValue(options.forceTimeoutMs, 5000, "forceTimeoutMs");
+  try {
+    await requestAndConfirmTermination(
+      channel,
+      false,
+      gracefulTimeoutMs,
+      `${label} graceful termination`,
+    );
+  } catch (gracefulError) {
+    try {
+      await requestAndConfirmTermination(
+        channel,
+        true,
+        forceTimeoutMs,
+        `${label} forced termination`,
+      );
+    } catch (forceError) {
+      throw new AggregateError(
+        [gracefulError, forceError],
+        `${label} did not close after graceful and forced termination`,
+      );
+    }
+  }
+}
+
 export async function disposeChildChannel(
   channel: ChildChannel,
   label: string,
-  timeoutMs = 5000,
+  options: ChildTerminationOptions = {},
 ): Promise<void> {
   let failure: unknown;
   try {
-    if (channel.child.exitCode === null) {
-      channel.child.kill();
-      await withTimeout(channel.exited, timeoutMs, label);
+    if (!channel.isClosed()) {
+      await terminateChild(channel, label, options);
     }
   } catch (error) {
     failure = error;
   } finally {
     const cleanupActions = [
-      () => channel.lines.close(),
+      () => channel.disposeListeners(),
       () => channel.child.stdin.destroy(),
       () => channel.child.stdout.destroy(),
       () => channel.child.stderr.destroy(),
@@ -158,10 +344,10 @@ export async function disposeChildChannel(
 export async function disposeChildChannels(
   channels: readonly ChildChannel[],
   label: string,
-  timeoutMs = 5000,
+  options: ChildTerminationOptions = {},
 ): Promise<void> {
   const results = await Promise.allSettled(
-    channels.map((channel) => disposeChildChannel(channel, label, timeoutMs)),
+    channels.map((channel) => disposeChildChannel(channel, label, options)),
   );
   const failures = results.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
   if (failures.length === 1) {

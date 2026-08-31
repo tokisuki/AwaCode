@@ -28,10 +28,18 @@ if (mode === "pause-after-snapshot") {
 }
 if (mode === "report-lock-busy") {
   let reported = false;
+  let waited = false;
   testHooks.migrationLockBusy = () => {
     if (!reported) {
       reported = true;
       process.stdout.write("LOCK_BUSY\n");
+    }
+  };
+  testHooks.migrationLockRetryWait = async (attempt: number) => {
+    if (!waited) {
+      waited = true;
+      process.stdout.write(`LOCK_RETRY_WAIT ${attempt}\n`);
+      await once(process.stdin, "data");
     }
   };
 }

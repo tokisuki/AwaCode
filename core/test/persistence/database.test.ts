@@ -3,16 +3,15 @@ import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { spawn } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
 import { openDatabase } from "../../src/persistence/database.ts";
 import { productionMigrations, type Migration } from "../../src/persistence/migrations.ts";
 import {
-  createChildChannel,
   disposeChildChannel,
   disposeChildChannels,
+  spawnChildChannel,
   withTimeout,
 } from "../support/child-process.ts";
 
@@ -472,11 +471,9 @@ test("two real initializers released together converge on one valid V1 schema", 
   const root = await dataRoot("race");
   const fixture = join(import.meta.dirname, "..", "..", "test-fixtures", "database-initialize-child.ts");
   const channels = [0, 1].map(() => {
-    const child = spawn(process.execPath, [fixture, root], {
+    const channel = spawnChildChannel(process.execPath, [fixture, root], {
       env: childEnvironment(),
-      stdio: ["pipe", "pipe", "pipe"],
     });
-    const channel = createChildChannel(child);
     return { ...channel, ready: channel.lines.nextLine() };
   });
   const children = channels.map((channel) => channel.child);
@@ -513,16 +510,12 @@ test("a cross-process lock retries asynchronously until a crashed holder release
   const root = await dataRoot("held-lock-crash");
   const fixture = join(import.meta.dirname, "..", "..", "test-fixtures", "database-initialize-child.ts");
   const timestamp = "2026-08-31T10:11:12.444Z";
-  const holderChild = spawn(process.execPath, [fixture, root, timestamp, "pause-after-snapshot"], {
+  const holder = spawnChildChannel(process.execPath, [fixture, root, timestamp, "pause-after-snapshot"], {
     env: childEnvironment(),
-    stdio: ["pipe", "pipe", "pipe"],
   });
-  const holder = createChildChannel(holderChild);
-  const waiterChild = spawn(process.execPath, [fixture, root, timestamp, "report-lock-busy"], {
+  const waiter = spawnChildChannel(process.execPath, [fixture, root, timestamp, "report-lock-busy"], {
     env: childEnvironment(),
-    stdio: ["pipe", "pipe", "pipe"],
   });
-  const waiter = createChildChannel(waiterChild);
 
   try {
     assert.equal(await holder.lines.nextLine(), "READY");
@@ -530,12 +523,14 @@ test("a cross-process lock retries asynchronously until a crashed holder release
     assert.equal(await holder.lines.nextLine(), "LOCK_HELD");
 
     assert.equal(await waiter.lines.nextLine(), "READY");
-    waiter.child.stdin.end("GO\n");
+    waiter.child.stdin.write("GO\n");
     assert.equal(await waiter.lines.nextLine(), "LOCK_BUSY");
+    assert.equal(await waiter.lines.nextLine(), "LOCK_RETRY_WAIT 1");
 
     assert.equal(holder.child.kill(), true);
     const [holderCode, holderSignal] = await withTimeout(holder.exited, 5000, "lock holder termination");
     assert.ok(holderCode !== 0 || holderSignal !== null);
+    waiter.child.stdin.end("RETRY\n");
     assert.deepEqual(JSON.parse(await waiter.lines.nextLine()), { version: 1, migrationCount: 1 });
     assert.equal((await withTimeout(waiter.exited, 5000, "lock waiter completion"))[0], 0);
   } finally {
@@ -561,11 +556,10 @@ test("a killed initializer paused after backup validation leaves only a stale te
 
   const timestamp = "2026-08-31T10:11:12.333Z";
   const fixture = join(import.meta.dirname, "..", "..", "test-fixtures", "database-initialize-child.ts");
-  const child = spawn(process.execPath, [fixture, root, timestamp, "pause-before-publish"], {
+  const channel = spawnChildChannel(process.execPath, [fixture, root, timestamp, "pause-before-publish"], {
     env: childEnvironment(),
-    stdio: ["pipe", "pipe", "pipe"],
   });
-  const channel = createChildChannel(child);
+  const { child } = channel;
   const { lines, exited } = channel;
   let validatedArtifact = "";
   try {
@@ -644,11 +638,9 @@ test("two real V0 upgrades share one critical section and never overwrite a coll
 
   const fixture = join(import.meta.dirname, "..", "..", "test-fixtures", "database-initialize-child.ts");
   const channels = [0, 1].map(() => {
-    const child = spawn(process.execPath, [fixture, root, timestamp], {
+    const channel = spawnChildChannel(process.execPath, [fixture, root, timestamp], {
       env: childEnvironment(),
-      stdio: ["pipe", "pipe", "pipe"],
     });
-    const channel = createChildChannel(child);
     return { ...channel, ready: channel.lines.nextLine() };
   });
   try {
