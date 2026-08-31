@@ -1,4 +1,6 @@
 import type { WorkspaceGuard } from "../security/workspace-guard.ts";
+import type { SessionStore } from "../persistence/session-store.ts";
+import type { PermissionClient } from "./permission.ts";
 
 export type ApprovalKind = "none" | "write" | "command";
 
@@ -12,6 +14,11 @@ export interface ToolContext {
   signal: AbortSignal;
   now: () => number;
   accessBarrier?: (event: ToolAccessEvent) => Promise<void>;
+  approvedToolRuntime?: {
+    callId: string;
+    store: SessionStore;
+    permissionClient: PermissionClient;
+  };
 }
 
 export interface ToolResult {

@@ -11,7 +11,8 @@ export type WorkspaceGuardErrorCode =
   | "not_file"
   | "not_directory"
   | "path_changed"
-  | "unsafe_symlink";
+  | "unsafe_symlink"
+  | "unsafe_file_symlink";
 
 const ERROR_MESSAGES: Record<WorkspaceGuardErrorCode, string> = {
   invalid_workspace: "Workspace must be an existing directory.",
@@ -23,6 +24,7 @@ const ERROR_MESSAGES: Record<WorkspaceGuardErrorCode, string> = {
   not_directory: "Path is not a directory.",
   path_changed: "Path changed during guarded access.",
   unsafe_symlink: "Directory path contains a symbolic link.",
+  unsafe_file_symlink: "A file selected for replacement must not be a symbolic link.",
 };
 
 export class WorkspaceGuardError extends Error {
@@ -176,6 +178,39 @@ export class WorkspaceGuard {
       if (handle !== undefined) {
         await handle.close().catch(() => undefined);
       }
+      if (error instanceof WorkspaceGuardError) {
+        throw error;
+      }
+      throw filesystemError(error);
+    }
+  }
+
+  async openFileForReplacement(
+    path: string,
+    afterInitialResolution?: (resolved: ResolvedWorkspacePath) => Promise<void>,
+    afterFileOpen?: (resolved: ResolvedWorkspacePath) => Promise<void>,
+  ): Promise<OpenedWorkspaceFile> {
+    const safeRelativePath = validatedRelativePath(path);
+    const candidate = resolve(this.rootPath, safeRelativePath.split("/").join(sep));
+    await this.resolveFile(path);
+    try {
+      if ((await lstat(candidate)).isSymbolicLink()) {
+        throw new WorkspaceGuardError("unsafe_file_symlink");
+      }
+    } catch (error) {
+      if (error instanceof WorkspaceGuardError) {
+        throw error;
+      }
+      throw filesystemError(error);
+    }
+    const opened = await this.openFile(path, afterInitialResolution, afterFileOpen);
+    try {
+      if ((await lstat(candidate)).isSymbolicLink()) {
+        throw new WorkspaceGuardError("unsafe_file_symlink");
+      }
+      return opened;
+    } catch (error) {
+      await opened.handle.close().catch(() => undefined);
       if (error instanceof WorkspaceGuardError) {
         throw error;
       }
