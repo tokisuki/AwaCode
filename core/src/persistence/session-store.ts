@@ -1,0 +1,383 @@
+import { randomUUID } from "node:crypto";
+import type { DatabaseSync } from "node:sqlite";
+
+import type { ProjectIdentity, ProjectIdentityKind } from "../project/project-identity.ts";
+
+export type SessionStatus = "idle" | "running" | "completed" | "interrupted" | "cancelled" | "error";
+export type MessageRole = "system" | "user" | "assistant" | "tool" | "internal";
+export type MessageStatus = "streaming" | "complete" | "interrupted";
+export type ToolCallStatus =
+  | "pending"
+  | "awaiting_approval"
+  | "running"
+  | "success"
+  | "failure"
+  | "denied"
+  | "interrupted";
+
+export interface ProjectRecord {
+  id: string;
+  identityKind: ProjectIdentityKind;
+  identityValue: string;
+  remote: string | null;
+  rootPath: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface SessionRecord {
+  id: string;
+  projectId: string;
+  title: string;
+  model: unknown | null;
+  status: SessionStatus;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface MessageRecord {
+  id: string;
+  sessionId: string;
+  seq: number;
+  role: MessageRole;
+  kind: string;
+  payload: unknown;
+  status: MessageStatus;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ToolCallRecord {
+  callId: string;
+  sessionId: string;
+  assistantMessageId: string;
+  ordinal: number;
+  toolName: string;
+  inputText: string;
+  status: ToolCallStatus;
+  result: unknown | null;
+  errorText: string | null;
+  createdAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+}
+
+export interface LoadedSession {
+  session: SessionRecord;
+  messages: MessageRecord[];
+  toolCalls: ToolCallRecord[];
+}
+
+export interface InsertMessageInput {
+  sessionId: string;
+  role: MessageRole;
+  kind: string;
+  payload: unknown;
+  status?: MessageStatus;
+}
+
+export interface InsertToolCallInput {
+  callId: string;
+  sessionId: string;
+  assistantMessageId: string;
+  ordinal: number;
+  toolName: string;
+  inputText: string;
+  status?: ToolCallStatus;
+  result?: unknown;
+  errorText?: string;
+  startedAt?: string;
+  finishedAt?: string;
+}
+
+export interface SessionStoreOptions {
+  now?: () => Date;
+  randomUUID?: () => string;
+}
+
+export class StoreNotFoundError extends Error {
+  readonly entity: "project" | "session";
+  readonly id: string;
+
+  constructor(entity: "project" | "session", id: string) {
+    super(`${entity} not found: ${id}`);
+    this.name = "StoreNotFoundError";
+    this.entity = entity;
+    this.id = id;
+  }
+}
+
+function parseJson(value: string | null): unknown | null {
+  return value === null ? null : JSON.parse(value) as unknown;
+}
+
+function stringifyJson(value: unknown): string {
+  const json = JSON.stringify(value);
+  if (json === undefined) {
+    throw new TypeError("value must be JSON serializable");
+  }
+  return json;
+}
+
+function projectRecord(row: Record<string, unknown>): ProjectRecord {
+  return {
+    id: String(row.id),
+    identityKind: String(row.identity_kind) as ProjectIdentityKind,
+    identityValue: String(row.identity_value),
+    remote: row.remote === null ? null : String(row.remote),
+    rootPath: String(row.root_path),
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+  };
+}
+
+function sessionRecord(row: Record<string, unknown>): SessionRecord {
+  return {
+    id: String(row.id),
+    projectId: String(row.project_id),
+    title: String(row.title),
+    model: parseJson(row.model_json === null ? null : String(row.model_json)),
+    status: String(row.status) as SessionStatus,
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+  };
+}
+
+function messageRecord(row: Record<string, unknown>): MessageRecord {
+  return {
+    id: String(row.id),
+    sessionId: String(row.session_id),
+    seq: Number(row.seq),
+    role: String(row.role) as MessageRole,
+    kind: String(row.kind),
+    payload: parseJson(String(row.payload_json)),
+    status: String(row.status) as MessageStatus,
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+  };
+}
+
+function toolCallRecord(row: Record<string, unknown>): ToolCallRecord {
+  return {
+    callId: String(row.call_id),
+    sessionId: String(row.session_id),
+    assistantMessageId: String(row.assistant_message_id),
+    ordinal: Number(row.ordinal),
+    toolName: String(row.tool_name),
+    inputText: String(row.input_text),
+    status: String(row.status) as ToolCallStatus,
+    result: parseJson(row.result_json === null ? null : String(row.result_json)),
+    errorText: row.error_text === null ? null : String(row.error_text),
+    createdAt: String(row.created_at),
+    startedAt: row.started_at === null ? null : String(row.started_at),
+    finishedAt: row.finished_at === null ? null : String(row.finished_at),
+  };
+}
+
+export class SessionStore {
+  private readonly db: DatabaseSync;
+  private readonly currentDate: () => Date;
+  private readonly createId: () => string;
+
+  constructor(db: DatabaseSync, options: SessionStoreOptions = {}) {
+    this.db = db;
+    this.currentDate = options.now ?? (() => new Date());
+    this.createId = options.randomUUID ?? randomUUID;
+  }
+
+  upsertProject(identity: ProjectIdentity): ProjectRecord {
+    const now = this.currentDate().toISOString();
+    this.db.prepare(`
+      INSERT INTO projects
+        (id, identity_kind, identity_value, remote, root_path, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        identity_kind = excluded.identity_kind,
+        identity_value = excluded.identity_value,
+        remote = excluded.remote,
+        root_path = excluded.root_path,
+        updated_at = excluded.updated_at
+    `).run(
+      identity.id,
+      identity.kind,
+      identity.value,
+      identity.remote ?? null,
+      identity.rootPath,
+      now,
+      now,
+    );
+    return this.getProject(identity.id);
+  }
+
+  createSession(projectId: string, title = "New session"): SessionRecord {
+    this.requireProject(projectId);
+    const id = this.createId();
+    const now = this.currentDate().toISOString();
+    this.db.prepare(`
+      INSERT INTO sessions
+        (id, project_id, title, model_json, status, created_at, updated_at)
+      VALUES (?, ?, ?, NULL, 'idle', ?, ?)
+    `).run(id, projectId, title, now, now);
+    return this.getSession(id);
+  }
+
+  listSessions(projectId: string): SessionRecord[] {
+    this.requireProject(projectId);
+    return (this.db.prepare(`
+      SELECT id, project_id, title, model_json, status, created_at, updated_at
+      FROM sessions
+      WHERE project_id = ?
+      ORDER BY updated_at DESC, id DESC
+    `).all(projectId) as unknown as Record<string, unknown>[]).map(sessionRecord);
+  }
+
+  loadSession(sessionId: string): LoadedSession {
+    const session = this.getSession(sessionId);
+    const messages = (this.db.prepare(`
+      SELECT id, session_id, seq, role, kind, payload_json, status, created_at, updated_at
+      FROM messages
+      WHERE session_id = ?
+      ORDER BY seq
+    `).all(sessionId) as unknown as Record<string, unknown>[]).map(messageRecord);
+    const toolCalls = (this.db.prepare(`
+      SELECT
+        tool_calls.call_id,
+        tool_calls.session_id,
+        tool_calls.assistant_message_id,
+        tool_calls.ordinal,
+        tool_calls.tool_name,
+        tool_calls.input_text,
+        tool_calls.status,
+        tool_calls.result_json,
+        tool_calls.error_text,
+        tool_calls.created_at,
+        tool_calls.started_at,
+        tool_calls.finished_at
+      FROM tool_calls
+      JOIN messages ON messages.id = tool_calls.assistant_message_id
+      WHERE tool_calls.session_id = ?
+      ORDER BY messages.seq, tool_calls.ordinal
+    `).all(sessionId) as unknown as Record<string, unknown>[]).map(toolCallRecord);
+    return { session, messages, toolCalls };
+  }
+
+  insertMessage(input: InsertMessageInput): MessageRecord {
+    const id = this.createId();
+    const now = this.currentDate().toISOString();
+    const payloadJson = stringifyJson(input.payload);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.requireSession(input.sessionId);
+      const next = this.db.prepare(`
+        SELECT COALESCE(MAX(seq), 0) + 1 AS seq
+        FROM messages
+        WHERE session_id = ?
+      `).get(input.sessionId) as { seq: number };
+      this.db.prepare(`
+        INSERT INTO messages
+          (id, session_id, seq, role, kind, payload_json, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        id,
+        input.sessionId,
+        next.seq,
+        input.role,
+        input.kind,
+        payloadJson,
+        input.status ?? "complete",
+        now,
+        now,
+      );
+      this.db.prepare("UPDATE sessions SET updated_at = ? WHERE id = ?").run(now, input.sessionId);
+      this.db.exec("COMMIT");
+      return this.getMessage(id);
+    } catch (error) {
+      this.rollback();
+      throw error;
+    }
+  }
+
+  insertToolCall(input: InsertToolCallInput): ToolCallRecord {
+    const now = this.currentDate().toISOString();
+    const resultJson = input.result === undefined ? null : stringifyJson(input.result);
+    this.db.prepare(`
+      INSERT INTO tool_calls
+        (call_id, session_id, assistant_message_id, ordinal, tool_name, input_text, status,
+         result_json, error_text, created_at, started_at, finished_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      input.callId,
+      input.sessionId,
+      input.assistantMessageId,
+      input.ordinal,
+      input.toolName,
+      input.inputText,
+      input.status ?? "pending",
+      resultJson,
+      input.errorText ?? null,
+      now,
+      input.startedAt ?? null,
+      input.finishedAt ?? null,
+    );
+    return this.getToolCall(input.callId);
+  }
+
+  private requireProject(id: string): void {
+    if (this.db.prepare("SELECT id FROM projects WHERE id = ?").get(id) === undefined) {
+      throw new StoreNotFoundError("project", id);
+    }
+  }
+
+  private requireSession(id: string): void {
+    if (this.db.prepare("SELECT id FROM sessions WHERE id = ?").get(id) === undefined) {
+      throw new StoreNotFoundError("session", id);
+    }
+  }
+
+  private getProject(id: string): ProjectRecord {
+    const row = this.db.prepare(`
+      SELECT id, identity_kind, identity_value, remote, root_path, created_at, updated_at
+      FROM projects WHERE id = ?
+    `).get(id) as Record<string, unknown> | undefined;
+    if (row === undefined) {
+      throw new StoreNotFoundError("project", id);
+    }
+    return projectRecord(row);
+  }
+
+  private getSession(id: string): SessionRecord {
+    const row = this.db.prepare(`
+      SELECT id, project_id, title, model_json, status, created_at, updated_at
+      FROM sessions WHERE id = ?
+    `).get(id) as Record<string, unknown> | undefined;
+    if (row === undefined) {
+      throw new StoreNotFoundError("session", id);
+    }
+    return sessionRecord(row);
+  }
+
+  private getMessage(id: string): MessageRecord {
+    const row = this.db.prepare(`
+      SELECT id, session_id, seq, role, kind, payload_json, status, created_at, updated_at
+      FROM messages WHERE id = ?
+    `).get(id) as Record<string, unknown>;
+    return messageRecord(row);
+  }
+
+  private getToolCall(callId: string): ToolCallRecord {
+    const row = this.db.prepare(`
+      SELECT call_id, session_id, assistant_message_id, ordinal, tool_name, input_text, status,
+             result_json, error_text, created_at, started_at, finished_at
+      FROM tool_calls WHERE call_id = ?
+    `).get(callId) as Record<string, unknown>;
+    return toolCallRecord(row);
+  }
+
+  private rollback(): void {
+    try {
+      this.db.exec("ROLLBACK");
+    } catch {
+      // Preserve the operation failure when SQLite already ended the transaction.
+    }
+  }
+}

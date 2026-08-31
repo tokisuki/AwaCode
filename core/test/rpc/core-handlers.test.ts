@@ -1,0 +1,149 @@
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, normalize } from "node:path";
+import test from "node:test";
+
+import { openDatabase } from "../../src/persistence/database.ts";
+import { SessionStore } from "../../src/persistence/session-store.ts";
+import { JsonRpcPeer } from "../../src/protocol/rpc-peer.ts";
+import { RpcFault } from "../../src/protocol/json-rpc.ts";
+import { registerCoreHandlers } from "../../src/rpc/core-handlers.ts";
+
+const temporaryDirectories: string[] = [];
+
+async function temporaryDirectory(label: string): Promise<string> {
+  const directory = await mkdtemp(join(tmpdir(), `awacode-rpc-${label}-`));
+  temporaryDirectories.push(directory);
+  return directory;
+}
+
+function cleanEnvironment(): NodeJS.ProcessEnv {
+  return {
+    ...Object.fromEntries(Object.entries(process.env).filter(([name]) =>
+      !/(?:TOKEN|SECRET|PASSWORD|API_KEY|ACCESS_KEY|PRIVATE_KEY|OPENAI|ANTHROPIC|AZURE|AWS)/i.test(name))),
+    GIT_TERMINAL_PROMPT: "0",
+  };
+}
+
+function connectedPeers(): { client: JsonRpcPeer; server: JsonRpcPeer } {
+  let client!: JsonRpcPeer;
+  let server!: JsonRpcPeer;
+  client = new JsonRpcPeer({ idPrefix: "ui-", send: (message) => server.receive(message) });
+  server = new JsonRpcPeer({ idPrefix: "core-", send: (message) => client.receive(message) });
+  return { client, server };
+}
+
+test.after(async () => {
+  await Promise.all(temporaryDirectories.map((directory) => rm(directory, { recursive: true, force: true })));
+});
+
+test("real JsonRpcPeer calls receive the literal results of all five core handlers", async () => {
+  const dataRoot = await temporaryDirectory("data");
+  const workspace = await temporaryDirectory("workspace");
+  const normalizedWorkspace = normalize(await realpath(workspace));
+  const identityPath = process.platform === "win32" ? normalizedWorkspace.toLowerCase() : normalizedWorkspace;
+  const projectId = createHash("sha256").update(`path:${identityPath}`).digest("hex");
+  const connection = await openDatabase({ env: { AWACODE_DATA_DIR: dataRoot } });
+  const store = new SessionStore(connection.db, {
+    now: () => new Date("2026-08-31T07:08:09.123Z"),
+    randomUUID: () => "session-rpc-1",
+  });
+  const { client, server } = connectedPeers();
+  registerCoreHandlers(server, { store, projectIdentityOptions: { env: cleanEnvironment() } });
+
+  try {
+    assert.deepEqual(await client.request("core/hello", {}), {
+      coreVersion: "0.1.0",
+      databaseVersion: 1,
+      configured: false,
+      interruptedCount: 0,
+    });
+    assert.deepEqual(await client.request("workspace/set", { workspace }), {
+      workspace: normalizedWorkspace,
+      projectId,
+    });
+    const created = {
+      id: "session-rpc-1",
+      projectId,
+      title: "RPC session",
+      model: null,
+      status: "idle",
+      createdAt: "2026-08-31T07:08:09.123Z",
+      updatedAt: "2026-08-31T07:08:09.123Z",
+    };
+    assert.deepEqual(await client.request("session/create", { projectId, title: "RPC session" }), created);
+    assert.deepEqual(await client.request("session/list", { projectId }), [created]);
+    assert.deepEqual(await client.request("session/load", { sessionId: "session-rpc-1" }), {
+      session: created,
+      messages: [],
+      toolCalls: [],
+    });
+  } finally {
+    client.close();
+    server.close();
+    connection.close();
+  }
+});
+
+test("exact parameter validators reject missing, extra, and mistyped fields through the peer", async () => {
+  const dataRoot = await temporaryDirectory("invalid-data");
+  const connection = await openDatabase({ env: { AWACODE_DATA_DIR: dataRoot } });
+  const store = new SessionStore(connection.db);
+  const { client, server } = connectedPeers();
+  registerCoreHandlers(server, { store, projectIdentityOptions: { env: cleanEnvironment() } });
+
+  try {
+    const invalidCalls: Array<[string, unknown]> = [
+      ["core/hello", undefined],
+      ["core/hello", { extra: true }],
+      ["workspace/set", { workspace: 7 }],
+      ["session/list", { projectId: "missing", extra: true }],
+      ["session/create", { projectId: "missing", title: null }],
+      ["session/load", []],
+    ];
+    for (const [method, params] of invalidCalls) {
+      await assert.rejects(
+        params === undefined ? client.request(method) : client.request(method, params),
+        (error: unknown) => error instanceof RpcFault && error.code === -32602 && error.message === "Invalid params",
+      );
+    }
+  } finally {
+    client.close();
+    server.close();
+    connection.close();
+  }
+});
+
+test("missing workspaces, projects, and sessions become application not-found faults", async () => {
+  const dataRoot = await temporaryDirectory("missing-data");
+  const missingWorkspace = join(await temporaryDirectory("missing-parent"), "absent");
+  const connection = await openDatabase({ env: { AWACODE_DATA_DIR: dataRoot } });
+  const store = new SessionStore(connection.db);
+  const { client, server } = connectedPeers();
+  registerCoreHandlers(server, { store, projectIdentityOptions: { env: cleanEnvironment() } });
+
+  try {
+    const calls: Array<[string, unknown, string, unknown]> = [
+      ["workspace/set", { workspace: missingWorkspace }, "Workspace not found", { workspace: missingWorkspace }],
+      ["session/list", { projectId: "missing-project" }, "Project not found", { projectId: "missing-project" }],
+      ["session/create", { projectId: "missing-project" }, "Project not found", { projectId: "missing-project" }],
+      ["session/load", { sessionId: "missing-session" }, "Session not found", { sessionId: "missing-session" }],
+    ];
+    for (const [method, params, message, data] of calls) {
+      await assert.rejects(
+        client.request(method, params),
+        (error: unknown) =>
+          error instanceof RpcFault
+          && error.code === -32003
+          && error.message === message
+          && assert.deepEqual(error.data, data) === undefined,
+      );
+    }
+  } finally {
+    client.close();
+    server.close();
+    connection.close();
+  }
+});
