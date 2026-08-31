@@ -208,6 +208,14 @@ export async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, lab
   }
 }
 
+export function waitForChildExit(
+  channel: ChildChannel,
+  timeoutMs: number,
+  label: string,
+): Promise<ChildExit> {
+  return withTimeout(channel.exited, timeoutMs, label);
+}
+
 function timeoutValue(value: number | undefined, fallback: number, name: string): number {
   const timeout = value ?? fallback;
   if (!Number.isFinite(timeout) || timeout < 0) {

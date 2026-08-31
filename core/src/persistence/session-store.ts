@@ -90,16 +90,63 @@ export interface InsertToolCallInput {
   finishedAt?: string;
 }
 
+export interface PendingToolCallInput {
+  callId: string;
+  ordinal: number;
+  toolName: string;
+  inputText: string;
+}
+
+export interface InsertAssistantMessageWithToolCallsInput {
+  sessionId: string;
+  kind: string;
+  payload: unknown;
+  toolCalls: readonly PendingToolCallInput[];
+}
+
+export interface InsertedAssistantToolCallBlock {
+  message: MessageRecord;
+  toolCalls: ToolCallRecord[];
+}
+
+export interface CompareAndSwapToolCallInput {
+  callId: string;
+  expectedStatus: ToolCallStatus;
+  status: ToolCallStatus;
+  result?: unknown;
+  errorText?: string;
+}
+
+export interface CompareAndSwapToolCallResult {
+  applied: boolean;
+  call: ToolCallRecord;
+}
+
+export interface InterruptedStateResults {
+  notStarted: unknown;
+  outcomeUnknown: unknown;
+  notStartedErrorText: string;
+  outcomeUnknownErrorText: string;
+}
+
+export interface RecoverySummary {
+  interruptedCount: number;
+  sessionsInterrupted: number;
+  messagesInterrupted: number;
+  notStartedCallsInterrupted: number;
+  outcomeUnknownCallsInterrupted: number;
+}
+
 export interface SessionStoreOptions {
   now?: () => Date;
   randomUUID?: () => string;
 }
 
 export class StoreNotFoundError extends Error {
-  readonly entity: "project" | "session";
+  readonly entity: "project" | "session" | "tool_call";
   readonly id: string;
 
-  constructor(entity: "project" | "session", id: string) {
+  constructor(entity: "project" | "session" | "tool_call", id: string) {
     super(`${entity} not found: ${id}`);
     this.name = "StoreNotFoundError";
     this.entity = entity;
@@ -297,7 +344,86 @@ export class SessionStore {
     }
   }
 
+  insertAssistantMessageWithToolCalls(
+    input: InsertAssistantMessageWithToolCallsInput,
+  ): InsertedAssistantToolCallBlock {
+    const id = this.createId();
+    const now = this.currentDate().toISOString();
+    const payloadJson = stringifyJson(input.payload);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.requireSession(input.sessionId);
+      const next = this.db.prepare(`
+        SELECT COALESCE(MAX(seq), 0) + 1 AS seq
+        FROM messages
+        WHERE session_id = ?
+      `).get(input.sessionId) as { seq: number };
+      this.db.prepare(`
+        INSERT INTO messages
+          (id, session_id, seq, role, kind, payload_json, status, created_at, updated_at)
+        VALUES (?, ?, ?, 'assistant', ?, ?, 'complete', ?, ?)
+      `).run(id, input.sessionId, next.seq, input.kind, payloadJson, now, now);
+
+      const insertCall = this.db.prepare(`
+        INSERT INTO tool_calls
+          (call_id, session_id, assistant_message_id, ordinal, tool_name, input_text, status,
+           result_json, error_text, created_at, started_at, finished_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, NULL, NULL)
+      `);
+      for (const [index, toolCall] of input.toolCalls.entries()) {
+        if (!Number.isSafeInteger(toolCall.ordinal) || toolCall.ordinal !== index) {
+          throw new RangeError("tool-call ordinals must be unique and zero-based in array order");
+        }
+        insertCall.run(
+          toolCall.callId,
+          input.sessionId,
+          id,
+          toolCall.ordinal,
+          toolCall.toolName,
+          toolCall.inputText,
+          now,
+        );
+      }
+      this.db.prepare("UPDATE sessions SET updated_at = ? WHERE id = ?").run(now, input.sessionId);
+      this.db.exec("COMMIT");
+      return {
+        message: this.getMessage(id),
+        toolCalls: input.toolCalls.map(({ callId }) => this.getToolCall(callId)),
+      };
+    } catch (error) {
+      this.rollback();
+      throw error;
+    }
+  }
+
   insertToolCall(input: InsertToolCallInput): ToolCallRecord {
+    const assistant = this.db.prepare(`
+      SELECT session_id, role, status
+      FROM messages
+      WHERE id = ?
+    `).get(input.assistantMessageId) as {
+      session_id: string;
+      role: MessageRole;
+      status: MessageStatus;
+    } | undefined;
+    if (
+      assistant === undefined
+      || assistant.session_id !== input.sessionId
+      || assistant.role !== "assistant"
+      || assistant.status !== "complete"
+    ) {
+      throw new TypeError("tool calls must reference a complete assistant message in the same session");
+    }
+    const terminal = input.status === "success"
+      || input.status === "failure"
+      || input.status === "denied"
+      || input.status === "interrupted";
+    if (terminal && (input.result === undefined || input.result === null)) {
+      throw new TypeError("terminal tool calls require a non-null JSON result");
+    }
+    if (!terminal && input.result !== undefined) {
+      throw new TypeError("nonterminal tool calls cannot have a result");
+    }
     const now = this.currentDate().toISOString();
     const resultJson = input.result === undefined ? null : stringifyJson(input.result);
     this.db.prepare(`
@@ -320,6 +446,83 @@ export class SessionStore {
       input.finishedAt ?? null,
     );
     return this.getToolCall(input.callId);
+  }
+
+  loadToolCall(callId: string): ToolCallRecord {
+    return this.getToolCall(callId);
+  }
+
+  compareAndSwapToolCall(input: CompareAndSwapToolCallInput): CompareAndSwapToolCallResult {
+    const now = this.currentDate().toISOString();
+    const terminal = input.status === "success"
+      || input.status === "failure"
+      || input.status === "denied"
+      || input.status === "interrupted";
+    const assignments = ["status = ?"];
+    const values: Array<string | null> = [input.status];
+    if (input.status === "running") {
+      assignments.push("started_at = COALESCE(started_at, ?)");
+      values.push(now);
+    }
+    if (terminal) {
+      assignments.push("result_json = ?", "error_text = ?", "finished_at = ?");
+      values.push(stringifyJson(input.result), input.errorText ?? null, now);
+    }
+
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const update = this.db.prepare(`
+        UPDATE tool_calls
+        SET ${assignments.join(", ")}
+        WHERE call_id = ? AND status = ?
+      `).run(...values, input.callId, input.expectedStatus);
+      const call = this.getToolCall(input.callId);
+      this.db.exec("COMMIT");
+      return { applied: update.changes === 1, call };
+    } catch (error) {
+      this.rollback();
+      throw error;
+    }
+  }
+
+  convergeInterruptedState(results: InterruptedStateResults): RecoverySummary {
+    const now = this.currentDate().toISOString();
+    const notStartedJson = stringifyJson(results.notStarted);
+    const outcomeUnknownJson = stringifyJson(results.outcomeUnknown);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const sessionsInterrupted = Number(this.db.prepare(`
+        UPDATE sessions
+        SET status = 'interrupted', updated_at = ?
+        WHERE status = 'running'
+      `).run(now).changes);
+      const messagesInterrupted = Number(this.db.prepare(`
+        UPDATE messages
+        SET status = 'interrupted', updated_at = ?
+        WHERE role = 'assistant' AND status = 'streaming'
+      `).run(now).changes);
+      const notStartedCallsInterrupted = Number(this.db.prepare(`
+        UPDATE tool_calls
+        SET status = 'interrupted', result_json = ?, error_text = ?, finished_at = ?
+        WHERE status IN ('pending', 'awaiting_approval')
+      `).run(notStartedJson, results.notStartedErrorText, now).changes);
+      const outcomeUnknownCallsInterrupted = Number(this.db.prepare(`
+        UPDATE tool_calls
+        SET status = 'interrupted', result_json = ?, error_text = ?, finished_at = ?
+        WHERE status = 'running'
+      `).run(outcomeUnknownJson, results.outcomeUnknownErrorText, now).changes);
+      this.db.exec("COMMIT");
+      return {
+        interruptedCount: notStartedCallsInterrupted + outcomeUnknownCallsInterrupted,
+        sessionsInterrupted,
+        messagesInterrupted,
+        notStartedCallsInterrupted,
+        outcomeUnknownCallsInterrupted,
+      };
+    } catch (error) {
+      this.rollback();
+      throw error;
+    }
   }
 
   private requireProject(id: string): void {
@@ -369,7 +572,10 @@ export class SessionStore {
       SELECT call_id, session_id, assistant_message_id, ordinal, tool_name, input_text, status,
              result_json, error_text, created_at, started_at, finished_at
       FROM tool_calls WHERE call_id = ?
-    `).get(callId) as Record<string, unknown>;
+    `).get(callId) as Record<string, unknown> | undefined;
+    if (row === undefined) {
+      throw new StoreNotFoundError("tool_call", callId);
+    }
     return toolCallRecord(row);
   }
 

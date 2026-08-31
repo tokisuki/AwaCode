@@ -12,6 +12,7 @@ import {
 import {
   disposeChildChannels,
   spawnChildChannel,
+  waitForChildExit,
 } from "../support/child-process.ts";
 import type { ProjectIdentity } from "../../src/project/project-identity.ts";
 
@@ -132,7 +133,7 @@ test("loads messages and tool calls in protocol order after two stores allocate 
       role: "assistant",
       kind: "tool_calls",
       payload: { text: "third" },
-      status: "streaming",
+      status: "complete",
     });
 
     second.insertToolCall({
@@ -162,6 +163,7 @@ test("loads messages and tool calls in protocol order after two stores allocate 
       toolName: "read",
       inputText: "{\"path\":\"a.ts\"}",
       status: "failure",
+      result: { error: "not found" },
       errorText: "not found",
     });
 
@@ -169,7 +171,7 @@ test("loads messages and tool calls in protocol order after two stores allocate 
     assert.deepEqual(loaded.messages.map(({ id, seq, status, payload }) => ({ id, seq, status, payload })), [
       { id: "message-1", seq: 1, status: "complete", payload: { text: "first" } },
       { id: "message-2", seq: 2, status: "complete", payload: { text: "second" } },
-      { id: "message-3", seq: 3, status: "streaming", payload: { text: "third" } },
+      { id: "message-3", seq: 3, status: "complete", payload: { text: "third" } },
     ]);
     assert.deepEqual(loaded.toolCalls.map(({ callId, assistantMessageId, ordinal, result, errorText }) => ({
       callId,
@@ -179,7 +181,8 @@ test("loads messages and tool calls in protocol order after two stores allocate 
       errorText,
     })), [
       {
-        callId: "call-first", assistantMessageId: "message-1", ordinal: 0, result: null, errorText: "not found",
+        callId: "call-first", assistantMessageId: "message-1", ordinal: 0,
+        result: { error: "not found" }, errorText: "not found",
       },
       {
         callId: "call-second", assistantMessageId: "message-1", ordinal: 1, result: { text: "B" }, errorText: null,
@@ -244,7 +247,8 @@ test("two store processes released together allocate distinct message sequences"
     assert.deepEqual(inserted.map(({ seq }) => seq).sort(), [1, 2]);
     assert.deepEqual(inserted.map(({ marker }) => marker).sort(), ["left", "right"]);
     assert.deepEqual(
-      (await Promise.all(channels.map((channel) => channel.exited))).map(([code]) => code),
+      (await Promise.all(channels.map((channel, index) =>
+        waitForChildExit(channel, 5000, `message insert ${index} completion`)))).map(([code]) => code),
       [0, 0],
     );
   } finally {

@@ -10,6 +10,7 @@ import {
   createChildChannel,
   disposeChildChannel,
   disposeChildChannels,
+  waitForChildExit,
   withTimeout,
 } from "../support/child-process.ts";
 
@@ -66,6 +67,26 @@ test("fast children drain their final stdout line after exit is observed", async
     assert.deepEqual(lines, Array.from({ length: 16 }, (_value, index) => `FINAL ${index}`));
   } finally {
     await disposeChildChannels(channels, "fast-child cleanup");
+  }
+});
+
+test("waiting for a child exit is bounded after its final line while a handle remains live", async () => {
+  const child = spawn(process.execPath, [
+    "-e",
+    "process.stdout.write('FINAL\\n'); setInterval(() => {}, 1000)",
+  ], {
+    detached: process.platform !== "win32",
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const channel = createChildChannel(child, { processGroup: process.platform !== "win32" });
+  try {
+    assert.equal(await channel.lines.nextLine(), "FINAL");
+    await assert.rejects(
+      waitForChildExit(channel, 50, "live-handle child"),
+      /live-handle child timed out after 50 ms/,
+    );
+  } finally {
+    await disposeChildChannel(channel, "live-handle child cleanup");
   }
 });
 

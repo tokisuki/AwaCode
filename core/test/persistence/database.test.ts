@@ -12,6 +12,7 @@ import {
   disposeChildChannel,
   disposeChildChannels,
   spawnChildChannel,
+  waitForChildExit,
   withTimeout,
 } from "../support/child-process.ts";
 
@@ -490,7 +491,8 @@ test("two real initializers released together converge on one valid V1 schema", 
       { version: 1, migrationCount: 1 },
       { version: 1, migrationCount: 1 },
     ]);
-    const exits = await Promise.all(channels.map((channel) => channel.exited));
+    const exits = await Promise.all(channels.map((channel, index) =>
+      waitForChildExit(channel, 5000, `initializer ${index} completion`)));
     assert.deepEqual(exits.map(([code]) => code), [0, 0]);
   } finally {
     await disposeChildChannels(channels, "initializer cleanup");
@@ -654,7 +656,8 @@ test("two real V0 upgrades share one critical section and never overwrite a coll
       { version: 1, migrationCount: 1 },
     ]);
     assert.deepEqual(
-      (await Promise.all(channels.map((channel) => channel.exited))).map(([code]) => code),
+      (await Promise.all(channels.map((channel, index) =>
+        waitForChildExit(channel, 5000, `empty initializer ${index} completion`)))).map(([code]) => code),
       [0, 0],
     );
   } finally {
