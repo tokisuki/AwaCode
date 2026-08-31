@@ -53,6 +53,10 @@ export class NdjsonDecoder {
       return [];
     }
 
+    if (this.lineBytes.length > this.maxLineBytes) {
+      this.fail("line_too_long");
+    }
+
     const text = this.decodeBytes(this.lineBytes);
     this.lineBytes.length = 0;
     if (text.trim().length === 0) {

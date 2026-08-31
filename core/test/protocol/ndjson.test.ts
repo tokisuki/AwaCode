@@ -96,6 +96,32 @@ test("rejects a non-whitespace final line but ignores whitespace at EOF", () => 
   assert.deepEqual(whitespace.end(), []);
 });
 
+test("rejects an EOF line whose trailing CR makes it exceed the byte limit", () => {
+  const decoder = new NdjsonDecoder(3);
+  let error: unknown;
+
+  assert.deepEqual(decoder.push(encoder.encode("abc\r")), []);
+  assert.throws(
+    () => decoder.end(),
+    (caught: unknown) => {
+      error = caught;
+      return caught instanceof NdjsonProtocolError && caught.code === "line_too_long";
+    },
+  );
+  assert.throws(() => decoder.push(encoder.encode("\n")), (caught: unknown) => caught === error);
+  assert.throws(() => decoder.end(), (caught: unknown) => caught === error);
+});
+
+test("rejects oversized whitespace-only EOF lines", () => {
+  const decoder = new NdjsonDecoder(3);
+
+  assert.deepEqual(decoder.push(encoder.encode("   \r")), []);
+  assert.throws(
+    () => decoder.end(),
+    (caught: unknown) => caught instanceof NdjsonProtocolError && caught.code === "line_too_long",
+  );
+});
+
 test("encodes one compact newline-terminated record and rejects undefined", () => {
   assert.deepEqual(encodeNdjson({ id: 1, message: "中" }), encoder.encode('{"id":1,"message":"中"}\n'));
   assert.throws(() => encodeNdjson(undefined), TypeError);
