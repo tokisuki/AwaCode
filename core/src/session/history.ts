@@ -125,6 +125,12 @@ export function validateProviderHistory(store: SessionStore, sessionId: string):
       if (message.role !== "assistant") {
         integrity(`tool call ${call.callId} is not attached to an assistant message`);
       }
+      if (!TERMINAL_STATUSES.has(call.status)) {
+        integrity(`tool call ${call.callId} is nonterminal`);
+      }
+      if (call.result === null) {
+        integrity(`tool call ${call.callId} has no terminal result`);
+      }
       const calls = callsByMessage.get(message.id) ?? [];
       calls.push(call);
       callsByMessage.set(message.id, calls);

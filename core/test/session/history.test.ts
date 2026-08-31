@@ -62,7 +62,6 @@ test("provider history emits a valid multi-call block in order and excludes inte
     });
     store.insertAssistantMessageWithToolCalls({
       sessionId: session.id,
-      kind: "tool_calls",
       payload: { text: "I inspected both files." },
       toolCalls: [
         { callId: "call-success", ordinal: 0, toolName: "read", inputText: "{\"path\":\"a.ts\"}" },
@@ -151,7 +150,6 @@ async function validHistoryFixture(label: string) {
   });
   const block = store.insertAssistantMessageWithToolCalls({
     sessionId: session.id,
-    kind: "tool_calls",
     payload: { text: "done" },
     toolCalls: [{ callId: `call-${label}`, ordinal: 0, toolName: "read", inputText: "{}" }],
   });
@@ -251,6 +249,44 @@ test("history validation rejects every representable persisted integrity violati
   for (const [index, item] of cases.entries()) {
     await t.test(item.name, async () => {
       const fixture = await validHistoryFixture(`invalid-${index}`);
+      try {
+        item.mutate(fixture);
+        assertIntegrityFailure(() => validateProviderHistory(fixture.store, fixture.session.id));
+      } finally {
+        fixture.connection.close();
+      }
+    });
+  }
+});
+
+test("history validates attached calls before filtering non-complete audit messages", async (t) => {
+  const cases: ReadonlyArray<{
+    name: string;
+    mutate(fixture: Awaited<ReturnType<typeof validHistoryFixture>>): void;
+  }> = [
+    {
+      name: "interrupted assistant with a nonterminal call",
+      mutate: ({ connection, block, callId }) => {
+        connection.db.prepare("UPDATE messages SET status = 'interrupted' WHERE id = ?").run(block.message.id);
+        connection.db.prepare(`
+          UPDATE tool_calls
+          SET status = 'running', result_json = NULL, finished_at = NULL
+          WHERE call_id = ?
+        `).run(callId);
+      },
+    },
+    {
+      name: "streaming assistant with a null terminal result",
+      mutate: ({ connection, block, callId }) => {
+        connection.db.prepare("UPDATE messages SET status = 'streaming' WHERE id = ?").run(block.message.id);
+        connection.db.prepare("UPDATE tool_calls SET result_json = NULL WHERE call_id = ?").run(callId);
+      },
+    },
+  ];
+
+  for (const [index, item] of cases.entries()) {
+    await t.test(item.name, async () => {
+      const fixture = await validHistoryFixture(`filtered-invalid-${index}`);
       try {
         item.mutate(fixture);
         assertIntegrityFailure(() => validateProviderHistory(fixture.store, fixture.session.id));

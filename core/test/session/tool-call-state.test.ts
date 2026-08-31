@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -8,6 +8,11 @@ import { openDatabase } from "../../src/persistence/database.ts";
 import { SessionStore, type ToolCallStatus } from "../../src/persistence/session-store.ts";
 import { transitionToolCall } from "../../src/session/tool-call-state.ts";
 import type { ProjectIdentity } from "../../src/project/project-identity.ts";
+import {
+  disposeChildChannels,
+  spawnChildChannel,
+  waitForChildExit,
+} from "../support/child-process.ts";
 
 const temporaryDirectories: string[] = [];
 
@@ -27,6 +32,11 @@ function identity(id: string, rootPath: string): ProjectIdentity {
   };
 }
 
+function cleanEnvironment(): NodeJS.ProcessEnv {
+  return Object.fromEntries(Object.entries(process.env).filter(([name]) =>
+    !/(?:TOKEN|SECRET|PASSWORD|API_KEY|ACCESS_KEY|PRIVATE_KEY|OPENAI|ANTHROPIC|AZURE|AWS)/i.test(name)));
+}
+
 test.after(async () => {
   await Promise.all(temporaryDirectories.map((directory) => rm(directory, { recursive: true, force: true })));
 });
@@ -42,24 +52,32 @@ test("the persisted tool-call state graph accepts every legal edge and rejects i
   });
 
   const createCall = (callId: string, status: ToolCallStatus = "pending") => {
-    const message = store.insertMessage({
+    store.insertAssistantMessageWithToolCalls({
       sessionId: "session-graph",
-      role: "assistant",
-      kind: "tool_calls",
       payload: { callId },
+      toolCalls: [{ callId, ordinal: 0, toolName: "read", inputText: "{}" }],
     });
-    store.insertToolCall({
-      callId,
-      sessionId: "session-graph",
-      assistantMessageId: message.id,
-      ordinal: 0,
-      toolName: "read",
-      inputText: "{}",
-      status,
-      ...(status === "success" || status === "failure" || status === "denied" || status === "interrupted"
-        ? { result: { seeded: status }, finishedAt: now }
-        : {}),
-    });
+    if (status === "running" || status === "success") {
+      assert.equal(transitionToolCall(store, {
+        callId, expectedStatus: "pending", status: "running",
+      }).kind, "applied");
+    }
+    if (status === "success") {
+      assert.equal(transitionToolCall(store, {
+        callId, expectedStatus: "running", status, result: { seeded: status },
+      }).kind, "applied");
+    } else if (status === "failure" || status === "interrupted") {
+      assert.equal(transitionToolCall(store, {
+        callId, expectedStatus: "pending", status, result: { seeded: status },
+      }).kind, "applied");
+    } else if (status === "denied") {
+      assert.equal(transitionToolCall(store, {
+        callId, expectedStatus: "pending", status: "awaiting_approval",
+      }).kind, "applied");
+      assert.equal(transitionToolCall(store, {
+        callId, expectedStatus: "awaiting_approval", status, result: { seeded: status },
+      }).kind, "applied");
+    }
   };
 
   try {
@@ -135,19 +153,10 @@ test("terminal transitions require one result and never overwrite terminal data 
   try {
     store.upsertProject(identity("project-terminal", "D:\\repo"));
     const session = store.createSession("project-terminal", "Terminal invariants");
-    const message = store.insertMessage({
+    store.insertAssistantMessageWithToolCalls({
       sessionId: session.id,
-      role: "assistant",
-      kind: "tool_calls",
       payload: {},
-    });
-    store.insertToolCall({
-      callId: "call-terminal",
-      sessionId: session.id,
-      assistantMessageId: message.id,
-      ordinal: 0,
-      toolName: "shell",
-      inputText: "{}",
+      toolCalls: [{ callId: "call-terminal", ordinal: 0, toolName: "shell", inputText: "{}" }],
     });
 
     assert.throws(() => transitionToolCall(store, {
@@ -201,82 +210,124 @@ test("terminal transitions require one result and never overwrite terminal data 
   }
 });
 
-test("allow loses cleanly to persisted deny or cancel decisions across two connections", async () => {
-  const root = await dataRoot("race");
-  const firstConnection = await openDatabase({ env: { AWACODE_DATA_DIR: root } });
-  const secondConnection = await openDatabase({ env: { AWACODE_DATA_DIR: root } });
-  const ids = ["session-race", "message-race"];
-  const first = new SessionStore(firstConnection.db, { randomUUID: () => ids.shift() as string });
-  const second = new SessionStore(secondConnection.db);
+test("two real processes race allow against deny or cancel and only the CAS winner begins its action", async (t) => {
+  for (const terminalTarget of ["denied", "interrupted"] as const) {
+    await t.test(`allow versus ${terminalTarget}`, async () => {
+      const root = await dataRoot(`process-race-${terminalTarget}`);
+      const callId = `process-race-${terminalTarget}`;
+      const setupConnection = await openDatabase({ env: { AWACODE_DATA_DIR: root } });
+      const ids = [`session-${terminalTarget}`, `message-${terminalTarget}`];
+      const setup = new SessionStore(setupConnection.db, { randomUUID: () => ids.shift() as string });
+      try {
+        setup.upsertProject(identity(`project-${terminalTarget}`, "D:\\repo"));
+        const session = setup.createSession(`project-${terminalTarget}`, "Process approval race");
+        setup.insertAssistantMessageWithToolCalls({
+          sessionId: session.id,
+          payload: {},
+          toolCalls: [{ callId, ordinal: 0, toolName: "write", inputText: "{}" }],
+        });
+        assert.equal(transitionToolCall(setup, {
+          callId,
+          expectedStatus: "pending",
+          status: "awaiting_approval",
+        }).kind, "applied");
+      } finally {
+        setupConnection.close();
+      }
+
+      const claims = join(root, "claims");
+      await mkdir(claims);
+      const fixture = join(import.meta.dirname, "..", "..", "test-fixtures", "tool-call-transition-child.ts");
+      const channels = ["running", terminalTarget].map((target) =>
+        spawnChildChannel(process.execPath, [fixture, root, callId, target, claims], {
+          env: cleanEnvironment(),
+        }));
+      try {
+        assert.deepEqual(await Promise.all(channels.map(({ lines }) => lines.nextLine())), ["READY", "READY"]);
+        const results = channels.map(({ lines }) => lines.nextLine());
+        for (const channel of channels) {
+          channel.child.stdin.end("GO\n");
+        }
+        const outcomes = (await Promise.all(results)).map((line) => JSON.parse(line) as {
+          target: "running" | "denied" | "interrupted";
+          kind: "applied" | "idempotent" | "conflict";
+          observedStatus: ToolCallStatus;
+        });
+        assert.equal(outcomes.filter(({ kind }) => kind === "applied").length, 1);
+        assert.equal(outcomes.filter(({ kind }) => kind === "conflict").length, 1);
+        assert.deepEqual(
+          (await Promise.all(channels.map((channel, index) =>
+            waitForChildExit(channel, 5000, `transition racer ${index} completion`)))).map(([code]) => code),
+          [0, 0],
+        );
+
+        const claimFiles = await readdir(claims);
+        assert.equal(claimFiles.length, 1);
+        const appliedTarget = outcomes.find(({ kind }) => kind === "applied")?.target;
+        assert.equal(await readFile(join(claims, claimFiles[0] as string), "utf8"), appliedTarget);
+        assert.equal(claimFiles[0], `${appliedTarget}.claim`);
+
+        const verifiedConnection = await openDatabase({ env: { AWACODE_DATA_DIR: root } });
+        try {
+          assert.equal(new SessionStore(verifiedConnection.db).loadToolCall(callId).status, appliedTarget);
+        } finally {
+          verifiedConnection.close();
+        }
+      } finally {
+        await disposeChildChannels(channels, `transition ${terminalTarget} racers cleanup`);
+      }
+    });
+  }
+});
+
+test("the lowest public transition boundary rejects graph bypasses and preserves terminal data", async () => {
+  const root = await dataRoot("boundary");
+  const connection = await openDatabase({ env: { AWACODE_DATA_DIR: root } });
+  const ids = ["session-boundary", "message-boundary"];
+  const store = new SessionStore(connection.db, { randomUUID: () => ids.shift() as string });
   try {
-    first.upsertProject(identity("project-race", "D:\\repo"));
-    const session = first.createSession("project-race", "Approval race");
-    first.insertAssistantMessageWithToolCalls({
+    store.upsertProject(identity("project-boundary", "D:\\repo"));
+    const session = store.createSession("project-boundary", "Boundary invariants");
+    store.insertAssistantMessageWithToolCalls({
       sessionId: session.id,
-      kind: "tool_calls",
       payload: {},
       toolCalls: [
-        { callId: "deny-wins", ordinal: 0, toolName: "write", inputText: "{}" },
-        { callId: "cancel-wins", ordinal: 1, toolName: "shell", inputText: "{}" },
-        { callId: "allow-wins", ordinal: 2, toolName: "write", inputText: "{}" },
+        { callId: "terminal-boundary", ordinal: 0, toolName: "read", inputText: "{}" },
+        { callId: "pending-boundary", ordinal: 1, toolName: "write", inputText: "{}" },
       ],
     });
-    for (const callId of ["deny-wins", "cancel-wins", "allow-wins"]) {
-      assert.equal(transitionToolCall(first, {
-        callId,
-        expectedStatus: "pending",
-        status: "awaiting_approval",
-      }).kind, "applied");
-    }
-
-    assert.equal(transitionToolCall(first, {
-      callId: "deny-wins",
-      expectedStatus: "awaiting_approval",
-      status: "denied",
-      result: { reason: "user denied" },
+    assert.equal(transitionToolCall(store, {
+      callId: "terminal-boundary",
+      expectedStatus: "pending",
+      status: "running",
     }).kind, "applied");
-    let actionsBegun = 0;
-    const allowAfterDeny = transitionToolCall(second, {
-      callId: "deny-wins",
-      expectedStatus: "awaiting_approval",
-      status: "running",
-    });
-    if (allowAfterDeny.kind === "applied") actionsBegun += 1;
-    assert.equal(allowAfterDeny.kind, "conflict");
-    assert.equal(allowAfterDeny.call.status, "denied");
-
-    assert.equal(transitionToolCall(first, {
-      callId: "cancel-wins",
-      expectedStatus: "awaiting_approval",
-      status: "interrupted",
-      result: { reason: "cancelled" },
+    assert.equal(transitionToolCall(store, {
+      callId: "terminal-boundary",
+      expectedStatus: "running",
+      status: "success",
+      result: { content: "original" },
     }).kind, "applied");
-    const allowAfterCancel = transitionToolCall(second, {
-      callId: "cancel-wins",
-      expectedStatus: "awaiting_approval",
-      status: "running",
-    });
-    if (allowAfterCancel.kind === "applied") actionsBegun += 1;
-    assert.equal(allowAfterCancel.kind, "conflict");
-    assert.equal(allowAfterCancel.call.status, "interrupted");
+    const terminalBefore = store.loadToolCall("terminal-boundary");
 
-    const allowFirst = transitionToolCall(first, {
-      callId: "allow-wins",
-      expectedStatus: "awaiting_approval",
-      status: "running",
+    const overwrite = store.compareAndSwapToolCall({
+      callId: "terminal-boundary",
+      expectedStatus: "success",
+      status: "failure",
+      result: { content: "replacement" },
     });
-    if (allowFirst.kind === "applied") actionsBegun += 1;
-    const denyAfterAllow = transitionToolCall(second, {
-      callId: "allow-wins",
-      expectedStatus: "awaiting_approval",
+    assert.equal(overwrite.applied, false);
+    assert.deepEqual(overwrite.call, terminalBefore);
+
+    const shortcut = store.compareAndSwapToolCall({
+      callId: "pending-boundary",
+      expectedStatus: "pending",
       status: "denied",
-      result: { reason: "late denial" },
+      result: { reason: "invalid shortcut" },
     });
-    assert.equal(denyAfterAllow.kind, "conflict");
-    assert.equal(denyAfterAllow.call.status, "running");
-    assert.equal(actionsBegun, 1);
+    assert.equal(shortcut.applied, false);
+    assert.equal(shortcut.call.status, "pending");
+    assert.equal(shortcut.call.result, null);
   } finally {
-    secondConnection.close();
-    firstConnection.close();
+    connection.close();
   }
 });

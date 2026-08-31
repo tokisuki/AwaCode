@@ -2,6 +2,10 @@ import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 
 import type { ProjectIdentity, ProjectIdentityKind } from "../project/project-identity.ts";
+import {
+  isLegalToolCallTransition,
+  isTerminalToolCallStatus,
+} from "../session/tool-call-transition-policy.ts";
 
 export type SessionStatus = "idle" | "running" | "completed" | "interrupted" | "cancelled" | "error";
 export type MessageRole = "system" | "user" | "assistant" | "tool" | "internal";
@@ -76,20 +80,6 @@ export interface InsertMessageInput {
   status?: MessageStatus;
 }
 
-export interface InsertToolCallInput {
-  callId: string;
-  sessionId: string;
-  assistantMessageId: string;
-  ordinal: number;
-  toolName: string;
-  inputText: string;
-  status?: ToolCallStatus;
-  result?: unknown;
-  errorText?: string;
-  startedAt?: string;
-  finishedAt?: string;
-}
-
 export interface PendingToolCallInput {
   callId: string;
   ordinal: number;
@@ -99,7 +89,6 @@ export interface PendingToolCallInput {
 
 export interface InsertAssistantMessageWithToolCallsInput {
   sessionId: string;
-  kind: string;
   payload: unknown;
   toolCalls: readonly PendingToolCallInput[];
 }
@@ -309,6 +298,9 @@ export class SessionStore {
   }
 
   insertMessage(input: InsertMessageInput): MessageRecord {
+    if (input.role === "tool" || (input.role === "assistant" && input.kind === "tool_calls")) {
+      throw new TypeError("tool protocol messages require the atomic assistant tool-call block API");
+    }
     const id = this.createId();
     const now = this.currentDate().toISOString();
     const payloadJson = stringifyJson(input.payload);
@@ -347,6 +339,9 @@ export class SessionStore {
   insertAssistantMessageWithToolCalls(
     input: InsertAssistantMessageWithToolCallsInput,
   ): InsertedAssistantToolCallBlock {
+    if (input.toolCalls.length === 0) {
+      throw new TypeError("an atomic assistant tool-call block requires at least one tool call");
+    }
     const id = this.createId();
     const now = this.currentDate().toISOString();
     const payloadJson = stringifyJson(input.payload);
@@ -361,8 +356,8 @@ export class SessionStore {
       this.db.prepare(`
         INSERT INTO messages
           (id, session_id, seq, role, kind, payload_json, status, created_at, updated_at)
-        VALUES (?, ?, ?, 'assistant', ?, ?, 'complete', ?, ?)
-      `).run(id, input.sessionId, next.seq, input.kind, payloadJson, now, now);
+        VALUES (?, ?, ?, 'assistant', 'tool_calls', ?, 'complete', ?, ?)
+      `).run(id, input.sessionId, next.seq, payloadJson, now, now);
 
       const insertCall = this.db.prepare(`
         INSERT INTO tool_calls
@@ -396,68 +391,22 @@ export class SessionStore {
     }
   }
 
-  insertToolCall(input: InsertToolCallInput): ToolCallRecord {
-    const assistant = this.db.prepare(`
-      SELECT session_id, role, status
-      FROM messages
-      WHERE id = ?
-    `).get(input.assistantMessageId) as {
-      session_id: string;
-      role: MessageRole;
-      status: MessageStatus;
-    } | undefined;
-    if (
-      assistant === undefined
-      || assistant.session_id !== input.sessionId
-      || assistant.role !== "assistant"
-      || assistant.status !== "complete"
-    ) {
-      throw new TypeError("tool calls must reference a complete assistant message in the same session");
-    }
-    const terminal = input.status === "success"
-      || input.status === "failure"
-      || input.status === "denied"
-      || input.status === "interrupted";
-    if (terminal && (input.result === undefined || input.result === null)) {
-      throw new TypeError("terminal tool calls require a non-null JSON result");
-    }
-    if (!terminal && input.result !== undefined) {
-      throw new TypeError("nonterminal tool calls cannot have a result");
-    }
-    const now = this.currentDate().toISOString();
-    const resultJson = input.result === undefined ? null : stringifyJson(input.result);
-    this.db.prepare(`
-      INSERT INTO tool_calls
-        (call_id, session_id, assistant_message_id, ordinal, tool_name, input_text, status,
-         result_json, error_text, created_at, started_at, finished_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      input.callId,
-      input.sessionId,
-      input.assistantMessageId,
-      input.ordinal,
-      input.toolName,
-      input.inputText,
-      input.status ?? "pending",
-      resultJson,
-      input.errorText ?? null,
-      now,
-      input.startedAt ?? null,
-      input.finishedAt ?? null,
-    );
-    return this.getToolCall(input.callId);
-  }
-
   loadToolCall(callId: string): ToolCallRecord {
     return this.getToolCall(callId);
   }
 
   compareAndSwapToolCall(input: CompareAndSwapToolCallInput): CompareAndSwapToolCallResult {
+    if (!isLegalToolCallTransition(input.expectedStatus, input.status)) {
+      return { applied: false, call: this.getToolCall(input.callId) };
+    }
+    const terminal = isTerminalToolCallStatus(input.status);
+    if (terminal && (input.result === undefined || input.result === null)) {
+      throw new TypeError("terminal tool-call transition requires a non-null JSON result");
+    }
+    if (!terminal && input.result !== undefined) {
+      throw new TypeError("nonterminal tool-call transition cannot have a result");
+    }
     const now = this.currentDate().toISOString();
-    const terminal = input.status === "success"
-      || input.status === "failure"
-      || input.status === "denied"
-      || input.status === "interrupted";
     const assignments = ["status = ?"];
     const values: Array<string | null> = [input.status];
     if (input.status === "running") {

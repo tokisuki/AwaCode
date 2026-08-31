@@ -24,7 +24,6 @@ const session = store.createSession("crash-project", "Crashed execution");
 connection.db.prepare("UPDATE sessions SET status = 'running' WHERE id = ?").run(session.id);
 store.insertAssistantMessageWithToolCalls({
   sessionId: session.id,
-  kind: "tool_calls",
   payload: { text: "running tool" },
   toolCalls: [{ callId: "crash-call", ordinal: 0, toolName: "marker", inputText: "{}" }],
 });

@@ -42,7 +42,6 @@ test("a completed assistant message and its ordered pending calls commit as one 
     const session = store.createSession("project-atomic", "Atomic tool block");
     const inserted = store.insertAssistantMessageWithToolCalls({
       sessionId: session.id,
-      kind: "tool_calls",
       payload: { text: "I will inspect both files." },
       toolCalls: [
         { callId: "call-a", ordinal: 0, toolName: "read", inputText: "{\"path\":\"a.ts\"}" },
@@ -83,7 +82,6 @@ test("a duplicate call ID or ordinal rolls back the assistant message and every 
     const session = store.createSession("project-rollback", "Rollback tool blocks");
     assert.throws(() => store.insertAssistantMessageWithToolCalls({
       sessionId: session.id,
-      kind: "tool_calls",
       payload: {},
       toolCalls: [
         { callId: "duplicate-call", ordinal: 0, toolName: "read", inputText: "{}" },
@@ -95,7 +93,6 @@ test("a duplicate call ID or ordinal rolls back the assistant message and every 
 
     assert.throws(() => store.insertAssistantMessageWithToolCalls({
       sessionId: session.id,
-      kind: "tool_calls",
       payload: {},
       toolCalls: [
         { callId: "ordinal-a", ordinal: 0, toolName: "read", inputText: "{}" },
@@ -109,7 +106,7 @@ test("a duplicate call ID or ordinal rolls back the assistant message and every 
   }
 });
 
-test("the ordinary streaming-message path cannot attach a runnable tool call", async () => {
+test("the ordinary streaming-message path stores partial text but cannot claim a tool-call block", async () => {
   const root = await dataRoot("streaming-guard");
   const connection = await openDatabase({ env: { AWACODE_DATA_DIR: root } });
   const ids = ["session-streaming", "message-streaming"];
@@ -120,19 +117,65 @@ test("the ordinary streaming-message path cannot attach a runnable tool call", a
     const message = store.insertMessage({
       sessionId: session.id,
       role: "assistant",
-      kind: "tool_calls",
+      kind: "text",
       payload: { text: "partial" },
       status: "streaming",
     });
-    assert.throws(() => store.insertToolCall({
-      callId: "streaming-call",
+    assert.equal(message.status, "streaming");
+    assert.throws(() => store.insertMessage({
       sessionId: session.id,
-      assistantMessageId: message.id,
-      ordinal: 0,
-      toolName: "write",
-      inputText: "{}",
-      status: "pending",
-    }), /complete assistant message/);
+      role: "assistant",
+      kind: "tool_calls",
+      payload: { text: "partial tool block" },
+      status: "streaming",
+    }), /atomic assistant tool-call block/);
+    assert.deepEqual(store.loadSession(session.id).toolCalls, []);
+  } finally {
+    connection.close();
+  }
+});
+
+test("ordinary message insertion rejects protocol-bearing tool messages and assistant tool-call blocks", async () => {
+  const root = await dataRoot("ordinary-protocol-guard");
+  const connection = await openDatabase({ env: { AWACODE_DATA_DIR: root } });
+  const ids = ["session-protocol-guard", "tool-message", "assistant-tool-message"];
+  const store = new SessionStore(connection.db, { randomUUID: () => ids.shift() as string });
+  try {
+    store.upsertProject(identity("project-protocol-guard", "D:\\repo"));
+    const session = store.createSession("project-protocol-guard", "Protocol guard");
+    assert.throws(() => store.insertMessage({
+      sessionId: session.id,
+      role: "tool",
+      kind: "result",
+      payload: { callId: "orphan" },
+    }), /atomic assistant tool-call block/);
+    assert.throws(() => store.insertMessage({
+      sessionId: session.id,
+      role: "assistant",
+      kind: "tool_calls",
+      payload: { text: "partial block" },
+      status: "complete",
+    }), /atomic assistant tool-call block/);
+    assert.deepEqual(store.loadSession(session.id).messages, []);
+  } finally {
+    connection.close();
+  }
+});
+
+test("the atomic tool-call block rejects an empty call set before writing its assistant message", async () => {
+  const root = await dataRoot("empty-block");
+  const connection = await openDatabase({ env: { AWACODE_DATA_DIR: root } });
+  const ids = ["session-empty-block", "message-must-not-exist"];
+  const store = new SessionStore(connection.db, { randomUUID: () => ids.shift() as string });
+  try {
+    store.upsertProject(identity("project-empty-block", "D:\\repo"));
+    const session = store.createSession("project-empty-block", "Empty block guard");
+    assert.throws(() => store.insertAssistantMessageWithToolCalls({
+      sessionId: session.id,
+      payload: { text: "no calls" },
+      toolCalls: [],
+    }), /at least one tool call/);
+    assert.deepEqual(store.loadSession(session.id).messages, []);
     assert.deepEqual(store.loadSession(session.id).toolCalls, []);
   } finally {
     connection.close();

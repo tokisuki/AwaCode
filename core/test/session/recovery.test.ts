@@ -54,7 +54,6 @@ test("startup recovery distinguishes calls that never began from running calls w
     connection.db.prepare("UPDATE sessions SET status = 'running' WHERE id = ?").run(session.id);
     store.insertAssistantMessageWithToolCalls({
       sessionId: session.id,
-      kind: "tool_calls",
       payload: { text: "working" },
       toolCalls: [
         { callId: "pending-call", ordinal: 0, toolName: "read", inputText: "{}" },
@@ -116,7 +115,6 @@ test("mixed recovery preserves terminal bytes and remains idempotent after reope
     });
     store.insertAssistantMessageWithToolCalls({
       sessionId: session.id,
-      kind: "tool_calls",
       payload: {},
       toolCalls: [
         { callId: "mixed-pending", ordinal: 0, toolName: "read", inputText: "{}" },

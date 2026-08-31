@@ -9,6 +9,7 @@ import {
   SessionStore,
   StoreNotFoundError,
 } from "../../src/persistence/session-store.ts";
+import { transitionToolCall } from "../../src/session/tool-call-state.ts";
 import {
   disposeChildChannels,
   spawnChildChannel,
@@ -116,11 +117,13 @@ test("loads messages and tool calls in protocol order after two stores allocate 
   try {
     first.upsertProject(identity("project-1", "D:\\repo"));
     const session = first.createSession("project-1", "Ordered history");
-    const message1 = first.insertMessage({
+    const message1 = first.insertAssistantMessageWithToolCalls({
       sessionId: session.id,
-      role: "assistant",
-      kind: "text",
       payload: { text: "first" },
+      toolCalls: [
+        { callId: "call-first", ordinal: 0, toolName: "read", inputText: "{\"path\":\"a.ts\"}" },
+        { callId: "call-second", ordinal: 1, toolName: "read", inputText: "{\"path\":\"b.ts\"}" },
+      ],
     });
     const message2 = second.insertMessage({
       sessionId: session.id,
@@ -128,44 +131,31 @@ test("loads messages and tool calls in protocol order after two stores allocate 
       kind: "text",
       payload: { text: "second" },
     });
-    const message3 = first.insertMessage({
+    const message3 = first.insertAssistantMessageWithToolCalls({
       sessionId: session.id,
-      role: "assistant",
-      kind: "tool_calls",
       payload: { text: "third" },
-      status: "complete",
+      toolCalls: [
+        { callId: "call-late", ordinal: 0, toolName: "shell", inputText: "{\"command\":\"npm test\"}" },
+      ],
     });
-
-    second.insertToolCall({
-      callId: "call-late",
-      sessionId: session.id,
-      assistantMessageId: message3.id,
-      ordinal: 0,
-      toolName: "shell",
-      inputText: "{\"command\":\"npm test\"}",
-      status: "pending",
-    });
-    first.insertToolCall({
+    assert.equal(transitionToolCall(first, {
       callId: "call-second",
-      sessionId: session.id,
-      assistantMessageId: message1.id,
-      ordinal: 1,
-      toolName: "read",
-      inputText: "{\"path\":\"b.ts\"}",
+      expectedStatus: "pending",
+      status: "running",
+    }).kind, "applied");
+    assert.equal(transitionToolCall(first, {
+      callId: "call-second",
+      expectedStatus: "running",
       status: "success",
       result: { text: "B" },
-    });
-    first.insertToolCall({
+    }).kind, "applied");
+    assert.equal(transitionToolCall(first, {
       callId: "call-first",
-      sessionId: session.id,
-      assistantMessageId: message1.id,
-      ordinal: 0,
-      toolName: "read",
-      inputText: "{\"path\":\"a.ts\"}",
+      expectedStatus: "pending",
       status: "failure",
       result: { error: "not found" },
       errorText: "not found",
-    });
+    }).kind, "applied");
 
     const loaded = second.loadSession(session.id);
     assert.deepEqual(loaded.messages.map(({ id, seq, status, payload }) => ({ id, seq, status, payload })), [
@@ -193,24 +183,7 @@ test("loads messages and tool calls in protocol order after two stores allocate 
     ]);
     assert.throws(() => second.loadSession("missing"), StoreNotFoundError);
 
-    assert.throws(() => second.insertToolCall({
-      callId: "different-call",
-      sessionId: session.id,
-      assistantMessageId: message1.id,
-      ordinal: 0,
-      toolName: "write",
-      inputText: "{}",
-    }), /UNIQUE constraint failed/);
-    assert.throws(() => second.insertToolCall({
-      callId: "call-first",
-      sessionId: session.id,
-      assistantMessageId: message3.id,
-      ordinal: 1,
-      toolName: "write",
-      inputText: "{}",
-    }), /UNIQUE constraint failed/);
-
-    assert.deepEqual([message1.seq, message2.seq, message3.seq], [1, 2, 3]);
+    assert.deepEqual([message1.message.seq, message2.seq, message3.message.seq], [1, 2, 3]);
   } finally {
     secondConnection.close();
     firstConnection.close();

@@ -3,23 +3,10 @@ import {
   type ToolCallRecord,
   type ToolCallStatus,
 } from "../persistence/session-store.ts";
-
-const LEGAL_TRANSITIONS: Readonly<Record<ToolCallStatus, ReadonlySet<ToolCallStatus>>> = {
-  pending: new Set(["running", "awaiting_approval", "failure", "interrupted"]),
-  awaiting_approval: new Set(["running", "denied", "interrupted"]),
-  running: new Set(["success", "failure", "interrupted"]),
-  success: new Set(),
-  failure: new Set(),
-  denied: new Set(),
-  interrupted: new Set(),
-};
-
-const TERMINAL_STATUSES: ReadonlySet<ToolCallStatus> = new Set([
-  "success",
-  "failure",
-  "denied",
-  "interrupted",
-]);
+import {
+  isLegalToolCallTransition,
+  isTerminalToolCallStatus,
+} from "./tool-call-transition-policy.ts";
 
 export interface ToolCallTransitionInput {
   callId: string;
@@ -45,11 +32,11 @@ export function transitionToolCall(
   store: SessionStore,
   input: ToolCallTransitionInput,
 ): ToolCallTransitionOutcome {
-  const terminal = TERMINAL_STATUSES.has(input.status);
+  const terminal = isTerminalToolCallStatus(input.status);
   if (terminal && (input.result === undefined || input.result === null)) {
     throw new TypeError("terminal tool-call transition requires a non-null JSON result");
   }
-  if (!LEGAL_TRANSITIONS[input.expectedStatus].has(input.status)) {
+  if (!isLegalToolCallTransition(input.expectedStatus, input.status)) {
     return { kind: "conflict", reason: "illegal_transition", call: store.loadToolCall(input.callId) };
   }
 
