@@ -24,11 +24,11 @@ const TERMINAL_STATUSES: ReadonlySet<ToolCallStatus> = new Set([
   "interrupted",
 ]);
 
-const API_KEY_LABEL_PATTERN = String.raw`api[\s_-]*key`;
-const COMMON_API_KEY_VENDOR_PATTERN = [
+const COMMON_API_KEY_VENDORS = [
   "openai",
   "anthropic",
-  String.raw`azure(?:[\s_-]*openai)?`,
+  "azure",
+  "azureopenai",
   "google",
   "gemini",
   "github",
@@ -41,32 +41,195 @@ const COMMON_API_KEY_VENDOR_PATTERN = [
   "openrouter",
   "xai",
   "deepseek",
-].join("|");
+];
 
 // Keep this policy closed: arbitrary words ending in Token/Secret are ordinary diagnostics.
-const CREDENTIAL_LABEL_PATTERN = [
-  String.raw`(?:${COMMON_API_KEY_VENDOR_PATTERN})[\s_-]*${API_KEY_LABEL_PATTERN}`,
-  API_KEY_LABEL_PATTERN,
-  String.raw`(?:access|private)[\s_-]*key`,
-  String.raw`(?:access|refresh|auth|bearer|id|session|csrf)[\s_-]*token`,
-  String.raw`(?:client|api|signing|webhook)[\s_-]*secret`,
+const CREDENTIAL_LABELS: ReadonlySet<string> = new Set([
+  "apikey",
+  "accesskey",
+  "privatekey",
+  "accesstoken",
+  "refreshtoken",
+  "authtoken",
+  "bearertoken",
+  "idtoken",
+  "sessiontoken",
+  "csrftoken",
+  "clientsecret",
+  "apisecret",
+  "signingsecret",
+  "webhooksecret",
   "token",
   "secret",
   "password",
-].join("|");
+  ...COMMON_API_KEY_VENDORS.map((vendor) => `${vendor}apikey`),
+]);
 
-const JSON_AUTHORIZATION_ASSIGNMENT =
-  /("authorization"\s*:\s*")(?:(bearer|basic)\s+)?[^"\r\n]*"/gi;
-const JSON_CREDENTIAL_ASSIGNMENT = new RegExp(
-  String.raw`("(?:${CREDENTIAL_LABEL_PATTERN})"\s*:\s*")[^"\r\n]*"`,
-  "gi",
-);
-const AUTHORIZATION_ASSIGNMENT =
-  /(?<![a-z0-9_-])(\bauthorization\b\s*[:=]\s*)(?:(bearer|basic)\s+)?(?:"([^"\r\n]*)"|'([^'\r\n]*)'|([^;\s,}\]\r\n]+))/gi;
-const CREDENTIAL_ASSIGNMENT = new RegExp(
-  String.raw`(?<![a-z0-9_-])(\b(?:${CREDENTIAL_LABEL_PATTERN})\b\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^;\s,}\]\r\n]+)`,
-  "gi",
-);
+interface AssignmentLabel {
+  kind: "authorization" | "credential";
+  quoted: boolean;
+}
+
+interface TextReplacement {
+  start: number;
+  end: number;
+  text: string;
+}
+
+function isHorizontalWhitespace(character: string): boolean {
+  return character === " " || character === "\t";
+}
+
+function isWhitespace(character: string): boolean {
+  return /\s/.test(character);
+}
+
+function isBareLabelCharacter(character: string): boolean {
+  // Separators belong to the full label, so matching cannot restart at a trailing Token/Secret word.
+  return /[a-z0-9_\- \t]/i.test(character);
+}
+
+function normalizeCredentialLabel(label: string): string | null {
+  const trimmed = label.trim();
+  if (!/^[a-z0-9](?:[a-z0-9_\- \t]*[a-z0-9])?$/i.test(trimmed)) {
+    return null;
+  }
+  return trimmed.replace(/[\s_-]+/g, "").toLowerCase();
+}
+
+function readAssignmentLabel(value: string, separator: number): AssignmentLabel | null {
+  let labelEnd = separator;
+  while (labelEnd > 0 && isHorizontalWhitespace(value.charAt(labelEnd - 1))) {
+    labelEnd -= 1;
+  }
+
+  let label: string;
+  let quoted = false;
+  if (labelEnd > 0 && value[labelEnd - 1] === '"') {
+    const openingQuote = value.lastIndexOf('"', labelEnd - 2);
+    if (openingQuote === -1) {
+      return null;
+    }
+    label = value.slice(openingQuote + 1, labelEnd - 1);
+    quoted = true;
+  } else {
+    let labelStart = labelEnd;
+    while (labelStart > 0 && isBareLabelCharacter(value.charAt(labelStart - 1))) {
+      labelStart -= 1;
+    }
+    while (labelStart < labelEnd && isHorizontalWhitespace(value.charAt(labelStart))) {
+      labelStart += 1;
+    }
+    label = value.slice(labelStart, labelEnd);
+  }
+
+  const normalized = normalizeCredentialLabel(label);
+  if (normalized === "authorization") {
+    return { kind: "authorization", quoted };
+  }
+  return normalized !== null && CREDENTIAL_LABELS.has(normalized)
+    ? { kind: "credential", quoted }
+    : null;
+}
+
+function findClosingQuote(value: string, start: number, quote: string): number {
+  for (let index = start; index < value.length; index += 1) {
+    if (value[index] === "\r" || value[index] === "\n") {
+      return -1;
+    }
+    if (value[index] === quote) {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function authorizationSecretStart(value: string, start: number, end: number): number {
+  const scheme = /^(?:bearer|basic)\s+/i.exec(value.slice(start, end));
+  return scheme === null ? start : start + scheme[0].length;
+}
+
+function readAssignmentValue(
+  value: string,
+  separator: number,
+  label: AssignmentLabel,
+): TextReplacement | null {
+  let valueStart = separator + 1;
+  while (valueStart < value.length && isWhitespace(value.charAt(valueStart))) {
+    valueStart += 1;
+  }
+
+  if (label.quoted) {
+    if (value[separator] !== ":" || value[valueStart] !== '"') {
+      return null;
+    }
+    const contentStart = valueStart + 1;
+    const closingQuote = findClosingQuote(value, contentStart, '"');
+    if (closingQuote === -1) {
+      return null;
+    }
+    return {
+      start: label.kind === "authorization"
+        ? authorizationSecretStart(value, contentStart, closingQuote)
+        : contentStart,
+      end: closingQuote,
+      text: "[REDACTED]",
+    };
+  }
+
+  const quote = value[valueStart];
+  if (quote === '"' || quote === "'") {
+    const closingQuote = findClosingQuote(value, valueStart + 1, quote);
+    if (closingQuote === -1) {
+      return null;
+    }
+    const contentStart = valueStart + 1;
+    const secretStart = label.kind === "authorization"
+      ? authorizationSecretStart(value, contentStart, closingQuote)
+      : contentStart;
+    const scheme = value.slice(contentStart, secretStart).trim();
+    return {
+      start: valueStart,
+      end: closingQuote + 1,
+      text: scheme === "" ? "[REDACTED]" : `${scheme} [REDACTED]`,
+    };
+  }
+
+  const secretStart = label.kind === "authorization"
+    ? authorizationSecretStart(value, valueStart, value.length)
+    : valueStart;
+  let valueEnd = secretStart;
+  while (valueEnd < value.length && !/[;\s,}\]]/.test(value.charAt(valueEnd))) {
+    valueEnd += 1;
+  }
+  return secretStart === valueEnd
+    ? null
+    : { start: secretStart, end: valueEnd, text: "[REDACTED]" };
+}
+
+function redactCredentialAssignments(value: string): string {
+  let result = "";
+  let unchangedStart = 0;
+  let searchStart = 0;
+  while (searchStart < value.length) {
+    const separatorOffset = value.slice(searchStart).search(/[:=]/);
+    if (separatorOffset === -1) {
+      break;
+    }
+    const separator = searchStart + separatorOffset;
+    const label = readAssignmentLabel(value, separator);
+    const replacement = label === null ? null : readAssignmentValue(value, separator, label);
+    if (replacement === null) {
+      searchStart = separator + 1;
+      continue;
+    }
+    result += value.slice(unchangedStart, replacement.start);
+    result += replacement.text;
+    unchangedStart = replacement.end;
+    searchStart = Math.max(separator + 1, replacement.end);
+  }
+  return result + value.slice(unchangedStart);
+}
 
 export function isLegalToolCallTransition(from: ToolCallStatus, to: ToolCallStatus): boolean {
   return LEGAL_TRANSITIONS[from].has(to);
@@ -158,30 +321,5 @@ export function sanitizeToolCallErrorText(value: string | undefined): string | n
   const withoutControls = value
     .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")
     .trim();
-  const withoutJsonAuthorization = withoutControls.replace(
-    JSON_AUTHORIZATION_ASSIGNMENT,
-    (_match, prefix: string, scheme: string | undefined) =>
-      `${prefix}${scheme === undefined ? "" : `${scheme} `}[REDACTED]"`,
-  );
-  const withoutJsonCredentials = withoutJsonAuthorization.replace(
-    JSON_CREDENTIAL_ASSIGNMENT,
-    "$1[REDACTED]\"",
-  );
-  const withoutAuthorization = withoutJsonCredentials.replace(
-    AUTHORIZATION_ASSIGNMENT,
-    (
-      _match,
-      label: string,
-      explicitScheme: string | undefined,
-      doubleQuotedValue: string | undefined,
-      singleQuotedValue: string | undefined,
-      unquotedValue: string | undefined,
-    ) => {
-      const valueText = doubleQuotedValue ?? singleQuotedValue ?? unquotedValue ?? "";
-      const embeddedScheme = /^(bearer|basic)\s+/i.exec(valueText)?.[1];
-      const scheme = explicitScheme ?? embeddedScheme;
-      return `${label}${scheme === undefined ? "" : `${scheme} `}[REDACTED]`;
-    },
-  );
-  return withoutAuthorization.replace(CREDENTIAL_ASSIGNMENT, "$1[REDACTED]").slice(0, 4000);
+  return redactCredentialAssignments(withoutControls).slice(0, 4000);
 }

@@ -385,6 +385,12 @@ test("the lowest transition boundary redacts only credential values and preserve
     "paginationToken=cursor-42; fetch failed",
     "syntaxSecret=keyword; parser failed",
     "passwordPolicy=strict",
+    "cancellation token=aborted",
+    "design token=primary",
+    "pagination token=cursor-42",
+    "syntax secret=keyword",
+    "retry failed (cancellation token=aborted); metadata { design token=primary }",
+    "fetch failed [pagination token=cursor-42]; parser context (syntax secret=keyword)",
   ] as const;
   try {
     store.upsertProject(identity("project-terminal-error-redaction", "D:\\repo"));
