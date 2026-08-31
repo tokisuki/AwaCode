@@ -24,6 +24,50 @@ const TERMINAL_STATUSES: ReadonlySet<ToolCallStatus> = new Set([
   "interrupted",
 ]);
 
+const API_KEY_LABEL_PATTERN = String.raw`api[\s_-]*key`;
+const COMMON_API_KEY_VENDOR_PATTERN = [
+  "openai",
+  "anthropic",
+  String.raw`azure(?:[\s_-]*openai)?`,
+  "google",
+  "gemini",
+  "github",
+  "gitlab",
+  "aws",
+  "stripe",
+  "cohere",
+  "mistral",
+  "groq",
+  "openrouter",
+  "xai",
+  "deepseek",
+].join("|");
+
+// Keep this policy closed: arbitrary words ending in Token/Secret are ordinary diagnostics.
+const CREDENTIAL_LABEL_PATTERN = [
+  String.raw`(?:${COMMON_API_KEY_VENDOR_PATTERN})[\s_-]*${API_KEY_LABEL_PATTERN}`,
+  API_KEY_LABEL_PATTERN,
+  String.raw`(?:access|private)[\s_-]*key`,
+  String.raw`(?:access|refresh|auth|bearer|id|session|csrf)[\s_-]*token`,
+  String.raw`(?:client|api|signing|webhook)[\s_-]*secret`,
+  "token",
+  "secret",
+  "password",
+].join("|");
+
+const JSON_AUTHORIZATION_ASSIGNMENT =
+  /("authorization"\s*:\s*")(?:(bearer|basic)\s+)?[^"\r\n]*"/gi;
+const JSON_CREDENTIAL_ASSIGNMENT = new RegExp(
+  String.raw`("(?:${CREDENTIAL_LABEL_PATTERN})"\s*:\s*")[^"\r\n]*"`,
+  "gi",
+);
+const AUTHORIZATION_ASSIGNMENT =
+  /(?<![a-z0-9_-])(\bauthorization\b\s*[:=]\s*)(?:(bearer|basic)\s+)?(?:"([^"\r\n]*)"|'([^'\r\n]*)'|([^;\s,}\]\r\n]+))/gi;
+const CREDENTIAL_ASSIGNMENT = new RegExp(
+  String.raw`(?<![a-z0-9_-])(\b(?:${CREDENTIAL_LABEL_PATTERN})\b\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^;\s,}\]\r\n]+)`,
+  "gi",
+);
+
 export function isLegalToolCallTransition(from: ToolCallStatus, to: ToolCallStatus): boolean {
   return LEGAL_TRANSITIONS[from].has(to);
 }
@@ -56,8 +100,10 @@ function assertStrictJsonValue(value: unknown, ancestors: Set<object>): void {
       }
       for (let index = 0; index < value.length; index += 1) {
         const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
-        if (descriptor === undefined || !("value" in descriptor)) {
-          throw new TypeError("terminal tool-call result arrays must not contain holes or accessors");
+        if (descriptor === undefined || !descriptor.enumerable || !("value" in descriptor)) {
+          throw new TypeError(
+            "terminal tool-call result arrays must contain enumerable data properties for every element",
+          );
         }
         assertStrictJsonValue(descriptor.value, ancestors);
       }
@@ -112,13 +158,30 @@ export function sanitizeToolCallErrorText(value: string | undefined): string | n
   const withoutControls = value
     .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")
     .trim();
-  const withoutAuthorization = withoutControls.replace(
-    /(\bauthorization\b\s*[:=]\s*)(?:(bearer|basic)\s+)?(?:"[^"\r\n]*"|'[^'\r\n]*'|[^;\s,}\]\r\n]+)/gi,
-    (_match, label: string, scheme: string | undefined) =>
-      `${label}${scheme === undefined ? "" : `${scheme} `}[REDACTED]`,
+  const withoutJsonAuthorization = withoutControls.replace(
+    JSON_AUTHORIZATION_ASSIGNMENT,
+    (_match, prefix: string, scheme: string | undefined) =>
+      `${prefix}${scheme === undefined ? "" : `${scheme} `}[REDACTED]"`,
   );
-  return withoutAuthorization.replace(
-    /(\b[a-z0-9_-]*(?:(?:api|access|private)[\s_-]*key|(?:access|refresh)[\s_-]*token|token|secret|password)\b\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^;\s,}\]\r\n]+)/gi,
-    "$1[REDACTED]",
-  ).slice(0, 4000);
+  const withoutJsonCredentials = withoutJsonAuthorization.replace(
+    JSON_CREDENTIAL_ASSIGNMENT,
+    "$1[REDACTED]\"",
+  );
+  const withoutAuthorization = withoutJsonCredentials.replace(
+    AUTHORIZATION_ASSIGNMENT,
+    (
+      _match,
+      label: string,
+      explicitScheme: string | undefined,
+      doubleQuotedValue: string | undefined,
+      singleQuotedValue: string | undefined,
+      unquotedValue: string | undefined,
+    ) => {
+      const valueText = doubleQuotedValue ?? singleQuotedValue ?? unquotedValue ?? "";
+      const embeddedScheme = /^(bearer|basic)\s+/i.exec(valueText)?.[1];
+      const scheme = explicitScheme ?? embeddedScheme;
+      return `${label}${scheme === undefined ? "" : `${scheme} `}[REDACTED]`;
+    },
+  );
+  return withoutAuthorization.replace(CREDENTIAL_ASSIGNMENT, "$1[REDACTED]").slice(0, 4000);
 }

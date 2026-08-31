@@ -232,6 +232,14 @@ test("the lowest transition boundary rejects terminal results that do not round-
     value: "hidden",
     enumerable: false,
   });
+  const nonEnumerableElementArray: unknown[] = ["hidden"];
+  Object.defineProperty(nonEnumerableElementArray, "0", {
+    enumerable: false,
+  });
+  const nestedNonEnumerableElementArray: unknown[] = ["nested hidden"];
+  Object.defineProperty(nestedNonEnumerableElementArray, "0", {
+    enumerable: false,
+  });
   const nestedAugmentedArray: unknown[] = [];
   Object.defineProperty(nestedAugmentedArray, "4294967295", {
     value: "nested dropped",
@@ -250,6 +258,8 @@ test("the lowest transition boundary rejects terminal results that do not round-
     { name: "sparse array", value: sparseArray },
     { name: "extra named array property", value: namedPropertyArray },
     { name: "non-enumerable named array property", value: nonEnumerablePropertyArray },
+    { name: "non-enumerable array element", value: nonEnumerableElementArray },
+    { name: "nested non-enumerable array element", value: { nested: nestedNonEnumerableElementArray } },
     { name: "nested augmented array", value: { nested: nestedAugmentedArray } },
   ];
   const cyclic: { self?: unknown } = {};
@@ -318,6 +328,11 @@ test("the lowest transition boundary redacts only credential values and preserve
       secret: "api-live-value",
     },
     {
+      input: "OpenAI API key: spaced-vendor-live-value; upstream timeout",
+      expected: "OpenAI API key: [REDACTED]; upstream timeout",
+      secret: "spaced-vendor-live-value",
+    },
+    {
       input: "openAiApiKey=vendor-live-value; upstream timeout",
       expected: "openAiApiKey=[REDACTED]; upstream timeout",
       secret: "vendor-live-value",
@@ -347,6 +362,29 @@ test("the lowest transition boundary redacts only credential values and preserve
       expected: "client-secret=[REDACTED]; retry failed",
       secret: "secret-live-value",
     },
+    {
+      input: "refreshToken=refresh-live-value; retry failed",
+      expected: "refreshToken=[REDACTED]; retry failed",
+      secret: "refresh-live-value",
+    },
+    {
+      input: '\"Authorization\": \"Bearer json-auth-live-value\", \"message\": \"upstream timeout\"',
+      expected: '\"Authorization\": \"Bearer [REDACTED]\", \"message\": \"upstream timeout\"',
+      secret: "json-auth-live-value",
+    },
+    {
+      input: '\"apiKey\": \"json-api-live-value\", \"message\": \"upstream timeout\"',
+      expected: '\"apiKey\": \"[REDACTED]\", \"message\": \"upstream timeout\"',
+      secret: "json-api-live-value",
+    },
+  ] as const;
+  const ordinaryDiagnostics = [
+    "cancellationToken=aborted; upstream timeout",
+    "designToken=primary",
+    "tokenCount=42",
+    "paginationToken=cursor-42; fetch failed",
+    "syntaxSecret=keyword; parser failed",
+    "passwordPolicy=strict",
   ] as const;
   try {
     store.upsertProject(identity("project-terminal-error-redaction", "D:\\repo"));
@@ -354,12 +392,20 @@ test("the lowest transition boundary redacts only credential values and preserve
     store.insertAssistantMessageWithToolCalls({
       sessionId: session.id,
       payload: {},
-      toolCalls: cases.map((_item, ordinal) => ({
-        callId: `redacted-call-${ordinal}`,
-        ordinal,
-        toolName: "shell",
-        inputText: "{}",
-      })),
+      toolCalls: [
+        ...cases.map((_item, ordinal) => ({
+          callId: `redacted-call-${ordinal}`,
+          ordinal,
+          toolName: "shell",
+          inputText: "{}",
+        })),
+        ...ordinaryDiagnostics.map((_item, index) => ({
+          callId: `ordinary-diagnostic-${index}`,
+          ordinal: cases.length + index,
+          toolName: "shell",
+          inputText: "{}",
+        })),
+      ],
     });
 
     for (const [ordinal, item] of cases.entries()) {
@@ -378,6 +424,24 @@ test("the lowest transition boundary redacts only credential values and preserve
           .get(callId) as { error_text: string };
         assert.equal(raw.error_text, item.expected);
         assert.equal(raw.error_text.includes(item.secret), false);
+      });
+    }
+
+    for (const [index, diagnostic] of ordinaryDiagnostics.entries()) {
+      await t.test(`does not redact ${diagnostic}`, () => {
+        const callId = `ordinary-diagnostic-${index}`;
+        const outcome = store.compareAndSwapToolCall({
+          callId,
+          expectedStatus: "pending",
+          status: "failure",
+          result: { message: "command failed" },
+          errorText: diagnostic,
+        });
+        assert.equal(outcome.applied, true);
+        assert.equal(outcome.call.errorText, diagnostic);
+        const raw = connection.db.prepare("SELECT error_text FROM tool_calls WHERE call_id = ?")
+          .get(callId) as { error_text: string };
+        assert.equal(raw.error_text, diagnostic);
       });
     }
   } finally {
