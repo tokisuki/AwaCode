@@ -1,4 +1,5 @@
 import { backup, DatabaseSync } from "node:sqlite";
+import { open as openFile, rm } from "node:fs/promises";
 import { resolve } from "node:path";
 
 import {
@@ -31,11 +32,11 @@ interface TableInfoRow {
   pk: number;
 }
 
-function hasApplicationTables(db: DatabaseSync): boolean {
+function hasUserSchemaObjects(db: DatabaseSync): boolean {
   const row = db.prepare(`
     SELECT COUNT(*) AS count
     FROM sqlite_schema
-    WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+    WHERE name NOT LIKE 'sqlite_%'
   `).get() as { count: number };
   return row.count > 0;
 }
@@ -92,35 +93,60 @@ function validateMigrations(migrations: readonly Migration[]): void {
 }
 
 function applyMigration(db: DatabaseSync, migration: Migration, appliedAt: string): void {
-  db.exec("BEGIN IMMEDIATE");
-  try {
-    if (hasMigrationTable(db)) {
-      const existing = db.prepare("SELECT version FROM schema_migrations WHERE version = ?").get(migration.version);
-      if (existing !== undefined) {
-        db.exec("COMMIT");
-        return;
-      }
+  if (hasMigrationTable(db)) {
+    const existing = db.prepare("SELECT version FROM schema_migrations WHERE version = ?").get(migration.version);
+    if (existing !== undefined) {
+      return;
     }
-    migration.up(db);
-    if (!isRecognizableMigrationTable(db)) {
-      throw new Error("migration did not leave a recognizable schema_migrations table");
-    }
-    db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
-      .run(migration.version, appliedAt);
-    db.exec("COMMIT");
-  } catch (error) {
-    try {
-      db.exec("ROLLBACK");
-    } catch {
-      // Preserve the migration failure when SQLite already ended the transaction.
-    }
-    throw error;
   }
+  migration.up(db);
+  if (!isRecognizableMigrationTable(db)) {
+    throw new Error("migration did not leave a recognizable schema_migrations table");
+  }
+  db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+    .run(migration.version, appliedAt);
 }
 
 function backupName(version: number, now: Date): string {
   const timestamp = now.toISOString().replace(/[:.]/g, "-");
   return `awacode-v${version}-${timestamp}.db`;
+}
+
+async function reserveBackupPath(directory: string, version: number, now: Date): Promise<string> {
+  const baseName = backupName(version, now);
+  const extensionIndex = baseName.lastIndexOf(".db");
+  const stem = baseName.slice(0, extensionIndex);
+  for (let collision = 0; ; collision += 1) {
+    const name = collision === 0 ? baseName : `${stem}-${collision}.db`;
+    const path = resolve(directory, name);
+    try {
+      const reservation = await openFile(path, "wx");
+      await reservation.close();
+      return path;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw error;
+      }
+    }
+  }
+}
+
+async function createBackup(
+  databasePath: string,
+  backupDirectory: string,
+  version: number,
+  now: Date,
+): Promise<void> {
+  const destination = await reserveBackupPath(backupDirectory, version, now);
+  const source = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    await backup(source, destination);
+  } catch (error) {
+    await rm(destination, { force: true });
+    throw error;
+  } finally {
+    source.close();
+  }
 }
 
 function configureConnection(db: DatabaseSync): void {
@@ -154,23 +180,40 @@ export async function openDatabase(options: OpenDatabaseOptions = {}): Promise<D
 
   try {
     configureConnection(db);
-    const nonEmpty = hasApplicationTables(db);
-    if (nonEmpty && !isRecognizableMigrationTable(db)) {
-      throw new Error(`refusing to initialize unrecognized non-empty database: ${paths.database}`);
+    db.exec("BEGIN IMMEDIATE");
+    let version: number;
+    try {
+      const nonEmpty = hasUserSchemaObjects(db);
+      if (nonEmpty && !isRecognizableMigrationTable(db)) {
+        throw new Error(`refusing to initialize unrecognized non-empty database: ${paths.database}`);
+      }
+      const oldVersion = databaseVersion(db);
+      if (oldVersion > newestVersion) {
+        throw new Error(`database version ${oldVersion} is newer than supported version ${newestVersion}`);
+      }
+      const applied = appliedVersions(db);
+      const missing = migrations.filter((migration) => !applied.has(migration.version));
+      if (nonEmpty && missing.length > 0) {
+        await createBackup(
+          paths.database,
+          paths.backups,
+          oldVersion,
+          (options.now ?? (() => new Date()))(),
+        );
+      }
+      for (const migration of missing) {
+        applyMigration(db, migration, (options.now ?? (() => new Date()))().toISOString());
+      }
+      version = databaseVersion(db);
+      db.exec("COMMIT");
+    } catch (error) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        // Preserve the migration failure when SQLite already ended the transaction.
+      }
+      throw error;
     }
-    const oldVersion = databaseVersion(db);
-    if (oldVersion > newestVersion) {
-      throw new Error(`database version ${oldVersion} is newer than supported version ${newestVersion}`);
-    }
-    const applied = appliedVersions(db);
-    const missing = migrations.filter((migration) => !applied.has(migration.version));
-    if (nonEmpty && missing.length > 0) {
-      await backup(db, resolve(paths.backups, backupName(oldVersion, (options.now ?? (() => new Date()))())));
-    }
-    for (const migration of missing) {
-      applyMigration(db, migration, (options.now ?? (() => new Date()))().toISOString());
-    }
-    const version = databaseVersion(db);
     return {
       db,
       paths,

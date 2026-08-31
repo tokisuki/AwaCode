@@ -107,6 +107,27 @@ test("falls back to the normalized real path for non-Git directories and unborn 
   }
 });
 
+for (const [label, remote] of [
+  ["forward-slash drive", "C:/repo/project.git"],
+  ["backslash drive", "D:\\repo\\project.git"],
+  ["UNC", "\\\\server\\share\\project.git"],
+  ["file URL", "file:///C:/repo/project.git"],
+] as const) {
+  test(`treats a ${label} origin as local and falls back to path identity`, async () => {
+    const repository = await initializeRepository(`local-${label.replaceAll(" ", "-")}`);
+    await git(repository, "remote", "add", "origin", remote);
+    const real = normalize(await realpath(repository));
+    const expectedPath = process.platform === "win32" ? real.toLowerCase() : real;
+
+    const resolved = await resolveProjectIdentity(repository);
+
+    assert.equal(resolved.kind, "path");
+    assert.equal(resolved.value, expectedPath);
+    assert.equal(resolved.remote, undefined);
+    assert.equal(resolved.id, sha256(`path:${expectedPath}`));
+  });
+}
+
 test("rejects a workspace that is not an existing directory", async () => {
   const parent = await temporaryDirectory("missing");
   await assert.rejects(resolveProjectIdentity(join(parent, "does-not-exist")), /existing directory/);

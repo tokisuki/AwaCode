@@ -32,6 +32,16 @@ export class WorkspaceNotFoundError extends Error {
   }
 }
 
+export class LocalGitRemoteError extends TypeError {
+  readonly remote: string;
+
+  constructor(remote: string) {
+    super("local Git remotes do not define a stable remote identity");
+    this.name = "LocalGitRemoteError";
+    this.remote = remote;
+  }
+}
+
 function identityId(input: string): string {
   return createHash("sha256").update(input).digest("hex");
 }
@@ -46,6 +56,9 @@ function normalizedRemotePath(pathname: string): string {
 
 export function normalizeGitRemote(value: string): string {
   const remote = value.trim();
+  if (/^[a-z]:[\\/]/i.test(remote) || /^(?:\\\\|\/\/)/.test(remote) || /^file:/i.test(remote)) {
+    throw new LocalGitRemoteError(remote);
+  }
   if (/^[a-z][a-z\d+.-]*:\/\//i.test(remote)) {
     const url = new URL(remote);
     const protocol = url.protocol.slice(0, -1).toLowerCase();
@@ -118,14 +131,20 @@ export async function resolveProjectIdentity(
 
   const remoteOutput = await gitOutput(rootPath, ["config", "--get", "remote.origin.url"], options);
   if (remoteOutput !== undefined) {
-    const remote = normalizeGitRemote(remoteOutput);
-    return {
-      id: identityId(`remote:${remote}`),
-      kind: "remote",
-      value: remote,
-      remote,
-      rootPath,
-    };
+    try {
+      const remote = normalizeGitRemote(remoteOutput);
+      return {
+        id: identityId(`remote:${remote}`),
+        kind: "remote",
+        value: remote,
+        remote,
+        rootPath,
+      };
+    } catch (error) {
+      if (!(error instanceof LocalGitRemoteError)) {
+        throw error;
+      }
+    }
   }
 
   const rootOutput = await gitOutput(rootPath, ["rev-list", "--max-parents=0", "HEAD"], options);

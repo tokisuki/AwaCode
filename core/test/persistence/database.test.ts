@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -160,6 +160,32 @@ test("rejects an unknown non-empty database without replacing it", async () => {
       ["keep me"],
     );
     assert.equal(reopened.prepare("SELECT COUNT(*) AS count FROM sqlite_schema WHERE name = 'projects'").get()?.count, 0);
+  } finally {
+    reopened.close();
+  }
+});
+
+test("rejects a view-only unknown database without creating AwaCode tables", async () => {
+  const root = await dataRoot("unknown-view");
+  const databasePath = join(root, "awacode.db");
+  const unknown = new DatabaseSync(databasePath);
+  unknown.exec("CREATE VIEW unrelated_view AS SELECT 'keep me' AS value");
+  unknown.close();
+
+  await assert.rejects(async () => {
+    const accepted = await openDatabase({ env: { AWACODE_DATA_DIR: root } });
+    accepted.close();
+    throw new Error("view-only database was accepted");
+  }, /unrecognized non-empty database/);
+
+  const reopened = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    assert.deepEqual(
+      reopened.prepare("SELECT value FROM unrelated_view").all().map((row) => String(row.value)),
+      ["keep me"],
+    );
+    assert.equal(reopened.prepare("SELECT COUNT(*) AS count FROM sqlite_schema WHERE name = 'projects'").get()?.count, 0);
+    assert.equal(reopened.prepare("SELECT COUNT(*) AS count FROM sqlite_schema WHERE name = 'schema_migrations'").get()?.count, 0);
   } finally {
     reopened.close();
   }
@@ -361,5 +387,92 @@ test("two real initializers released together converge on one valid V1 schema", 
     assert.equal(verified.db.prepare("SELECT COUNT(*) AS count FROM sqlite_schema WHERE name = 'projects'").get()?.count, 1);
   } finally {
     verified.close();
+  }
+});
+
+test("two real V0 upgrades share one critical section and never overwrite a colliding backup", async () => {
+  const root = await dataRoot("old-race");
+  const databasePath = join(root, "awacode.db");
+  const old = new DatabaseSync(databasePath);
+  old.exec(`
+    CREATE TABLE schema_migrations (
+      version INTEGER PRIMARY KEY,
+      applied_at TEXT NOT NULL
+    ) STRICT;
+    CREATE TABLE legacy_notes (value TEXT NOT NULL) STRICT;
+    INSERT INTO legacy_notes (value) VALUES ('V0 survives');
+  `);
+  old.close();
+
+  const timestamp = "2026-08-31T09:10:11.222Z";
+  const baseName = "awacode-v0-2026-08-31T09-10-11-222Z.db";
+  const backupDirectory = join(root, "backups");
+  await mkdir(backupDirectory);
+  const collision = new DatabaseSync(join(backupDirectory, baseName));
+  collision.exec(`
+    CREATE TABLE collision_sentinel (value TEXT NOT NULL) STRICT;
+    INSERT INTO collision_sentinel (value) VALUES ('do not overwrite');
+  `);
+  collision.close();
+
+  const fixture = join(import.meta.dirname, "..", "..", "test-fixtures", "database-initialize-child.ts");
+  const channels = [0, 1].map(() => {
+    const child = spawn(process.execPath, [fixture, root, timestamp], {
+      env: childEnvironment(),
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const lines = childLineReader(child);
+    return { child, lines, ready: lines.nextLine(), exited: once(child, "exit") };
+  });
+  try {
+    assert.deepEqual(await Promise.all(channels.map((channel) => channel.ready)), ["READY", "READY"]);
+    const results = channels.map((channel) => channel.lines.nextLine());
+    for (const channel of channels) {
+      channel.child.stdin.end("GO\n");
+    }
+    assert.deepEqual((await Promise.all(results)).map((line) => JSON.parse(line)), [
+      { version: 1, migrationCount: 1 },
+      { version: 1, migrationCount: 1 },
+    ]);
+    assert.deepEqual(
+      (await Promise.all(channels.map((channel) => channel.exited))).map(([code]) => code),
+      [0, 0],
+    );
+  } finally {
+    for (const channel of channels) {
+      if (channel.child.exitCode === null) {
+        channel.child.kill();
+      }
+    }
+  }
+
+  const collisionAfter = new DatabaseSync(join(backupDirectory, baseName), { readOnly: true });
+  try {
+    assert.deepEqual(
+      collisionAfter.prepare("SELECT value FROM collision_sentinel").all().map((row) => String(row.value)),
+      ["do not overwrite"],
+    );
+  } finally {
+    collisionAfter.close();
+  }
+
+  assert.deepEqual((await readdir(backupDirectory)).sort(), [
+    "awacode-v0-2026-08-31T09-10-11-222Z-1.db",
+    baseName,
+  ]);
+  const v0Backup = new DatabaseSync(
+    join(backupDirectory, "awacode-v0-2026-08-31T09-10-11-222Z-1.db"),
+    { readOnly: true },
+  );
+  try {
+    assert.equal(v0Backup.prepare("PRAGMA integrity_check").get()?.integrity_check, "ok");
+    assert.equal(v0Backup.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()?.count, 0);
+    assert.equal(v0Backup.prepare("SELECT COUNT(*) AS count FROM sqlite_schema WHERE name = 'projects'").get()?.count, 0);
+    assert.deepEqual(
+      v0Backup.prepare("SELECT value FROM legacy_notes").all().map((row) => String(row.value)),
+      ["V0 survives"],
+    );
+  } finally {
+    v0Backup.close();
   }
 });
