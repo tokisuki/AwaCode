@@ -1,11 +1,11 @@
 import {
   type SessionStore,
   type ToolCallRecord,
-  type ToolCallStatus,
 } from "../persistence/session-store.ts";
 import {
   isLegalToolCallTransition,
   isTerminalToolCallStatus,
+  type ToolCallStatus,
 } from "./tool-call-transition-policy.ts";
 
 export interface ToolCallTransitionInput {
@@ -21,13 +21,6 @@ export type ToolCallTransitionOutcome =
   | { kind: "idempotent"; call: ToolCallRecord }
   | { kind: "conflict"; reason: "illegal_transition" | "stale_status"; call: ToolCallRecord };
 
-function sanitizeErrorText(value: string | undefined): string | undefined {
-  if (value === undefined) {
-    return undefined;
-  }
-  return value.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "").trim().slice(0, 4000);
-}
-
 export function transitionToolCall(
   store: SessionStore,
   input: ToolCallTransitionInput,
@@ -40,13 +33,12 @@ export function transitionToolCall(
     return { kind: "conflict", reason: "illegal_transition", call: store.loadToolCall(input.callId) };
   }
 
-  const errorText = sanitizeErrorText(input.errorText);
   const outcome = store.compareAndSwapToolCall({
     callId: input.callId,
     expectedStatus: input.expectedStatus,
     status: input.status,
     ...(input.result === undefined ? {} : { result: input.result }),
-    ...(errorText === undefined ? {} : { errorText }),
+    ...(input.errorText === undefined ? {} : { errorText: input.errorText }),
   });
   if (outcome.applied) {
     return { kind: "applied", call: outcome.call };

@@ -210,6 +210,91 @@ test("terminal transitions require one result and never overwrite terminal data 
   }
 });
 
+test("the lowest transition boundary rejects terminal results that do not round-trip as strict JSON", async (t) => {
+  const root = await dataRoot("strict-terminal-json");
+  const connection = await openDatabase({ env: { AWACODE_DATA_DIR: root } });
+  const invalidResults: Array<{ name: string; value: unknown }> = [
+    { name: "top-level null", value: null },
+    { name: "top-level non-finite number", value: Number.NaN },
+    { name: "nested non-finite number", value: { nested: Number.POSITIVE_INFINITY } },
+    { name: "nested undefined", value: { nested: undefined } },
+    { name: "function", value: () => undefined },
+    { name: "symbol", value: Symbol("not-json") },
+    { name: "JSON-normalizing object", value: new Date("2026-09-01T00:00:00.000Z") },
+  ];
+  const cyclic: { self?: unknown } = {};
+  cyclic.self = cyclic;
+  invalidResults.push({ name: "cycle", value: cyclic });
+  const ids = ["session-strict-terminal-json", "message-strict-terminal-json"];
+  const store = new SessionStore(connection.db, { randomUUID: () => ids.shift() as string });
+  try {
+    store.upsertProject(identity("project-strict-terminal-json", "D:\\repo"));
+    const session = store.createSession("project-strict-terminal-json", "Strict terminal JSON");
+    store.insertAssistantMessageWithToolCalls({
+      sessionId: session.id,
+      payload: {},
+      toolCalls: invalidResults.map(({ name }, ordinal) => ({
+        callId: `strict-${ordinal}`,
+        ordinal,
+        toolName: "read",
+        inputText: JSON.stringify({ name }),
+      })),
+    });
+
+    for (const [ordinal, item] of invalidResults.entries()) {
+      await t.test(item.name, () => {
+        const callId = `strict-${ordinal}`;
+        assert.throws(() => store.compareAndSwapToolCall({
+          callId,
+          expectedStatus: "pending",
+          status: "failure",
+          result: item.value,
+        }), TypeError);
+        const persisted = store.loadToolCall(callId);
+        assert.equal(persisted.status, "pending");
+        assert.equal(persisted.result, null);
+        assert.equal(persisted.finishedAt, null);
+      });
+    }
+  } finally {
+    connection.close();
+  }
+});
+
+test("the lowest transition boundary redacts credential values before persisting error text", async () => {
+  const root = await dataRoot("terminal-error-redaction");
+  const connection = await openDatabase({ env: { AWACODE_DATA_DIR: root } });
+  const ids = ["session-terminal-error-redaction", "message-terminal-error-redaction"];
+  const store = new SessionStore(connection.db, { randomUUID: () => ids.shift() as string });
+  try {
+    store.upsertProject(identity("project-terminal-error-redaction", "D:\\repo"));
+    const session = store.createSession("project-terminal-error-redaction", "Terminal error redaction");
+    store.insertAssistantMessageWithToolCalls({
+      sessionId: session.id,
+      payload: {},
+      toolCalls: [{ callId: "redacted-call", ordinal: 0, toolName: "shell", inputText: "{}" }],
+    });
+
+    const outcome = store.compareAndSwapToolCall({
+      callId: "redacted-call",
+      expectedStatus: "pending",
+      status: "failure",
+      result: { message: "command failed" },
+      errorText: "  Authorization: Bearer auth-live-value\nOPENAI_API_KEY=api-live-value; token: token-live-value; secret='secret-live-value'\u0000  ",
+    });
+    assert.equal(outcome.applied, true);
+    assert.equal(outcome.call.errorText, [
+      "Authorization: [REDACTED]",
+      "OPENAI_API_KEY=[REDACTED]; token: [REDACTED]; secret=[REDACTED]",
+    ].join("\n"));
+    const raw = connection.db.prepare("SELECT error_text FROM tool_calls WHERE call_id = ?")
+      .get("redacted-call") as { error_text: string };
+    assert.doesNotMatch(raw.error_text, /auth-live-value|api-live-value|token-live-value|secret-live-value/);
+  } finally {
+    connection.close();
+  }
+});
+
 test("two real processes race allow against deny or cancel and only the CAS winner begins its action", async (t) => {
   for (const terminalTarget of ["denied", "interrupted"] as const) {
     await t.test(`allow versus ${terminalTarget}`, async () => {

@@ -2,9 +2,9 @@ import {
   type MessageRecord,
   type SessionStore,
   type ToolCallRecord,
-  type ToolCallStatus,
 } from "../persistence/session-store.ts";
 import { recoverInterruptedState } from "./recovery.ts";
+import type { ToolCallStatus } from "./tool-call-transition-policy.ts";
 
 type ProviderRole = "system" | "user" | "assistant";
 type TerminalToolCallStatus = "success" | "failure" | "denied" | "interrupted";
@@ -125,6 +125,9 @@ export function validateProviderHistory(store: SessionStore, sessionId: string):
       if (message.role !== "assistant") {
         integrity(`tool call ${call.callId} is not attached to an assistant message`);
       }
+      if (message.kind !== "tool_calls") {
+        integrity(`tool call ${call.callId} is attached to assistant kind ${message.kind}`);
+      }
       if (!TERMINAL_STATUSES.has(call.status)) {
         integrity(`tool call ${call.callId} is nonterminal`);
       }
@@ -134,6 +137,17 @@ export function validateProviderHistory(store: SessionStore, sessionId: string):
       const calls = callsByMessage.get(message.id) ?? [];
       calls.push(call);
       callsByMessage.set(message.id, calls);
+    }
+    for (const [messageId, calls] of callsByMessage) {
+      for (const [index, call] of calls.entries()) {
+        if (!Number.isSafeInteger(call.ordinal) || call.ordinal !== index) {
+          integrity(`assistant message ${messageId} has a non-contiguous or duplicate ordinal`);
+        }
+      }
+      const message = messages.get(messageId) as MessageRecord;
+      if (message.status !== "complete") {
+        integrity(`tool call block ${messageId} is attached to a non-complete assistant message`);
+      }
     }
 
     const history: ProviderHistoryEntry[] = [];

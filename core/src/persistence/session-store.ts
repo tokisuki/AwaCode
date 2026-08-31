@@ -2,22 +2,20 @@ import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 
 import type { ProjectIdentity, ProjectIdentityKind } from "../project/project-identity.ts";
+import { createToolCallRecoveryRecords } from "../session/tool-call-recovery-records.ts";
 import {
   isLegalToolCallTransition,
   isTerminalToolCallStatus,
+  sanitizeToolCallErrorText,
+  stringifyTerminalToolCallResult,
+  type ToolCallStatus,
 } from "../session/tool-call-transition-policy.ts";
+
+export type { ToolCallStatus } from "../session/tool-call-transition-policy.ts";
 
 export type SessionStatus = "idle" | "running" | "completed" | "interrupted" | "cancelled" | "error";
 export type MessageRole = "system" | "user" | "assistant" | "tool" | "internal";
 export type MessageStatus = "streaming" | "complete" | "interrupted";
-export type ToolCallStatus =
-  | "pending"
-  | "awaiting_approval"
-  | "running"
-  | "success"
-  | "failure"
-  | "denied"
-  | "interrupted";
 
 export interface ProjectRecord {
   id: string;
@@ -109,13 +107,6 @@ export interface CompareAndSwapToolCallInput {
 export interface CompareAndSwapToolCallResult {
   applied: boolean;
   call: ToolCallRecord;
-}
-
-export interface InterruptedStateResults {
-  notStarted: unknown;
-  outcomeUnknown: unknown;
-  notStartedErrorText: string;
-  outcomeUnknownErrorText: string;
 }
 
 export interface RecoverySummary {
@@ -291,7 +282,7 @@ export class SessionStore {
         tool_calls.finished_at
       FROM tool_calls
       JOIN messages ON messages.id = tool_calls.assistant_message_id
-      WHERE tool_calls.session_id = ?
+      WHERE messages.session_id = ?
       ORDER BY messages.seq, tool_calls.ordinal
     `).all(sessionId) as unknown as Record<string, unknown>[]).map(toolCallRecord);
     return { session, messages, toolCalls };
@@ -415,7 +406,7 @@ export class SessionStore {
     }
     if (terminal) {
       assignments.push("result_json = ?", "error_text = ?", "finished_at = ?");
-      values.push(stringifyJson(input.result), input.errorText ?? null, now);
+      values.push(stringifyTerminalToolCallResult(input.result), sanitizeToolCallErrorText(input.errorText), now);
     }
 
     this.db.exec("BEGIN IMMEDIATE");
@@ -434,10 +425,11 @@ export class SessionStore {
     }
   }
 
-  convergeInterruptedState(results: InterruptedStateResults): RecoverySummary {
+  convergeInterruptedState(): RecoverySummary {
     const now = this.currentDate().toISOString();
-    const notStartedJson = stringifyJson(results.notStarted);
-    const outcomeUnknownJson = stringifyJson(results.outcomeUnknown);
+    const recovery = createToolCallRecoveryRecords();
+    const notStartedJson = stringifyTerminalToolCallResult(recovery.notStarted.result);
+    const outcomeUnknownJson = stringifyTerminalToolCallResult(recovery.outcomeUnknown.result);
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const sessionsInterrupted = Number(this.db.prepare(`
@@ -454,12 +446,12 @@ export class SessionStore {
         UPDATE tool_calls
         SET status = 'interrupted', result_json = ?, error_text = ?, finished_at = ?
         WHERE status IN ('pending', 'awaiting_approval')
-      `).run(notStartedJson, results.notStartedErrorText, now).changes);
+      `).run(notStartedJson, recovery.notStarted.errorText, now).changes);
       const outcomeUnknownCallsInterrupted = Number(this.db.prepare(`
         UPDATE tool_calls
         SET status = 'interrupted', result_json = ?, error_text = ?, finished_at = ?
         WHERE status = 'running'
-      `).run(outcomeUnknownJson, results.outcomeUnknownErrorText, now).changes);
+      `).run(outcomeUnknownJson, recovery.outcomeUnknown.errorText, now).changes);
       this.db.exec("COMMIT");
       return {
         interruptedCount: notStartedCallsInterrupted + outcomeUnknownCallsInterrupted,

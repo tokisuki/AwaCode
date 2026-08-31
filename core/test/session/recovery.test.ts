@@ -94,6 +94,59 @@ test("startup recovery distinguishes calls that never began from running calls w
   }
 });
 
+test("the public convergence boundary constructs the exact recovery results without caller data", async () => {
+  const root = await dataRoot("trusted-boundary");
+  const connection = await openDatabase({ env: { AWACODE_DATA_DIR: root } });
+  const ids = ["session-trusted-boundary", "message-trusted-boundary"];
+  const store = new SessionStore(connection.db, {
+    now: () => new Date("2026-09-01T03:30:00.000Z"),
+    randomUUID: () => ids.shift() as string,
+  });
+  try {
+    store.upsertProject(identity("project-trusted-boundary", "D:\\repo"));
+    const session = store.createSession("project-trusted-boundary", "Trusted recovery boundary");
+    store.insertAssistantMessageWithToolCalls({
+      sessionId: session.id,
+      payload: {},
+      toolCalls: [
+        { callId: "trusted-pending", ordinal: 0, toolName: "read", inputText: "{}" },
+        { callId: "trusted-running", ordinal: 1, toolName: "shell", inputText: "{}" },
+      ],
+    });
+    assert.equal(transitionToolCall(store, {
+      callId: "trusted-running",
+      expectedStatus: "pending",
+      status: "running",
+    }).kind, "applied");
+
+    assert.deepEqual(store.convergeInterruptedState(), {
+      interruptedCount: 2,
+      sessionsInterrupted: 0,
+      messagesInterrupted: 0,
+      notStartedCallsInterrupted: 1,
+      outcomeUnknownCallsInterrupted: 1,
+    });
+    assert.deepEqual(store.loadSession(session.id).toolCalls.map(({ callId, result, errorText }) => ({
+      callId,
+      result,
+      errorText,
+    })), [
+      {
+        callId: "trusted-pending",
+        result: NOT_STARTED_RECOVERY_RESULT,
+        errorText: "Tool execution never began; no local side effect occurred.",
+      },
+      {
+        callId: "trusted-running",
+        result: OUTCOME_UNKNOWN_RECOVERY_RESULT,
+        errorText: "Durable outcome unknown; local side effects may have occurred. Inspect the workspace before retrying.",
+      },
+    ]);
+  } finally {
+    connection.close();
+  }
+});
+
 test("mixed recovery preserves terminal bytes and remains idempotent after reopening the database", async () => {
   const root = await dataRoot("mixed-reopen");
   const connection = await openDatabase({ env: { AWACODE_DATA_DIR: root } });

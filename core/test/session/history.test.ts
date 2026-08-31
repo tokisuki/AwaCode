@@ -162,10 +162,13 @@ async function validHistoryFixture(label: string) {
   return { connection, store, session, user, block, callId: `call-${label}` };
 }
 
-function assertIntegrityFailure(operation: () => unknown): void {
+function assertIntegrityFailure(operation: () => unknown, detailPattern?: RegExp): void {
   assert.throws(operation, (error: unknown) => {
     assert.ok(error instanceof HistoryIntegrityError);
     assert.equal(error.code, "history_integrity_error");
+    if (detailPattern !== undefined) {
+      assert.match(error.message, detailPattern);
+    }
     return true;
   });
 }
@@ -259,13 +262,15 @@ test("history validation rejects every representable persisted integrity violati
   }
 });
 
-test("history validates attached calls before filtering non-complete audit messages", async (t) => {
+test("history validates every attached call before filtering non-complete audit messages", async (t) => {
   const cases: ReadonlyArray<{
     name: string;
+    detail: RegExp;
     mutate(fixture: Awaited<ReturnType<typeof validHistoryFixture>>): void;
   }> = [
     {
       name: "interrupted assistant with a nonterminal call",
+      detail: /nonterminal/,
       mutate: ({ connection, block, callId }) => {
         connection.db.prepare("UPDATE messages SET status = 'interrupted' WHERE id = ?").run(block.message.id);
         connection.db.prepare(`
@@ -277,9 +282,46 @@ test("history validates attached calls before filtering non-complete audit messa
     },
     {
       name: "streaming assistant with a null terminal result",
+      detail: /no terminal result/,
       mutate: ({ connection, block, callId }) => {
         connection.db.prepare("UPDATE messages SET status = 'streaming' WHERE id = ?").run(block.message.id);
         connection.db.prepare("UPDATE tool_calls SET result_json = NULL WHERE call_id = ?").run(callId);
+      },
+    },
+    {
+      name: "interrupted assistant with a mismatched call session",
+      detail: /wrong session or assistant/,
+      mutate: ({ connection, session, block, callId }) => {
+        connection.db.prepare(`
+          INSERT INTO sessions (id, project_id, title, model_json, status, created_at, updated_at)
+          SELECT 'filtered-other-session', project_id, 'Other', NULL, 'idle', created_at, updated_at
+          FROM sessions WHERE id = ?
+        `).run(session.id);
+        connection.db.prepare("UPDATE messages SET status = 'interrupted' WHERE id = ?").run(block.message.id);
+        connection.db.prepare("UPDATE tool_calls SET session_id = 'filtered-other-session' WHERE call_id = ?").run(callId);
+      },
+    },
+    {
+      name: "interrupted assistant with a negative ordinal",
+      detail: /non-contiguous or duplicate ordinal/,
+      mutate: ({ connection, block, callId }) => {
+        connection.db.prepare("UPDATE messages SET status = 'interrupted' WHERE id = ?").run(block.message.id);
+        connection.db.prepare("UPDATE tool_calls SET ordinal = -1 WHERE call_id = ?").run(callId);
+      },
+    },
+    {
+      name: "interrupted assistant with the wrong message kind",
+      detail: /attached to assistant kind text/,
+      mutate: ({ connection, block }) => {
+        connection.db.prepare("UPDATE messages SET status = 'interrupted', kind = 'text' WHERE id = ?")
+          .run(block.message.id);
+      },
+    },
+    {
+      name: "interrupted assistant with an otherwise valid call",
+      detail: /non-complete assistant message/,
+      mutate: ({ connection, block }) => {
+        connection.db.prepare("UPDATE messages SET status = 'interrupted' WHERE id = ?").run(block.message.id);
       },
     },
   ];
@@ -289,7 +331,7 @@ test("history validates attached calls before filtering non-complete audit messa
       const fixture = await validHistoryFixture(`filtered-invalid-${index}`);
       try {
         item.mutate(fixture);
-        assertIntegrityFailure(() => validateProviderHistory(fixture.store, fixture.session.id));
+        assertIntegrityFailure(() => validateProviderHistory(fixture.store, fixture.session.id), item.detail);
       } finally {
         fixture.connection.close();
       }
