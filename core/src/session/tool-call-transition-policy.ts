@@ -61,8 +61,16 @@ function assertStrictJsonValue(value: unknown, ancestors: Set<object>): void {
         }
         assertStrictJsonValue(descriptor.value, ancestors);
       }
-      if (Reflect.ownKeys(value).some((key) =>
-        key !== "length" && (typeof key !== "string" || !/^(?:0|[1-9]\d*)$/.test(key)))) {
+      if (Reflect.ownKeys(value).some((key) => {
+        if (key === "length") {
+          return false;
+        }
+        if (typeof key !== "string" || !/^(?:0|[1-9]\d*)$/.test(key)) {
+          return true;
+        }
+        const index = Number(key);
+        return !Number.isSafeInteger(index) || index >= value.length;
+      })) {
         throw new TypeError("terminal tool-call result arrays must not contain non-index properties");
       }
       return;
@@ -85,11 +93,15 @@ function assertStrictJsonValue(value: unknown, ancestors: Set<object>): void {
   }
 }
 
-export function stringifyTerminalToolCallResult(value: unknown): string {
+export function assertStrictTerminalToolCallResult(value: unknown): void {
   if (value === null) {
     throw new TypeError("terminal tool-call transition requires a non-null JSON result");
   }
   assertStrictJsonValue(value, new Set());
+}
+
+export function stringifyTerminalToolCallResult(value: unknown): string {
+  assertStrictTerminalToolCallResult(value);
   return JSON.stringify(value);
 }
 
@@ -101,11 +113,12 @@ export function sanitizeToolCallErrorText(value: string | undefined): string | n
     .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")
     .trim();
   const withoutAuthorization = withoutControls.replace(
-    /(\bauthorization\b\s*[:=]\s*)[^\r\n]*/gi,
-    "$1[REDACTED]",
+    /(\bauthorization\b\s*[:=]\s*)(?:(bearer|basic)\s+)?(?:"[^"\r\n]*"|'[^'\r\n]*'|[^;\s,}\]\r\n]+)/gi,
+    (_match, label: string, scheme: string | undefined) =>
+      `${label}${scheme === undefined ? "" : `${scheme} `}[REDACTED]`,
   );
   return withoutAuthorization.replace(
-    /(\b(?:[a-z0-9]+[_-])*(?:api[_-]?key|access[_-]?key|private[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password)\b\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;}\]\r\n]+)/gi,
+    /(\b[a-z0-9_-]*(?:(?:api|access|private)[\s_-]*key|(?:access|refresh)[\s_-]*token|token|secret|password)\b\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^;\s,}\]\r\n]+)/gi,
     "$1[REDACTED]",
   ).slice(0, 4000);
 }

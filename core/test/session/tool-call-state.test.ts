@@ -213,6 +213,30 @@ test("terminal transitions require one result and never overwrite terminal data 
 test("the lowest transition boundary rejects terminal results that do not round-trip as strict JSON", async (t) => {
   const root = await dataRoot("strict-terminal-json");
   const connection = await openDatabase({ env: { AWACODE_DATA_DIR: root } });
+  const maximumArrayIndexKey: unknown[] = [];
+  Object.defineProperty(maximumArrayIndexKey, "4294967295", {
+    value: "dropped",
+    enumerable: true,
+  });
+  const unsafeIntegerArrayKey: unknown[] = [];
+  Object.defineProperty(unsafeIntegerArrayKey, "9007199254740992", {
+    value: "dropped",
+    enumerable: true,
+  });
+  const sparseArray = new Array<unknown>(2);
+  sparseArray[1] = "present";
+  const namedPropertyArray: unknown[] = [];
+  Object.assign(namedPropertyArray, { diagnostic: "dropped" });
+  const nonEnumerablePropertyArray: unknown[] = [];
+  Object.defineProperty(nonEnumerablePropertyArray, "diagnostic", {
+    value: "hidden",
+    enumerable: false,
+  });
+  const nestedAugmentedArray: unknown[] = [];
+  Object.defineProperty(nestedAugmentedArray, "4294967295", {
+    value: "nested dropped",
+    enumerable: true,
+  });
   const invalidResults: Array<{ name: string; value: unknown }> = [
     { name: "top-level null", value: null },
     { name: "top-level non-finite number", value: Number.NaN },
@@ -221,6 +245,12 @@ test("the lowest transition boundary rejects terminal results that do not round-
     { name: "function", value: () => undefined },
     { name: "symbol", value: Symbol("not-json") },
     { name: "JSON-normalizing object", value: new Date("2026-09-01T00:00:00.000Z") },
+    { name: "maximum array-index-like own key", value: maximumArrayIndexKey },
+    { name: "unsafe-integer array-index-like own key", value: unsafeIntegerArrayKey },
+    { name: "sparse array", value: sparseArray },
+    { name: "extra named array property", value: namedPropertyArray },
+    { name: "non-enumerable named array property", value: nonEnumerablePropertyArray },
+    { name: "nested augmented array", value: { nested: nestedAugmentedArray } },
   ];
   const cyclic: { self?: unknown } = {};
   cyclic.self = cyclic;
@@ -238,7 +268,12 @@ test("the lowest transition boundary rejects terminal results that do not round-
         ordinal,
         toolName: "read",
         inputText: JSON.stringify({ name }),
-      })),
+      })).concat({
+        callId: "strict-dense-array",
+        ordinal: invalidResults.length,
+        toolName: "read",
+        inputText: "{}",
+      }),
     });
 
     for (const [ordinal, item] of invalidResults.entries()) {
@@ -256,40 +291,95 @@ test("the lowest transition boundary rejects terminal results that do not round-
         assert.equal(persisted.finishedAt, null);
       });
     }
+
+    const denseArray = [0, null, true, "text", { nested: [1, 2] }];
+    const dense = store.compareAndSwapToolCall({
+      callId: "strict-dense-array",
+      expectedStatus: "pending",
+      status: "failure",
+      result: denseArray,
+    });
+    assert.equal(dense.applied, true);
+    assert.deepEqual(dense.call.result, denseArray);
   } finally {
     connection.close();
   }
 });
 
-test("the lowest transition boundary redacts credential values before persisting error text", async () => {
+test("the lowest transition boundary redacts only credential values and preserves diagnostic context", async (t) => {
   const root = await dataRoot("terminal-error-redaction");
   const connection = await openDatabase({ env: { AWACODE_DATA_DIR: root } });
   const ids = ["session-terminal-error-redaction", "message-terminal-error-redaction"];
   const store = new SessionStore(connection.db, { randomUUID: () => ids.shift() as string });
+  const cases = [
+    {
+      input: "API key: api-live-value; upstream timeout",
+      expected: "API key: [REDACTED]; upstream timeout",
+      secret: "api-live-value",
+    },
+    {
+      input: "openAiApiKey=vendor-live-value; upstream timeout",
+      expected: "openAiApiKey=[REDACTED]; upstream timeout",
+      secret: "vendor-live-value",
+    },
+    {
+      input: "ordinary prefix; Authorization: Bearer auth-live-value; upstream timeout",
+      expected: "ordinary prefix; Authorization: Bearer [REDACTED]; upstream timeout",
+      secret: "auth-live-value",
+    },
+    {
+      input: "openai-api-key=hyphen-live-value; retry failed",
+      expected: "openai-api-key=[REDACTED]; retry failed",
+      secret: "hyphen-live-value",
+    },
+    {
+      input: "  OPENAI_API_KEY=underscore-live-value; retry failed\u0000  ",
+      expected: "OPENAI_API_KEY=[REDACTED]; retry failed",
+      secret: "underscore-live-value",
+    },
+    {
+      input: "access_token=token-live-value; retry failed",
+      expected: "access_token=[REDACTED]; retry failed",
+      secret: "token-live-value",
+    },
+    {
+      input: "client-secret='secret-live-value'; retry failed",
+      expected: "client-secret=[REDACTED]; retry failed",
+      secret: "secret-live-value",
+    },
+  ] as const;
   try {
     store.upsertProject(identity("project-terminal-error-redaction", "D:\\repo"));
     const session = store.createSession("project-terminal-error-redaction", "Terminal error redaction");
     store.insertAssistantMessageWithToolCalls({
       sessionId: session.id,
       payload: {},
-      toolCalls: [{ callId: "redacted-call", ordinal: 0, toolName: "shell", inputText: "{}" }],
+      toolCalls: cases.map((_item, ordinal) => ({
+        callId: `redacted-call-${ordinal}`,
+        ordinal,
+        toolName: "shell",
+        inputText: "{}",
+      })),
     });
 
-    const outcome = store.compareAndSwapToolCall({
-      callId: "redacted-call",
-      expectedStatus: "pending",
-      status: "failure",
-      result: { message: "command failed" },
-      errorText: "  Authorization: Bearer auth-live-value\nOPENAI_API_KEY=api-live-value; token: token-live-value; secret='secret-live-value'\u0000  ",
-    });
-    assert.equal(outcome.applied, true);
-    assert.equal(outcome.call.errorText, [
-      "Authorization: [REDACTED]",
-      "OPENAI_API_KEY=[REDACTED]; token: [REDACTED]; secret=[REDACTED]",
-    ].join("\n"));
-    const raw = connection.db.prepare("SELECT error_text FROM tool_calls WHERE call_id = ?")
-      .get("redacted-call") as { error_text: string };
-    assert.doesNotMatch(raw.error_text, /auth-live-value|api-live-value|token-live-value|secret-live-value/);
+    for (const [ordinal, item] of cases.entries()) {
+      await t.test(item.input, () => {
+        const callId = `redacted-call-${ordinal}`;
+        const outcome = store.compareAndSwapToolCall({
+          callId,
+          expectedStatus: "pending",
+          status: "failure",
+          result: { message: "command failed" },
+          errorText: item.input,
+        });
+        assert.equal(outcome.applied, true);
+        assert.equal(outcome.call.errorText, item.expected);
+        const raw = connection.db.prepare("SELECT error_text FROM tool_calls WHERE call_id = ?")
+          .get(callId) as { error_text: string };
+        assert.equal(raw.error_text, item.expected);
+        assert.equal(raw.error_text.includes(item.secret), false);
+      });
+    }
   } finally {
     connection.close();
   }

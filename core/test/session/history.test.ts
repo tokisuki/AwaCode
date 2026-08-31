@@ -338,3 +338,38 @@ test("history validates every attached call before filtering non-complete audit 
     });
   }
 });
+
+test("history rejects lossy terminal JSON before filtering complete or interrupted parents", async (t) => {
+  const cases = [
+    { name: "complete parent with top-level Infinity", parentStatus: "complete", resultJson: "1e400" },
+    { name: "complete parent with top-level negative zero", parentStatus: "complete", resultJson: "-0" },
+    {
+      name: "interrupted parent with nested Infinity",
+      parentStatus: "interrupted",
+      resultJson: '{"nested":1e400}',
+    },
+    {
+      name: "interrupted parent with nested negative zero",
+      parentStatus: "interrupted",
+      resultJson: '{"nested":-0}',
+    },
+  ] as const;
+
+  for (const [index, item] of cases.entries()) {
+    await t.test(item.name, async () => {
+      const fixture = await validHistoryFixture(`lossy-result-${index}`);
+      try {
+        fixture.connection.db.prepare("UPDATE messages SET status = ? WHERE id = ?")
+          .run(item.parentStatus, fixture.block.message.id);
+        fixture.connection.db.prepare("UPDATE tool_calls SET result_json = ? WHERE call_id = ?")
+          .run(item.resultJson, fixture.callId);
+        assertIntegrityFailure(
+          () => validateProviderHistory(fixture.store, fixture.session.id),
+          /strict JSON result/,
+        );
+      } finally {
+        fixture.connection.close();
+      }
+    });
+  }
+});

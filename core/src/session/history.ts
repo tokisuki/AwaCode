@@ -4,7 +4,10 @@ import {
   type ToolCallRecord,
 } from "../persistence/session-store.ts";
 import { recoverInterruptedState } from "./recovery.ts";
-import type { ToolCallStatus } from "./tool-call-transition-policy.ts";
+import {
+  assertStrictTerminalToolCallResult,
+  isTerminalToolCallStatus,
+} from "./tool-call-transition-policy.ts";
 
 type ProviderRole = "system" | "user" | "assistant";
 type TerminalToolCallStatus = "success" | "failure" | "denied" | "interrupted";
@@ -55,15 +58,22 @@ export class HistoryIntegrityError extends Error {
   }
 }
 
-const TERMINAL_STATUSES: ReadonlySet<ToolCallStatus> = new Set([
-  "success",
-  "failure",
-  "denied",
-  "interrupted",
-]);
-
 function integrity(detail: string): never {
   throw new HistoryIntegrityError(detail);
+}
+
+function validateTerminalCall(call: ToolCallRecord): void {
+  if (!isTerminalToolCallStatus(call.status)) {
+    integrity(`tool call ${call.callId} is nonterminal`);
+  }
+  if (call.result === null) {
+    integrity(`tool call ${call.callId} has no terminal result`);
+  }
+  try {
+    assertStrictTerminalToolCallResult(call.result);
+  } catch {
+    integrity(`tool call ${call.callId} has an invalid strict JSON result`);
+  }
 }
 
 function toolBlock(message: MessageRecord, calls: readonly ToolCallRecord[]): ProviderAssistantToolBlock {
@@ -79,12 +89,7 @@ function toolBlock(message: MessageRecord, calls: readonly ToolCallRecord[]): Pr
     if (call.ordinal !== index) {
       integrity(`assistant message ${message.id} has a non-contiguous or duplicate ordinal`);
     }
-    if (!TERMINAL_STATUSES.has(call.status)) {
-      integrity(`tool call ${call.callId} is nonterminal`);
-    }
-    if (call.result === null) {
-      integrity(`tool call ${call.callId} has no terminal result`);
-    }
+    validateTerminalCall(call);
     const status = call.status as TerminalToolCallStatus;
     toolCalls.push({
       callId: call.callId,
@@ -128,12 +133,7 @@ export function validateProviderHistory(store: SessionStore, sessionId: string):
       if (message.kind !== "tool_calls") {
         integrity(`tool call ${call.callId} is attached to assistant kind ${message.kind}`);
       }
-      if (!TERMINAL_STATUSES.has(call.status)) {
-        integrity(`tool call ${call.callId} is nonterminal`);
-      }
-      if (call.result === null) {
-        integrity(`tool call ${call.callId} has no terminal result`);
-      }
+      validateTerminalCall(call);
       const calls = callsByMessage.get(message.id) ?? [];
       calls.push(call);
       callsByMessage.set(message.id, calls);
