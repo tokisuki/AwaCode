@@ -1,16 +1,20 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { once } from "node:events";
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
-import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
 import { openDatabase } from "../../src/persistence/database.ts";
 import { productionMigrations, type Migration } from "../../src/persistence/migrations.ts";
+import {
+  createChildChannel,
+  disposeChildChannel,
+  disposeChildChannels,
+  withTimeout,
+} from "../support/child-process.ts";
 
 const temporaryDirectories: string[] = [];
 
@@ -145,6 +149,45 @@ test("migration initialization is idempotent across close and reopen", async () 
     second.close();
   }
   assert.deepEqual(await readdir(join(root, "backups")), []);
+});
+
+test("same-process concurrent initializers serialize without a five-second event-loop stall", async () => {
+  const root = await dataRoot("same-process-race");
+  const startedAt = Date.now();
+  const [first, second] = await withTimeout(Promise.all([
+    openDatabase({ env: { AWACODE_DATA_DIR: root } }),
+    openDatabase({ env: { AWACODE_DATA_DIR: root } }),
+  ]), 2000, "same-process database initialization");
+  try {
+    assert.equal(first.version, 1);
+    assert.equal(second.version, 1);
+    assert.ok(Date.now() - startedAt < 2000);
+  } finally {
+    first.close();
+    second.close();
+  }
+});
+
+test("same-process migration lock is released after an initializer error", async () => {
+  const root = await dataRoot("same-process-error");
+  await assert.rejects(
+    openDatabase({
+      env: { AWACODE_DATA_DIR: root },
+      testHooks: {
+        afterSnapshotClassification() {
+          throw new Error("injected initializer failure");
+        },
+      },
+    }),
+    /injected initializer failure/,
+  );
+
+  const recovered = await withTimeout(
+    openDatabase({ env: { AWACODE_DATA_DIR: root } }),
+    1000,
+    "database initialization after lock-holder error",
+  );
+  recovered.close();
 });
 
 test("applies a missing lower migration instead of trusting only the maximum version", async () => {
@@ -425,105 +468,6 @@ function childEnvironment(): NodeJS.ProcessEnv {
     !/(?:TOKEN|SECRET|PASSWORD|API_KEY|ACCESS_KEY|PRIVATE_KEY|OPENAI|ANTHROPIC|AZURE|AWS)/i.test(name)));
 }
 
-interface ChildLineReader {
-  nextLine(timeoutMs?: number): Promise<string>;
-  close(): void;
-}
-
-function childLineReader(child: ChildProcessWithoutNullStreams): ChildLineReader {
-  const lines: string[] = [];
-  const waiters: Array<{
-    resolve(line: string): void;
-    reject(error: Error): void;
-    timeout: NodeJS.Timeout;
-  }> = [];
-  const diagnostics: Buffer[] = [];
-  let partial = "";
-  let terminalError: Error | undefined;
-
-  const onStderr = (chunk: Buffer) => diagnostics.push(Buffer.from(chunk));
-  const onStdout = (chunk: Buffer) => {
-    partial += chunk.toString("utf8");
-    let newline = partial.indexOf("\n");
-    while (newline >= 0) {
-      const line = partial.slice(0, newline).replace(/\r$/, "");
-      partial = partial.slice(newline + 1);
-      const waiter = waiters.shift();
-      if (waiter === undefined) {
-        lines.push(line);
-      } else {
-        clearTimeout(waiter.timeout);
-        waiter.resolve(line);
-      }
-      newline = partial.indexOf("\n");
-    }
-  };
-  const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
-    terminalError = new Error(
-      `initializer exited before its next line (code=${String(code)}, signal=${String(signal)}): ${Buffer.concat(diagnostics).toString("utf8")}`,
-    );
-    for (const waiter of waiters.splice(0)) {
-      clearTimeout(waiter.timeout);
-      waiter.reject(terminalError);
-    }
-  };
-  child.stderr.on("data", onStderr);
-  child.stdout.on("data", onStdout);
-  child.once("exit", onExit);
-
-  return {
-    nextLine(timeoutMs = 5000) {
-      const line = lines.shift();
-      if (line !== undefined) {
-        return Promise.resolve(line);
-      }
-      if (terminalError !== undefined) {
-        return Promise.reject(terminalError);
-      }
-      return new Promise<string>((resolve, reject) => {
-        const waiter = {
-          resolve,
-          reject,
-          timeout: setTimeout(() => {
-            const index = waiters.indexOf(waiter);
-            if (index >= 0) {
-              waiters.splice(index, 1);
-            }
-            reject(new Error(`initializer did not emit its next line within ${timeoutMs} ms`));
-          }, timeoutMs),
-        };
-        waiters.push(waiter);
-      });
-    },
-    close() {
-      child.stderr.off("data", onStderr);
-      child.stdout.off("data", onStdout);
-      child.off("exit", onExit);
-      const error = new Error("child line reader closed");
-      for (const waiter of waiters.splice(0)) {
-        clearTimeout(waiter.timeout);
-        waiter.reject(error);
-      }
-    },
-  };
-}
-
-async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
-  let timeout: NodeJS.Timeout | undefined;
-  try {
-    return await Promise.race([
-      promise,
-      new Promise<never>((_resolve, reject) => {
-        timeout = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs} ms`)), timeoutMs);
-      }),
-    ]);
-  } finally {
-    if (timeout !== undefined) {
-      clearTimeout(timeout);
-    }
-  }
-}
-
 test("two real initializers released together converge on one valid V1 schema", async () => {
   const root = await dataRoot("race");
   const fixture = join(import.meta.dirname, "..", "..", "test-fixtures", "database-initialize-child.ts");
@@ -532,8 +476,8 @@ test("two real initializers released together converge on one valid V1 schema", 
       env: childEnvironment(),
       stdio: ["pipe", "pipe", "pipe"],
     });
-    const lines = childLineReader(child);
-    return { child, lines, ready: lines.nextLine(), exited: once(child, "exit") };
+    const channel = createChildChannel(child);
+    return { ...channel, ready: channel.lines.nextLine() };
   });
   const children = channels.map((channel) => channel.child);
 
@@ -552,16 +496,7 @@ test("two real initializers released together converge on one valid V1 schema", 
     const exits = await Promise.all(channels.map((channel) => channel.exited));
     assert.deepEqual(exits.map(([code]) => code), [0, 0]);
   } finally {
-    for (const channel of channels) {
-      if (channel.child.exitCode === null) {
-        channel.child.kill();
-        await withTimeout(channel.exited, 5000, "initializer cleanup");
-      }
-      channel.lines.close();
-      channel.child.stdin.destroy();
-      channel.child.stdout.destroy();
-      channel.child.stderr.destroy();
-    }
+    await disposeChildChannels(channels, "initializer cleanup");
   }
 
   const verified = await openDatabase({ env: { AWACODE_DATA_DIR: root } });
@@ -571,6 +506,40 @@ test("two real initializers released together converge on one valid V1 schema", 
     assert.equal(verified.db.prepare("SELECT COUNT(*) AS count FROM sqlite_schema WHERE name = 'projects'").get()?.count, 1);
   } finally {
     verified.close();
+  }
+});
+
+test("a cross-process lock retries asynchronously until a crashed holder releases it", async () => {
+  const root = await dataRoot("held-lock-crash");
+  const fixture = join(import.meta.dirname, "..", "..", "test-fixtures", "database-initialize-child.ts");
+  const timestamp = "2026-08-31T10:11:12.444Z";
+  const holderChild = spawn(process.execPath, [fixture, root, timestamp, "pause-after-snapshot"], {
+    env: childEnvironment(),
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const holder = createChildChannel(holderChild);
+  const waiterChild = spawn(process.execPath, [fixture, root, timestamp, "report-lock-busy"], {
+    env: childEnvironment(),
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const waiter = createChildChannel(waiterChild);
+
+  try {
+    assert.equal(await holder.lines.nextLine(), "READY");
+    holder.child.stdin.write("GO\n");
+    assert.equal(await holder.lines.nextLine(), "LOCK_HELD");
+
+    assert.equal(await waiter.lines.nextLine(), "READY");
+    waiter.child.stdin.end("GO\n");
+    assert.equal(await waiter.lines.nextLine(), "LOCK_BUSY");
+
+    assert.equal(holder.child.kill(), true);
+    const [holderCode, holderSignal] = await withTimeout(holder.exited, 5000, "lock holder termination");
+    assert.ok(holderCode !== 0 || holderSignal !== null);
+    assert.deepEqual(JSON.parse(await waiter.lines.nextLine()), { version: 1, migrationCount: 1 });
+    assert.equal((await withTimeout(waiter.exited, 5000, "lock waiter completion"))[0], 0);
+  } finally {
+    await disposeChildChannels([holder, waiter], "held-lock child cleanup");
   }
 });
 
@@ -596,8 +565,8 @@ test("a killed initializer paused after backup validation leaves only a stale te
     env: childEnvironment(),
     stdio: ["pipe", "pipe", "pipe"],
   });
-  const lines = childLineReader(child);
-  const exited = once(child, "exit");
+  const channel = createChildChannel(child);
+  const { lines, exited } = channel;
   let validatedArtifact = "";
   try {
     assert.equal(await lines.nextLine(), "READY");
@@ -621,14 +590,7 @@ test("a killed initializer paused after backup validation leaves only a stale te
     const [code, signal] = await withTimeout(exited, 5000, "paused backup child termination");
     assert.ok(code !== 0 || signal !== null);
   } finally {
-    if (child.exitCode === null) {
-      child.kill();
-      await withTimeout(exited, 5000, "backup child cleanup");
-    }
-    lines.close();
-    child.stdin.destroy();
-    child.stdout.destroy();
-    child.stderr.destroy();
+    await disposeChildChannel(channel, "backup child cleanup");
   }
 
   const afterCrash = await readdir(backupDirectory);
@@ -686,8 +648,8 @@ test("two real V0 upgrades share one critical section and never overwrite a coll
       env: childEnvironment(),
       stdio: ["pipe", "pipe", "pipe"],
     });
-    const lines = childLineReader(child);
-    return { child, lines, ready: lines.nextLine(), exited: once(child, "exit") };
+    const channel = createChildChannel(child);
+    return { ...channel, ready: channel.lines.nextLine() };
   });
   try {
     assert.deepEqual(await Promise.all(channels.map((channel) => channel.ready)), ["READY", "READY"]);
@@ -704,16 +666,7 @@ test("two real V0 upgrades share one critical section and never overwrite a coll
       [0, 0],
     );
   } finally {
-    for (const channel of channels) {
-      if (channel.child.exitCode === null) {
-        channel.child.kill();
-        await withTimeout(channel.exited, 5000, "V0 initializer cleanup");
-      }
-      channel.lines.close();
-      channel.child.stdin.destroy();
-      channel.child.stdout.destroy();
-      channel.child.stderr.destroy();
-    }
+    await disposeChildChannels(channels, "V0 initializer cleanup");
   }
 
   const collisionAfter = new DatabaseSync(join(backupDirectory, baseName), { readOnly: true });

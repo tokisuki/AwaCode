@@ -13,17 +13,33 @@ if (root === undefined) {
 process.stdout.write("READY\n");
 await once(process.stdin, "data");
 
+const testHooks: NonNullable<OpenDatabaseOptions["testHooks"]> = {};
+if (mode === "pause-before-publish") {
+  testHooks.beforeBackupPublish = async (temporaryPath: string) => {
+    process.stdout.write(`BACKUP_VALIDATED ${basename(temporaryPath)}\n`);
+    await once(process.stdin, "data");
+  };
+}
+if (mode === "pause-after-snapshot") {
+  testHooks.afterSnapshotClassification = async () => {
+    process.stdout.write("LOCK_HELD\n");
+    await once(process.stdin, "data");
+  };
+}
+if (mode === "report-lock-busy") {
+  let reported = false;
+  testHooks.migrationLockBusy = () => {
+    if (!reported) {
+      reported = true;
+      process.stdout.write("LOCK_BUSY\n");
+    }
+  };
+}
+
 const options: OpenDatabaseOptions = {
   env: { AWACODE_DATA_DIR: root },
   ...(timestamp === undefined ? {} : { now: () => new Date(timestamp) }),
-  ...(mode === "pause-before-publish" ? {
-    testHooks: {
-      async beforeBackupPublish(temporaryPath: string) {
-        process.stdout.write(`BACKUP_VALIDATED ${basename(temporaryPath)}\n`);
-        await once(process.stdin, "data");
-      },
-    },
-  } : {}),
+  ...(Object.keys(testHooks).length === 0 ? {} : { testHooks }),
 };
 const connection = await openDatabase(options);
 try {
