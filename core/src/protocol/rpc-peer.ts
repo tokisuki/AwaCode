@@ -156,7 +156,11 @@ export class JsonRpcPeer {
       }
       try {
         const result = await registration.handler(params);
-        await this.sendMessage({ jsonrpc: JSON_RPC_VERSION, id: inbound.message.id, result });
+        await this.sendMessage({
+          jsonrpc: JSON_RPC_VERSION,
+          id: inbound.message.id,
+          result: result === undefined ? null : result,
+        });
       } catch (error) {
         if (error instanceof RpcFault) {
           await this.sendError(inbound.message.id, error.code, error.message, error.data);

@@ -2,7 +2,12 @@ import { once } from "node:events";
 import type { Readable, Writable } from "node:stream";
 
 import { encodeNdjson, NdjsonDecoder, NdjsonProtocolError } from "./ndjson.ts";
-import { JSON_RPC_VERSION, RPC_ERROR_CODES, type JsonRpcMessage } from "./json-rpc.ts";
+import {
+  JSON_RPC_VERSION,
+  RPC_ERROR_CODES,
+  RpcDisconnectedError,
+  type JsonRpcMessage,
+} from "./json-rpc.ts";
 import { JsonRpcPeer } from "./rpc-peer.ts";
 
 export interface StdioRpcOptions {
@@ -23,6 +28,7 @@ export class StdioRpc {
   private readonly activeReceives = new Set<Promise<void>>();
   private readonly resolveDone: () => void;
   private finished = false;
+  private terminalWriteError: RpcDisconnectedError | undefined;
 
   constructor(options: StdioRpcOptions) {
     this.options = options;
@@ -45,7 +51,10 @@ export class StdioRpc {
     options.stdin.resume();
   }
 
-  private enqueueWrite(message: JsonRpcMessage): Promise<void> {
+  private enqueueWrite(message: JsonRpcMessage, allowTerminalRecord = false): Promise<void> {
+    if (this.terminalWriteError !== undefined && !allowTerminalRecord) {
+      return Promise.reject(this.terminalWriteError);
+    }
     const write = this.writeTail.then(async () => {
       if (!this.options.stdout.write(encodeNdjson(message))) {
         await once(this.options.stdout, "drain");
@@ -88,6 +97,7 @@ export class StdioRpc {
       return;
     }
     this.finished = true;
+    this.terminalWriteError = new RpcDisconnectedError(error);
     this.options.stdin.pause();
     const diagnostic = error instanceof NdjsonProtocolError ? error.code : "transport_error";
     try {
@@ -97,11 +107,14 @@ export class StdioRpc {
     }
     if (error instanceof NdjsonProtocolError && error.code === "parse_error") {
       try {
-        await this.enqueueWrite({
-          jsonrpc: JSON_RPC_VERSION,
-          id: null,
-          error: { code: RPC_ERROR_CODES.parseError, message: "Parse error" },
-        });
+        await this.enqueueWrite(
+          {
+            jsonrpc: JSON_RPC_VERSION,
+            id: null,
+            error: { code: RPC_ERROR_CODES.parseError, message: "Parse error" },
+          },
+          true,
+        );
       } catch {
         // The peer is closed below even when the parse-error response cannot be written.
       }

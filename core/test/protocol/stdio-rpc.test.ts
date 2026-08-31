@@ -86,6 +86,26 @@ test("decodes stdin through one peer and emits ordered protocol-only responses",
   assert.deepEqual(diagnostics, []);
 });
 
+test("encodes an undefined handler return as a null JSON-RPC result", async () => {
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const output: Buffer[] = [];
+  stdout.on("data", (chunk: Buffer) => output.push(Buffer.from(chunk)));
+  const rpc = new StdioRpc({ stdin, stdout, stderr, idPrefix: "core-" });
+  rpc.peer.register("returns-undefined", (value) => value, () => undefined);
+
+  stdin.end(Buffer.from('{"jsonrpc":"2.0","id":"ui-undefined","method":"returns-undefined"}\n'));
+  await rpc.done;
+
+  const decoder = new NdjsonDecoder();
+  assert.deepEqual(decoder.push(Buffer.concat(output)), [{
+    jsonrpc: "2.0",
+    id: "ui-undefined",
+    result: null,
+  }]);
+});
+
 test("reports malformed JSON once on stdout, diagnoses it on stderr, and closes", async () => {
   const stdin = new PassThrough();
   const stdout = new PassThrough();
@@ -107,6 +127,38 @@ test("reports malformed JSON once on stdout, diagnoses it on stderr, and closes"
   }]);
   assert.match(Buffer.concat(diagnostics).toString("utf8"), /parse_error/);
   await assert.rejects(rpc.peer.notify("later"), RpcDisconnectedError);
+});
+
+test("quarantines a slow handler response after fatal parse completion", async () => {
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const output: Buffer[] = [];
+  stdout.on("data", (chunk: Buffer) => output.push(Buffer.from(chunk)));
+  let enterHandler!: () => void;
+  const handlerEntered = new Promise<void>((resolve) => { enterHandler = resolve; });
+  let releaseHandler!: () => void;
+  const handlerGate = new Promise<void>((resolve) => { releaseHandler = resolve; });
+  const rpc = new StdioRpc({ stdin, stdout, stderr, idPrefix: "core-" });
+  rpc.peer.register("slow", (value) => value, async () => {
+    enterHandler();
+    await handlerGate;
+    return { late: true };
+  });
+
+  stdin.write(Buffer.from('{"jsonrpc":"2.0","id":"ui-7","method":"slow"}\n'));
+  await handlerEntered;
+  stdin.write(Buffer.from('{oops}\n'));
+  await rpc.done;
+  releaseHandler();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  const decoder = new NdjsonDecoder();
+  assert.deepEqual(decoder.push(Buffer.concat(output)), [{
+    jsonrpc: "2.0",
+    id: null,
+    error: { code: -32700, message: "Parse error" },
+  }]);
 });
 
 test("treats incomplete and overlong EOF input as diagnostics without fabricated responses", async () => {
