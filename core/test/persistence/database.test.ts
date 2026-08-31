@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { once } from "node:events";
-import { mkdir, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -42,6 +43,25 @@ function schemaSnapshot(db: DatabaseSync): Array<{ type: string; name: string; s
 
 async function databaseArtifacts(root: string): Promise<string[]> {
   return (await readdir(root)).filter((name) => name.startsWith("awacode.db")).sort();
+}
+
+async function directoryFileSnapshot(root: string) {
+  const entries = await readdir(root, { withFileTypes: true });
+  return Promise.all(entries.sort((left, right) => left.name.localeCompare(right.name)).map(async (entry) => {
+    const path = join(root, entry.name);
+    const metadata = await stat(path);
+    return {
+      name: entry.name,
+      type: entry.isDirectory() ? "directory" : "file",
+      size: metadata.size,
+      mode: metadata.mode,
+      mtimeMs: metadata.mtimeMs,
+      ctimeMs: metadata.ctimeMs,
+      contentsHash: entry.isFile()
+        ? createHash("sha256").update(await readFile(path)).digest("hex")
+        : null,
+    };
+  }));
 }
 
 test("opens a real V1 database with the exact strict schema and connection PRAGMAs", async () => {
@@ -235,6 +255,68 @@ test("rejecting an unknown database does not change journal mode, schema, bytes,
   assert.deepEqual(await databaseArtifacts(root), artifactsBefore);
 });
 
+test("rejecting an unknown WAL database does not create SHM or change any original directory entry", async () => {
+  const root = await dataRoot("unknown-wal-unchanged");
+  const databasePath = join(root, "awacode.db");
+  const unknown = new DatabaseSync(databasePath);
+  unknown.exec("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0");
+  unknown.exec("CREATE TABLE unrelated (value TEXT NOT NULL) STRICT");
+  unknown.prepare("INSERT INTO unrelated (value) VALUES (?)").run("only in WAL");
+  const databaseBytes = await readFile(databasePath);
+  const walBytes = await readFile(`${databasePath}-wal`);
+  unknown.close();
+  await Promise.all(["", "-shm", "-wal"].map((suffix) => rm(`${databasePath}${suffix}`, { force: true })));
+  await writeFile(databasePath, databaseBytes);
+  await writeFile(`${databasePath}-wal`, walBytes);
+
+  const before = await directoryFileSnapshot(root);
+  assert.deepEqual(before.map(({ name }) => name), ["awacode.db", "awacode.db-wal"]);
+
+  await assert.rejects(
+    openDatabase({ env: { AWACODE_DATA_DIR: root } }),
+    /unrecognized non-empty database/,
+  );
+
+  assert.deepEqual(await directoryFileSnapshot(root), before);
+});
+
+test("reclassifies a database replaced after snapshot before any persistent configuration", async () => {
+  const root = await dataRoot("snapshot-replacement");
+  const databasePath = join(root, "awacode.db");
+  let hookCalls = 0;
+
+  await assert.rejects(async () => {
+    const accepted = await openDatabase({
+      env: { AWACODE_DATA_DIR: root },
+      testHooks: {
+        afterSnapshotClassification() {
+          hookCalls += 1;
+          const replacement = new DatabaseSync(databasePath);
+          replacement.exec("CREATE TABLE replacement_unknown (value TEXT NOT NULL) STRICT");
+          replacement.prepare("INSERT INTO replacement_unknown (value) VALUES (?)").run("do not configure");
+          replacement.close();
+        },
+      },
+    });
+    accepted.close();
+    throw new Error("replacement hook was not awaited");
+  }, /unrecognized non-empty database/);
+
+  assert.equal(hookCalls, 1);
+  const replacement = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    assert.equal(replacement.prepare("PRAGMA journal_mode").get()?.journal_mode, "delete");
+    assert.deepEqual(
+      replacement.prepare("SELECT value FROM replacement_unknown").all().map((row) => String(row.value)),
+      ["do not configure"],
+    );
+    assert.equal(replacement.prepare("SELECT COUNT(*) AS count FROM sqlite_schema WHERE name = 'projects'").get()?.count, 0);
+  } finally {
+    replacement.close();
+  }
+  assert.deepEqual(await databaseArtifacts(root), ["awacode.db"]);
+});
+
 test("backs up a recognized V0 database before upgrading it successfully", async () => {
   const root = await dataRoot("backup-success");
   const databasePath = join(root, "awacode.db");
@@ -343,15 +425,24 @@ function childEnvironment(): NodeJS.ProcessEnv {
     !/(?:TOKEN|SECRET|PASSWORD|API_KEY|ACCESS_KEY|PRIVATE_KEY|OPENAI|ANTHROPIC|AZURE|AWS)/i.test(name)));
 }
 
-function childLineReader(child: ChildProcessWithoutNullStreams): { nextLine(): Promise<string> } {
+interface ChildLineReader {
+  nextLine(timeoutMs?: number): Promise<string>;
+  close(): void;
+}
+
+function childLineReader(child: ChildProcessWithoutNullStreams): ChildLineReader {
   const lines: string[] = [];
-  const waiters: Array<{ resolve(line: string): void; reject(error: Error): void }> = [];
+  const waiters: Array<{
+    resolve(line: string): void;
+    reject(error: Error): void;
+    timeout: NodeJS.Timeout;
+  }> = [];
   const diagnostics: Buffer[] = [];
   let partial = "";
   let terminalError: Error | undefined;
 
-  child.stderr.on("data", (chunk: Buffer) => diagnostics.push(Buffer.from(chunk)));
-  child.stdout.on("data", (chunk: Buffer) => {
+  const onStderr = (chunk: Buffer) => diagnostics.push(Buffer.from(chunk));
+  const onStdout = (chunk: Buffer) => {
     partial += chunk.toString("utf8");
     let newline = partial.indexOf("\n");
     while (newline >= 0) {
@@ -361,22 +452,27 @@ function childLineReader(child: ChildProcessWithoutNullStreams): { nextLine(): P
       if (waiter === undefined) {
         lines.push(line);
       } else {
+        clearTimeout(waiter.timeout);
         waiter.resolve(line);
       }
       newline = partial.indexOf("\n");
     }
-  });
-  child.once("exit", (code, signal) => {
+  };
+  const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
     terminalError = new Error(
       `initializer exited before its next line (code=${String(code)}, signal=${String(signal)}): ${Buffer.concat(diagnostics).toString("utf8")}`,
     );
     for (const waiter of waiters.splice(0)) {
+      clearTimeout(waiter.timeout);
       waiter.reject(terminalError);
     }
-  });
+  };
+  child.stderr.on("data", onStderr);
+  child.stdout.on("data", onStdout);
+  child.once("exit", onExit);
 
   return {
-    nextLine() {
+    nextLine(timeoutMs = 5000) {
       const line = lines.shift();
       if (line !== undefined) {
         return Promise.resolve(line);
@@ -384,9 +480,48 @@ function childLineReader(child: ChildProcessWithoutNullStreams): { nextLine(): P
       if (terminalError !== undefined) {
         return Promise.reject(terminalError);
       }
-      return new Promise<string>((resolve, reject) => waiters.push({ resolve, reject }));
+      return new Promise<string>((resolve, reject) => {
+        const waiter = {
+          resolve,
+          reject,
+          timeout: setTimeout(() => {
+            const index = waiters.indexOf(waiter);
+            if (index >= 0) {
+              waiters.splice(index, 1);
+            }
+            reject(new Error(`initializer did not emit its next line within ${timeoutMs} ms`));
+          }, timeoutMs),
+        };
+        waiters.push(waiter);
+      });
+    },
+    close() {
+      child.stderr.off("data", onStderr);
+      child.stdout.off("data", onStdout);
+      child.off("exit", onExit);
+      const error = new Error("child line reader closed");
+      for (const waiter of waiters.splice(0)) {
+        clearTimeout(waiter.timeout);
+        waiter.reject(error);
+      }
     },
   };
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs} ms`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout !== undefined) {
+      clearTimeout(timeout);
+    }
+  }
 }
 
 test("two real initializers released together converge on one valid V1 schema", async () => {
@@ -417,10 +552,15 @@ test("two real initializers released together converge on one valid V1 schema", 
     const exits = await Promise.all(channels.map((channel) => channel.exited));
     assert.deepEqual(exits.map(([code]) => code), [0, 0]);
   } finally {
-    for (const child of children) {
-      if (child.exitCode === null) {
-        child.kill();
+    for (const channel of channels) {
+      if (channel.child.exitCode === null) {
+        channel.child.kill();
+        await withTimeout(channel.exited, 5000, "initializer cleanup");
       }
+      channel.lines.close();
+      channel.child.stdin.destroy();
+      channel.child.stdout.destroy();
+      channel.child.stderr.destroy();
     }
   }
 
@@ -434,7 +574,7 @@ test("two real initializers released together converge on one valid V1 schema", 
   }
 });
 
-test("a killed backup writer leaves only a stale temp artifact that startup cleans before recovery", async () => {
+test("a killed initializer paused after backup validation leaves only a stale temp for recovery", async () => {
   const root = await dataRoot("backup-crash");
   const databasePath = join(root, "awacode.db");
   const old = new DatabaseSync(databasePath);
@@ -444,7 +584,7 @@ test("a killed backup writer leaves only a stale temp artifact that startup clea
       applied_at TEXT NOT NULL
     ) STRICT;
     CREATE TABLE legacy_blob (id INTEGER PRIMARY KEY, payload BLOB NOT NULL) STRICT;
-    INSERT INTO legacy_blob (payload) VALUES (zeroblob(16777216));
+    INSERT INTO legacy_blob (payload) VALUES (zeroblob(1048576));
   `);
   old.close();
   const backupDirectory = join(root, "backups");
@@ -452,28 +592,45 @@ test("a killed backup writer leaves only a stale temp artifact that startup clea
 
   const timestamp = "2026-08-31T10:11:12.333Z";
   const fixture = join(import.meta.dirname, "..", "..", "test-fixtures", "database-initialize-child.ts");
-  const child = spawn(process.execPath, [fixture, root, timestamp, "watch-backup"], {
+  const child = spawn(process.execPath, [fixture, root, timestamp, "pause-before-publish"], {
     env: childEnvironment(),
     stdio: ["pipe", "pipe", "pipe"],
   });
   const lines = childLineReader(child);
   const exited = once(child, "exit");
-  let observedArtifact = "";
+  let validatedArtifact = "";
   try {
     assert.equal(await lines.nextLine(), "READY");
-    const artifactLine = lines.nextLine();
-    child.stdin.end("GO\n");
-    observedArtifact = await artifactLine;
+    child.stdin.write("GO\n");
+    validatedArtifact = await lines.nextLine();
+    assert.match(validatedArtifact, /^BACKUP_VALIDATED \.awacode-backup-[0-9a-f-]+\.tmp$/);
+    const whilePaused = await readdir(backupDirectory);
+    assert.equal(whilePaused.length, 1);
+    assert.match(whilePaused[0] as string, /^\.awacode-backup-[0-9a-f-]+\.tmp$/);
+    assert.deepEqual(whilePaused.filter((name) => name.endsWith(".db")), []);
+    const validated = new DatabaseSync(join(backupDirectory, whilePaused[0] as string), { readOnly: true });
+    try {
+      assert.equal(validated.prepare("PRAGMA journal_mode").get()?.journal_mode, "delete");
+      assert.equal(validated.prepare("PRAGMA integrity_check").get()?.integrity_check, "ok");
+      assert.equal(validated.prepare("SELECT COUNT(*) AS count FROM legacy_blob").get()?.count, 1);
+      assert.equal(validated.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()?.count, 0);
+    } finally {
+      validated.close();
+    }
     assert.equal(child.kill(), true);
-    await exited;
+    const [code, signal] = await withTimeout(exited, 5000, "paused backup child termination");
+    assert.ok(code !== 0 || signal !== null);
   } finally {
     if (child.exitCode === null) {
       child.kill();
-      await exited;
+      await withTimeout(exited, 5000, "backup child cleanup");
     }
+    lines.close();
+    child.stdin.destroy();
+    child.stdout.destroy();
+    child.stderr.destroy();
   }
 
-  assert.match(observedArtifact, /^BACKUP_ARTIFACT \.awacode-backup-[0-9a-f-]+\.tmp$/);
   const afterCrash = await readdir(backupDirectory);
   assert.equal(afterCrash.length, 1);
   assert.match(afterCrash[0] as string, /^\.awacode-backup-[0-9a-f-]+\.tmp$/);
@@ -550,7 +707,12 @@ test("two real V0 upgrades share one critical section and never overwrite a coll
     for (const channel of channels) {
       if (channel.child.exitCode === null) {
         channel.child.kill();
+        await withTimeout(channel.exited, 5000, "V0 initializer cleanup");
       }
+      channel.lines.close();
+      channel.child.stdin.destroy();
+      channel.child.stdout.destroy();
+      channel.child.stderr.destroy();
     }
   }
 

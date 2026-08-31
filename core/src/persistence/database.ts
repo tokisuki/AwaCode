@@ -1,13 +1,16 @@
 import { backup, DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
-import { link, open as openFile, readdir, rm, stat } from "node:fs/promises";
+import { link, mkdir, open as openFile, readdir, rm } from "node:fs/promises";
 import { resolve } from "node:path";
 
 import {
   prepareDataPaths,
+  resolveDataPaths,
   type DataPathOptions,
   type DataPaths,
 } from "./data-paths.ts";
+import { withDatabaseSnapshot } from "./database-snapshot.ts";
+import { acquireMigrationLock } from "./migration-lock.ts";
 import {
   DATABASE_VERSION,
   type Migration,
@@ -17,6 +20,11 @@ import {
 export interface OpenDatabaseOptions extends DataPathOptions {
   migrations?: readonly Migration[];
   now?: () => Date;
+  /** @internal Deterministic barriers used only by real-disk/process tests. */
+  testHooks?: {
+    afterSnapshotClassification?(): void | Promise<void>;
+    beforeBackupPublish?(temporaryPath: string): void | Promise<void>;
+  };
 }
 
 export interface DatabaseConnection {
@@ -72,20 +80,17 @@ function assertRecognizedOrEmpty(db: DatabaseSync, databasePath: string): void {
 }
 
 async function preflightDatabase(databasePath: string): Promise<void> {
-  try {
-    await stat(databasePath);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+  await withDatabaseSnapshot(databasePath, (snapshotPath) => {
+    if (snapshotPath === undefined) {
       return;
     }
-    throw error;
-  }
-  const preflight = new DatabaseSync(databasePath, { readOnly: true });
-  try {
-    assertRecognizedOrEmpty(preflight, databasePath);
-  } finally {
-    preflight.close();
-  }
+    const preflight = new DatabaseSync(snapshotPath, { readOnly: true });
+    try {
+      assertRecognizedOrEmpty(preflight, databasePath);
+    } finally {
+      preflight.close();
+    }
+  });
 }
 
 function databaseVersion(db: DatabaseSync): number {
@@ -209,12 +214,14 @@ async function createBackup(
   backupDirectory: string,
   version: number,
   now: Date,
+  beforePublish?: (temporaryPath: string) => void | Promise<void>,
 ): Promise<void> {
   const temporaryPath = await reserveTemporaryBackupPath(backupDirectory);
   const source = new DatabaseSync(databasePath, { readOnly: true });
   try {
     await backup(source, temporaryPath);
     finalizeAndValidateBackup(temporaryPath);
+    await beforePublish?.(temporaryPath);
     await publishBackup(temporaryPath, backupDirectory, version, now);
   } catch (error) {
     await removeTemporaryBackupArtifacts(temporaryPath);
@@ -246,66 +253,77 @@ function configureConnection(db: DatabaseSync): void {
 }
 
 export async function openDatabase(options: OpenDatabaseOptions = {}): Promise<DatabaseConnection> {
-  const paths = await prepareDataPaths(options);
+  const paths = resolveDataPaths(options);
   const migrations = options.migrations ?? productionMigrations;
   validateMigrations(migrations);
   const newestVersion = migrations.at(-1)?.version ?? 0;
-  await preflightDatabase(paths.database);
-  const db = new DatabaseSync(paths.database);
-  let closed = false;
+  const migrationLock = await acquireMigrationLock(paths.database);
 
   try {
-    configureConnection(db);
-    db.exec("BEGIN IMMEDIATE");
-    let version: number;
+    await preflightDatabase(paths.database);
+    await options.testHooks?.afterSnapshotClassification?.();
+    await mkdir(paths.root, { recursive: true });
+    const db = new DatabaseSync(paths.database);
+    let closed = false;
+
     try {
-      await removeStaleBackupTemps(paths.backups);
-      const nonEmpty = hasUserSchemaObjects(db);
       assertRecognizedOrEmpty(db, paths.database);
-      const oldVersion = databaseVersion(db);
-      if (oldVersion > newestVersion) {
-        throw new Error(`database version ${oldVersion} is newer than supported version ${newestVersion}`);
-      }
-      const applied = appliedVersions(db);
-      const missing = migrations.filter((migration) => !applied.has(migration.version));
-      if (nonEmpty && missing.length > 0) {
-        await createBackup(
-          paths.database,
-          paths.backups,
-          oldVersion,
-          (options.now ?? (() => new Date()))(),
-        );
-      }
-      for (const migration of missing) {
-        applyMigration(db, migration, (options.now ?? (() => new Date()))().toISOString());
-      }
-      version = databaseVersion(db);
-      db.exec("COMMIT");
-    } catch (error) {
+      await prepareDataPaths(options);
+      configureConnection(db);
+      db.exec("BEGIN IMMEDIATE");
+      let version: number;
       try {
-        db.exec("ROLLBACK");
-      } catch {
-        // Preserve the migration failure when SQLite already ended the transaction.
+        await removeStaleBackupTemps(paths.backups);
+        const nonEmpty = hasUserSchemaObjects(db);
+        assertRecognizedOrEmpty(db, paths.database);
+        const oldVersion = databaseVersion(db);
+        if (oldVersion > newestVersion) {
+          throw new Error(`database version ${oldVersion} is newer than supported version ${newestVersion}`);
+        }
+        const applied = appliedVersions(db);
+        const missing = migrations.filter((migration) => !applied.has(migration.version));
+        if (nonEmpty && missing.length > 0) {
+          await createBackup(
+            paths.database,
+            paths.backups,
+            oldVersion,
+            (options.now ?? (() => new Date()))(),
+            options.testHooks?.beforeBackupPublish,
+          );
+        }
+        for (const migration of missing) {
+          applyMigration(db, migration, (options.now ?? (() => new Date()))().toISOString());
+        }
+        version = databaseVersion(db);
+        db.exec("COMMIT");
+      } catch (error) {
+        try {
+          db.exec("ROLLBACK");
+        } catch {
+          // Preserve the migration failure when SQLite already ended the transaction.
+        }
+        throw error;
+      }
+      return {
+        db,
+        paths,
+        version,
+        close() {
+          if (!closed) {
+            closed = true;
+            db.close();
+          }
+        },
+      };
+    } catch (error) {
+      if (!closed) {
+        closed = true;
+        db.close();
       }
       throw error;
     }
-    return {
-      db,
-      paths,
-      version,
-      close() {
-        if (!closed) {
-          closed = true;
-          db.close();
-        }
-      },
-    };
-  } catch (error) {
-    if (!closed) {
-      closed = true;
-      db.close();
-    }
-    throw error;
+  } finally {
+    migrationLock.release();
   }
 }
 
