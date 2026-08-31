@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -25,6 +25,23 @@ test.after(async () => {
 
 function columnNames(db: DatabaseSync, table: string): string[] {
   return db.prepare(`PRAGMA table_info(${table})`).all().map((row) => String(row.name));
+}
+
+function schemaSnapshot(db: DatabaseSync): Array<{ type: string; name: string; sql: string | null }> {
+  return db.prepare(`
+    SELECT type, name, sql
+    FROM sqlite_schema
+    WHERE name NOT LIKE 'sqlite_%'
+    ORDER BY type, name
+  `).all().map((row) => ({
+    type: String(row.type),
+    name: String(row.name),
+    sql: row.sql === null ? null : String(row.sql),
+  }));
+}
+
+async function databaseArtifacts(root: string): Promise<string[]> {
+  return (await readdir(root)).filter((name) => name.startsWith("awacode.db")).sort();
 }
 
 test("opens a real V1 database with the exact strict schema and connection PRAGMAs", async () => {
@@ -189,6 +206,33 @@ test("rejects a view-only unknown database without creating AwaCode tables", asy
   } finally {
     reopened.close();
   }
+});
+
+test("rejecting an unknown database does not change journal mode, schema, bytes, or sidecars", async () => {
+  const root = await dataRoot("unknown-unchanged");
+  const databasePath = join(root, "awacode.db");
+  const unknown = new DatabaseSync(databasePath);
+  unknown.exec("CREATE VIEW unrelated_view AS SELECT 'keep me' AS value");
+  const journalModeBefore = String(unknown.prepare("PRAGMA journal_mode").get()?.journal_mode);
+  const schemaBefore = schemaSnapshot(unknown);
+  unknown.close();
+  const bytesBefore = await readFile(databasePath);
+  const artifactsBefore = await databaseArtifacts(root);
+
+  await assert.rejects(
+    openDatabase({ env: { AWACODE_DATA_DIR: root } }),
+    /unrecognized non-empty database/,
+  );
+
+  const reopened = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    assert.equal(reopened.prepare("PRAGMA journal_mode").get()?.journal_mode, journalModeBefore);
+    assert.deepEqual(schemaSnapshot(reopened), schemaBefore);
+  } finally {
+    reopened.close();
+  }
+  assert.deepEqual(await readFile(databasePath), bytesBefore);
+  assert.deepEqual(await databaseArtifacts(root), artifactsBefore);
 });
 
 test("backs up a recognized V0 database before upgrading it successfully", async () => {
@@ -387,6 +431,70 @@ test("two real initializers released together converge on one valid V1 schema", 
     assert.equal(verified.db.prepare("SELECT COUNT(*) AS count FROM sqlite_schema WHERE name = 'projects'").get()?.count, 1);
   } finally {
     verified.close();
+  }
+});
+
+test("a killed backup writer leaves only a stale temp artifact that startup cleans before recovery", async () => {
+  const root = await dataRoot("backup-crash");
+  const databasePath = join(root, "awacode.db");
+  const old = new DatabaseSync(databasePath);
+  old.exec(`
+    CREATE TABLE schema_migrations (
+      version INTEGER PRIMARY KEY,
+      applied_at TEXT NOT NULL
+    ) STRICT;
+    CREATE TABLE legacy_blob (id INTEGER PRIMARY KEY, payload BLOB NOT NULL) STRICT;
+    INSERT INTO legacy_blob (payload) VALUES (zeroblob(16777216));
+  `);
+  old.close();
+  const backupDirectory = join(root, "backups");
+  await mkdir(backupDirectory);
+
+  const timestamp = "2026-08-31T10:11:12.333Z";
+  const fixture = join(import.meta.dirname, "..", "..", "test-fixtures", "database-initialize-child.ts");
+  const child = spawn(process.execPath, [fixture, root, timestamp, "watch-backup"], {
+    env: childEnvironment(),
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const lines = childLineReader(child);
+  const exited = once(child, "exit");
+  let observedArtifact = "";
+  try {
+    assert.equal(await lines.nextLine(), "READY");
+    const artifactLine = lines.nextLine();
+    child.stdin.end("GO\n");
+    observedArtifact = await artifactLine;
+    assert.equal(child.kill(), true);
+    await exited;
+  } finally {
+    if (child.exitCode === null) {
+      child.kill();
+      await exited;
+    }
+  }
+
+  assert.match(observedArtifact, /^BACKUP_ARTIFACT \.awacode-backup-[0-9a-f-]+\.tmp$/);
+  const afterCrash = await readdir(backupDirectory);
+  assert.equal(afterCrash.length, 1);
+  assert.match(afterCrash[0] as string, /^\.awacode-backup-[0-9a-f-]+\.tmp$/);
+  assert.deepEqual(afterCrash.filter((name) => name.endsWith(".db")), []);
+
+  const recovered = await openDatabase({
+    env: { AWACODE_DATA_DIR: root },
+    now: () => new Date(timestamp),
+  });
+  recovered.close();
+
+  const afterRecovery = await readdir(backupDirectory);
+  assert.deepEqual(afterRecovery, ["awacode-v0-2026-08-31T10-11-12-333Z.db"]);
+  const completed = new DatabaseSync(join(backupDirectory, afterRecovery[0] as string), { readOnly: true });
+  try {
+    assert.equal(completed.prepare("PRAGMA integrity_check").get()?.integrity_check, "ok");
+    assert.equal(completed.prepare("SELECT COUNT(*) AS count FROM legacy_blob").get()?.count, 1);
+    assert.equal(completed.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()?.count, 0);
+    assert.equal(completed.prepare("SELECT COUNT(*) AS count FROM sqlite_schema WHERE name = 'projects'").get()?.count, 0);
+  } finally {
+    completed.close();
   }
 });
 

@@ -87,6 +87,31 @@ function tableInfo(db: DatabaseSync, table: string) {
   }));
 }
 
+function foreignKeys(db: DatabaseSync, table: string) {
+  return db.prepare(`PRAGMA foreign_key_list(${table})`).all().map((row) => ({
+    from: String(row.from),
+    table: String(row.table),
+    to: String(row.to),
+    onUpdate: String(row.on_update),
+    onDelete: String(row.on_delete),
+    match: String(row.match),
+  })).sort((left, right) => left.from.localeCompare(right.from));
+}
+
+function indexes(db: DatabaseSync, table: string) {
+  return db.prepare(`PRAGMA index_list(${table})`).all().map((row) => {
+    const name = String(row.name);
+    return {
+      name,
+      unique: Number(row.unique),
+      origin: String(row.origin),
+      partial: Number(row.partial),
+      columns: db.prepare("SELECT name FROM pragma_index_info(?) ORDER BY seqno").all(name)
+        .map((column) => String(column.name)),
+    };
+  }).sort((left, right) => left.name.localeCompare(right.name));
+}
+
 test("V1 exposes every exact column, PK, NOT NULL flag, default, and named index", async () => {
   const connection = await openFixture("metadata");
   try {
@@ -145,6 +170,55 @@ test("V1 exposes every exact column, PK, NOT NULL flag, default, and named index
       { name: "summary", type: "TEXT", notNull: 0, defaultValue: null, primaryKey: 0 },
       { name: "summary_upto_seq", type: "INTEGER", notNull: 1, defaultValue: "0", primaryKey: 0 },
       { name: "updated_at", type: "TEXT", notNull: 1, defaultValue: null, primaryKey: 0 },
+    ]);
+
+    assert.deepEqual(foreignKeys(connection.db, "schema_migrations"), []);
+    assert.deepEqual(foreignKeys(connection.db, "projects"), []);
+    assert.deepEqual(foreignKeys(connection.db, "sessions"), [
+      { from: "project_id", table: "projects", to: "id", onUpdate: "NO ACTION", onDelete: "NO ACTION", match: "NONE" },
+    ]);
+    assert.deepEqual(foreignKeys(connection.db, "messages"), [
+      { from: "session_id", table: "sessions", to: "id", onUpdate: "NO ACTION", onDelete: "CASCADE", match: "NONE" },
+    ]);
+    assert.deepEqual(foreignKeys(connection.db, "tool_calls"), [
+      { from: "assistant_message_id", table: "messages", to: "id", onUpdate: "NO ACTION", onDelete: "CASCADE", match: "NONE" },
+      { from: "session_id", table: "sessions", to: "id", onUpdate: "NO ACTION", onDelete: "CASCADE", match: "NONE" },
+    ]);
+    assert.deepEqual(foreignKeys(connection.db, "context_snapshots"), [
+      { from: "session_id", table: "sessions", to: "id", onUpdate: "NO ACTION", onDelete: "CASCADE", match: "NONE" },
+    ]);
+
+    assert.deepEqual(indexes(connection.db, "schema_migrations"), []);
+    assert.deepEqual(indexes(connection.db, "projects"), [
+      { name: "sqlite_autoindex_projects_1", unique: 1, origin: "pk", partial: 0, columns: ["id"] },
+    ]);
+    assert.deepEqual(indexes(connection.db, "sessions"), [
+      {
+        name: "sessions_project_updated_idx", unique: 0, origin: "c", partial: 0,
+        columns: ["project_id", "updated_at"],
+      },
+      { name: "sqlite_autoindex_sessions_1", unique: 1, origin: "pk", partial: 0, columns: ["id"] },
+    ]);
+    assert.deepEqual(indexes(connection.db, "messages"), [
+      { name: "sqlite_autoindex_messages_1", unique: 1, origin: "pk", partial: 0, columns: ["id"] },
+      {
+        name: "sqlite_autoindex_messages_2", unique: 1, origin: "u", partial: 0,
+        columns: ["session_id", "seq"],
+      },
+    ]);
+    assert.deepEqual(indexes(connection.db, "tool_calls"), [
+      { name: "sqlite_autoindex_tool_calls_1", unique: 1, origin: "pk", partial: 0, columns: ["call_id"] },
+      {
+        name: "sqlite_autoindex_tool_calls_2", unique: 1, origin: "u", partial: 0,
+        columns: ["assistant_message_id", "ordinal"],
+      },
+      { name: "tool_calls_session_idx", unique: 0, origin: "c", partial: 0, columns: ["session_id"] },
+    ]);
+    assert.deepEqual(indexes(connection.db, "context_snapshots"), [
+      {
+        name: "sqlite_autoindex_context_snapshots_1", unique: 1, origin: "pk", partial: 0,
+        columns: ["session_id"],
+      },
     ]);
 
     const sessionIndex = connection.db.prepare("PRAGMA index_xinfo(sessions_project_updated_idx)").all()
@@ -360,12 +434,13 @@ test("V1 enforces every foreign key, project restrict, and message/session casca
   try {
     assertInsertFails(db, () => seedSession(db, "orphan-session", "missing-project"), /FOREIGN KEY constraint failed/);
     assertInsertFails(db, () => seedMessage(db, "orphan-message", "missing-session", 1), /FOREIGN KEY constraint failed/);
-    assertInsertFails(db, () => insertRecord(db, "tool_calls", {
-      call_id: "orphan-tool-session", session_id: "missing-session", assistant_message_id: "missing-message",
-      ordinal: 0, tool_name: "read", input_text: "{}", status: "pending", created_at: "created",
-    }), /FOREIGN KEY constraint failed/);
     seedProject(db, "fk-project");
     seedSession(db, "fk-session", "fk-project");
+    seedMessage(db, "fk-message", "fk-session", 0);
+    assertInsertFails(db, () => insertRecord(db, "tool_calls", {
+      call_id: "orphan-tool-session", session_id: "missing-session", assistant_message_id: "fk-message",
+      ordinal: 0, tool_name: "read", input_text: "{}", status: "pending", created_at: "created",
+    }), /FOREIGN KEY constraint failed/);
     assertInsertFails(db, () => insertRecord(db, "tool_calls", {
       call_id: "orphan-tool-message", session_id: "fk-session", assistant_message_id: "missing-message",
       ordinal: 0, tool_name: "read", input_text: "{}", status: "pending", created_at: "created",

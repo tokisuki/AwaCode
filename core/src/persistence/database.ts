@@ -1,5 +1,6 @@
 import { backup, DatabaseSync } from "node:sqlite";
-import { open as openFile, rm } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { link, open as openFile, readdir, rm, stat } from "node:fs/promises";
 import { resolve } from "node:path";
 
 import {
@@ -64,6 +65,29 @@ function isRecognizableMigrationTable(db: DatabaseSync): boolean {
     && columns[1].notnull === 1;
 }
 
+function assertRecognizedOrEmpty(db: DatabaseSync, databasePath: string): void {
+  if (hasUserSchemaObjects(db) && !isRecognizableMigrationTable(db)) {
+    throw new Error(`refusing to initialize unrecognized non-empty database: ${databasePath}`);
+  }
+}
+
+async function preflightDatabase(databasePath: string): Promise<void> {
+  try {
+    await stat(databasePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return;
+    }
+    throw error;
+  }
+  const preflight = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    assertRecognizedOrEmpty(preflight, databasePath);
+  } finally {
+    preflight.close();
+  }
+}
+
 function databaseVersion(db: DatabaseSync): number {
   if (!hasMigrationTable(db)) {
     return 0;
@@ -112,7 +136,56 @@ function backupName(version: number, now: Date): string {
   return `awacode-v${version}-${timestamp}.db`;
 }
 
-async function reserveBackupPath(directory: string, version: number, now: Date): Promise<string> {
+const BACKUP_TEMP_NAME = /^\.awacode-backup-[0-9a-f-]+\.tmp(?:-(?:journal|shm|wal))?$/i;
+
+async function reserveTemporaryBackupPath(directory: string): Promise<string> {
+  for (;;) {
+    const path = resolve(directory, `.awacode-backup-${randomUUID()}.tmp`);
+    try {
+      const reservation = await openFile(path, "wx");
+      await reservation.close();
+      return path;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw error;
+      }
+    }
+  }
+}
+
+async function removeStaleBackupTemps(directory: string): Promise<void> {
+  const entries = await readdir(directory, { withFileTypes: true });
+  await Promise.all(entries
+    .filter((entry) => entry.isFile() && BACKUP_TEMP_NAME.test(entry.name))
+    .map((entry) => rm(resolve(directory, entry.name), { force: true })));
+}
+
+async function removeTemporaryBackupArtifacts(temporaryPath: string): Promise<void> {
+  await Promise.all(["", "-journal", "-shm", "-wal"]
+    .map((suffix) => rm(`${temporaryPath}${suffix}`, { force: true })));
+}
+
+function finalizeAndValidateBackup(path: string): void {
+  const validation = new DatabaseSync(path);
+  try {
+    validation.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    if (validation.prepare("PRAGMA journal_mode = DELETE").get()?.journal_mode !== "delete") {
+      throw new Error(`backup could not leave WAL mode: ${path}`);
+    }
+    if (validation.prepare("PRAGMA integrity_check").get()?.integrity_check !== "ok") {
+      throw new Error(`backup integrity check failed: ${path}`);
+    }
+  } finally {
+    validation.close();
+  }
+}
+
+async function publishBackup(
+  temporaryPath: string,
+  directory: string,
+  version: number,
+  now: Date,
+): Promise<void> {
   const baseName = backupName(version, now);
   const extensionIndex = baseName.lastIndexOf(".db");
   const stem = baseName.slice(0, extensionIndex);
@@ -120,9 +193,9 @@ async function reserveBackupPath(directory: string, version: number, now: Date):
     const name = collision === 0 ? baseName : `${stem}-${collision}.db`;
     const path = resolve(directory, name);
     try {
-      const reservation = await openFile(path, "wx");
-      await reservation.close();
-      return path;
+      await link(temporaryPath, path);
+      await removeTemporaryBackupArtifacts(temporaryPath);
+      return;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
         throw error;
@@ -137,12 +210,14 @@ async function createBackup(
   version: number,
   now: Date,
 ): Promise<void> {
-  const destination = await reserveBackupPath(backupDirectory, version, now);
+  const temporaryPath = await reserveTemporaryBackupPath(backupDirectory);
   const source = new DatabaseSync(databasePath, { readOnly: true });
   try {
-    await backup(source, destination);
+    await backup(source, temporaryPath);
+    finalizeAndValidateBackup(temporaryPath);
+    await publishBackup(temporaryPath, backupDirectory, version, now);
   } catch (error) {
-    await rm(destination, { force: true });
+    await removeTemporaryBackupArtifacts(temporaryPath);
     throw error;
   } finally {
     source.close();
@@ -175,6 +250,7 @@ export async function openDatabase(options: OpenDatabaseOptions = {}): Promise<D
   const migrations = options.migrations ?? productionMigrations;
   validateMigrations(migrations);
   const newestVersion = migrations.at(-1)?.version ?? 0;
+  await preflightDatabase(paths.database);
   const db = new DatabaseSync(paths.database);
   let closed = false;
 
@@ -183,10 +259,9 @@ export async function openDatabase(options: OpenDatabaseOptions = {}): Promise<D
     db.exec("BEGIN IMMEDIATE");
     let version: number;
     try {
+      await removeStaleBackupTemps(paths.backups);
       const nonEmpty = hasUserSchemaObjects(db);
-      if (nonEmpty && !isRecognizableMigrationTable(db)) {
-        throw new Error(`refusing to initialize unrecognized non-empty database: ${paths.database}`);
-      }
+      assertRecognizedOrEmpty(db, paths.database);
       const oldVersion = databaseVersion(db);
       if (oldVersion > newestVersion) {
         throw new Error(`database version ${oldVersion} is newer than supported version ${newestVersion}`);
