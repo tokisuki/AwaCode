@@ -56,6 +56,9 @@ export class StdioRpc {
       return Promise.reject(this.terminalWriteError);
     }
     const write = this.writeTail.then(async () => {
+      if (this.terminalWriteError !== undefined && !allowTerminalRecord) {
+        throw this.terminalWriteError;
+      }
       if (!this.options.stdout.write(encodeNdjson(message))) {
         await once(this.options.stdout, "drain");
       }

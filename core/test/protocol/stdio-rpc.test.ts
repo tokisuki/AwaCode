@@ -10,6 +10,7 @@ import { StdioRpc } from "../../src/protocol/stdio-rpc.ts";
 class ControlledWriter extends Writable {
   readonly chunks: Buffer[] = [];
   private readonly releases: Array<() => void> = [];
+  private releaseFutureWrites = false;
 
   constructor() {
     super({ highWaterMark: 1 });
@@ -21,14 +22,23 @@ class ControlledWriter extends Writable {
     callback: (error?: Error | null) => void,
   ): void {
     this.chunks.push(Buffer.from(chunk));
-    this.releases.push(callback);
     this.emit("record");
+    if (this.releaseFutureWrites) {
+      setImmediate(callback);
+    } else {
+      this.releases.push(callback);
+    }
   }
 
   release(): void {
     const callback = this.releases.shift();
     assert.ok(callback, "expected one blocked stdout write");
     callback();
+  }
+
+  releaseAndContinue(): void {
+    this.releaseFutureWrites = true;
+    this.release();
   }
 }
 
@@ -159,6 +169,38 @@ test("quarantines a slow handler response after fatal parse completion", async (
     id: null,
     error: { code: -32700, message: "Parse error" },
   }]);
+});
+
+test("suppresses a pre-fatal queued response when it reaches the write gate", async () => {
+  const stdin = new PassThrough();
+  const stdout = new ControlledWriter();
+  const stderr = new PassThrough();
+  const rpc = new StdioRpc({ stdin, stdout, stderr, idPrefix: "core-" });
+  const firstRecord = once(stdout, "record");
+  const blocker = rpc.peer.notify("already-written");
+  await firstRecord;
+  let handleRequest!: () => void;
+  const requestHandled = new Promise<void>((resolve) => { handleRequest = resolve; });
+  rpc.peer.register("queued", (value) => value, () => {
+    handleRequest();
+    return { mustNotWrite: true };
+  });
+
+  stdin.write(Buffer.from('{"jsonrpc":"2.0","id":"ui-queued","method":"queued"}\n'));
+  await requestHandled;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const diagnosed = once(stderr, "data");
+  stdin.write(Buffer.from('{oops}\n'));
+  await diagnosed;
+  stdout.releaseAndContinue();
+  await blocker;
+  await rpc.done;
+
+  const decoder = new NdjsonDecoder();
+  assert.deepEqual(decoder.push(Buffer.concat(stdout.chunks)), [
+    { jsonrpc: "2.0", method: "already-written" },
+    { jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } },
+  ]);
 });
 
 test("treats incomplete and overlong EOF input as diagnostics without fabricated responses", async () => {
