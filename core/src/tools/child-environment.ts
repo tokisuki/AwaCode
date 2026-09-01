@@ -1,11 +1,16 @@
 function isCredentialVariable(name: string): boolean {
   const normalized = name.toUpperCase();
+  const compact = normalized.replace(/[^A-Z0-9]/g, "");
   return normalized === "AWACODE_API_KEY"
     || normalized === "OPENAI_API_KEY"
     || normalized.endsWith("_API_KEY")
     || normalized.includes("AUTHORIZATION")
     || normalized.includes("TOKEN")
-    || normalized.includes("SECRET");
+    || normalized.includes("SECRET")
+    || normalized.includes("PASSWORD")
+    || compact.includes("APIKEY")
+    || compact.includes("ACCESSKEY")
+    || compact.includes("PRIVATEKEY");
 }
 
 export function filterChildEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {

@@ -214,8 +214,8 @@ test("binds approval and one real spawn to persisted command input and stores on
 
 test("stripped environment values never enter approval, output, diagnostics, or SQLite", async () => {
   const command = hostCommand(
-    "[Console]::Out.Write($env:SAFE_VALUE + '|' + $env:AWACODE_API_KEY + '|' + $env:OPENAI_API_KEY + '|' + $env:NPM_TOKEN + '|' + $env:AWS_SECRET_ACCESS_KEY + '|' + $env:accessToken + '|' + $env:clientSecret)",
-    "printf '%s' \"$SAFE_VALUE|$AWACODE_API_KEY|$OPENAI_API_KEY|$NPM_TOKEN|$AWS_SECRET_ACCESS_KEY|$accessToken|$clientSecret\"",
+    "[Console]::Out.Write($env:SAFE_VALUE + '|' + $env:AWACODE_API_KEY + '|' + $env:OPENAI_API_KEY + '|' + $env:NPM_TOKEN + '|' + $env:AWS_SECRET_ACCESS_KEY + '|' + $env:accessToken + '|' + $env:clientSecret + '|' + $env:PGPASSWORD + '|' + $env:DATABASE_PASSWORD + '|' + $env:apiKey + '|' + $env:AWS_ACCESS_KEY_ID + '|' + $env:privateKey)",
+    "printf '%s' \"$SAFE_VALUE|$AWACODE_API_KEY|$OPENAI_API_KEY|$NPM_TOKEN|$AWS_SECRET_ACCESS_KEY|$accessToken|$clientSecret|$PGPASSWORD|$DATABASE_PASSWORD|$apiKey|$AWS_ACCESS_KEY_ID|$privateKey\"",
   );
   const setup = await fixture("secret-persistence", { command });
   const secrets = [
@@ -225,6 +225,11 @@ test("stripped environment values never enter approval, output, diagnostics, or 
     "never-aws-value",
     "never-access-value",
     "never-client-value",
+    "never-pg-password-value",
+    "never-database-password-value",
+    "never-camel-api-key-value",
+    "never-aws-access-key-value",
+    "never-private-key-value",
   ];
   const requests: PermissionRequest[] = [];
   try {
@@ -251,10 +256,15 @@ test("stripped environment values never enter approval, output, diagnostics, or 
         AWS_SECRET_ACCESS_KEY: secrets[3],
         accessToken: secrets[4],
         clientSecret: secrets[5],
+        PGPASSWORD: secrets[6],
+        DATABASE_PASSWORD: secrets[7],
+        apiKey: secrets[8],
+        AWS_ACCESS_KEY_ID: secrets[9],
+        privateKey: secrets[10],
       },
     });
     assert.equal(result.status, "success");
-    assert.match(result.content, /visible\|\|\|\|\|\|/);
+    assert.equal(result.content, `STDOUT:\nvisible${"|".repeat(11)}\nSTDERR:\n(empty)`);
     const persistedRows = setup.connection.db.prepare(`
       SELECT input_text, result_json, error_text
       FROM tool_calls

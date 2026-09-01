@@ -11,8 +11,10 @@ import {
   type CommandProcessAdapter,
   type CommandTimer,
   type CommandTreeTerminator,
+  type PosixProcessGroupController,
   executeCommandProcess,
   shellInvocation,
+  terminatePosixProcessGroup,
 } from "../../src/tools/command-process.ts";
 import {
   createChildChannel,
@@ -27,6 +29,10 @@ function hostCommand(windows: string, posix: string): string {
 
 function shellQuoted(value: string): string {
   return `'${value.replaceAll("'", "''")}'`;
+}
+
+function posixQuoted(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
 class ManualCommandTimer implements CommandTimer {
@@ -140,6 +146,23 @@ async function assertHeartbeatStopped(path: string, label: string): Promise<void
   }
 }
 
+async function waitForTextFile(path: string, label: string): Promise<string> {
+  const deadline = Date.now() + 2_000;
+  for (;;) {
+    try {
+      return await readFile(path, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw error;
+      }
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`${label} did not appear within 2000 ms`);
+    }
+    await new Promise<void>((resolvePoll) => setTimeout(resolvePoll, 20));
+  }
+}
+
 test("uses stable platform shell vectors and preserves command quoting as one argument", () => {
   const command = `Write-Output "a b"; Write-Output '中文'; $x = \"'quoted'\"`;
   assert.deepEqual(shellInvocation(command, {
@@ -156,6 +179,80 @@ test("uses stable platform shell vectors and preserves command quoting as one ar
     executable: "/bin/sh",
     args: ["-lc", command],
   });
+});
+
+test("POSIX escalation probes the process group after grace even when the shell already closed", async () => {
+  for (const [label, outcomes, expectedEvents, expectedFailed] of [
+    [
+      "live descendant after root close",
+      ["delivered", "delivered", "delivered"],
+      ["-91:SIGTERM", "wait:250", "-91:0", "-91:SIGKILL"],
+      false,
+    ],
+    [
+      "group already gone at TERM",
+      ["gone"],
+      ["-91:SIGTERM"],
+      false,
+    ],
+    [
+      "group gone at probe",
+      ["delivered", "gone"],
+      ["-91:SIGTERM", "wait:250", "-91:0"],
+      false,
+    ],
+    [
+      "group disappears before KILL",
+      ["delivered", "delivered", "gone"],
+      ["-91:SIGTERM", "wait:250", "-91:0", "-91:SIGKILL"],
+      false,
+    ],
+    [
+      "TERM error remains a failure",
+      ["failed", "delivered", "delivered"],
+      ["-91:SIGTERM", "wait:250", "-91:0", "-91:SIGKILL"],
+      true,
+    ],
+    [
+      "probe error remains a failure and still attempts KILL",
+      ["delivered", "failed", "delivered"],
+      ["-91:SIGTERM", "wait:250", "-91:0", "-91:SIGKILL"],
+      true,
+    ],
+    [
+      "KILL error is a failure",
+      ["delivered", "delivered", "failed"],
+      ["-91:SIGTERM", "wait:250", "-91:0", "-91:SIGKILL"],
+      true,
+    ],
+  ] as const) {
+    const remaining = [...outcomes];
+    const events: string[] = [];
+    const controller: PosixProcessGroupController = {
+      signal(target, signal) {
+        events.push(`${target}:${signal}`);
+        const outcome = remaining.shift();
+        assert.notEqual(outcome, undefined, label);
+        return outcome as "delivered" | "gone" | "failed";
+      },
+      async wait(delayMs) {
+        events.push(`wait:${delayMs}`);
+      },
+    };
+
+    const result = await terminatePosixProcessGroup(
+      91,
+      Promise.resolve([null, "SIGTERM"]),
+      controller,
+    );
+
+    assert.deepEqual(events, expectedEvents, label);
+    assert.equal(remaining.length, 0, label);
+    assert.deepEqual(result, {
+      failed: expectedFailed,
+      code: expectedFailed ? "tree_termination_failed" : null,
+    }, label);
+  }
 });
 
 test("production Windows taskkill tree capability is explicit when host privileges deny it", async (context) => {
@@ -508,6 +605,67 @@ test("timeout and cancellation each settle once, clean resources, and terminate 
       if (cleanupFailures.length > 0) {
         throw new AggregateError(cleanupFailures, `${cause} command tree fallback cleanup failed`);
       }
+    }
+  }
+});
+
+test("real POSIX escalation kills a redirected SIGTERM-resistant descendant after the shell closes", async (context) => {
+  if (process.platform === "win32") {
+    context.skip("requires real POSIX detached process-group and signal semantics");
+    return;
+  }
+  const root = await mkdtemp(join(tmpdir(), "awacode-resistant-redirected-tree-"));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const readyPath = join(root, "ready.txt");
+  const heartbeatPath = join(root, "heartbeat.txt");
+  const fixture = join(import.meta.dirname, "..", "..", "test-fixtures", "resistant-redirected-grandchild.ts");
+  const timer = new ManualCommandTimer();
+  let channel: ChildChannel | undefined;
+  let grandchildPid: number | undefined;
+  const adapter: CommandProcessAdapter = {
+    platform: process.platform,
+    windowsPowerShellExecutable: "unused",
+    spawn(executable, args, options) {
+      const child = spawn(executable, [...args], options) as ReturnType<CommandProcessAdapter["spawn"]>;
+      channel = createChildChannel(child, { processGroup: true });
+      return child;
+    },
+  };
+  const command = `${posixQuoted(process.execPath)} ${posixQuoted(fixture)} ${posixQuoted(readyPath)} ${posixQuoted(heartbeatPath)} </dev/null >/dev/null 2>&1 & grandchild=$!; wait "$grandchild"`;
+  try {
+    const pending = executeCommandProcess({
+      command,
+      cwd: process.cwd(),
+      timeoutMs: 30_000,
+      signal: new AbortController().signal,
+      processAdapter: adapter,
+      timer,
+    });
+    await withTimeout(timer.armed, 2_000, "resistant POSIX timer arm");
+    grandchildPid = Number(await waitForTextFile(readyPath, "resistant POSIX readiness"));
+    assert.ok(Number.isSafeInteger(grandchildPid) && grandchildPid > 0);
+    timer.fire();
+
+    const result = await withTimeout(pending, 10_000, "resistant POSIX tree result");
+    assert.equal(result.timedOut, true);
+    assert.equal(result.terminationFailed, false);
+    assert.equal(result.terminationFailureCode, null);
+    await waitForProcessGone(grandchildPid, "resistant POSIX grandchild");
+    await assertHeartbeatStopped(heartbeatPath, "resistant POSIX grandchild");
+  } finally {
+    const cleanupFailures: unknown[] = [];
+    if (channel !== undefined) {
+      await disposeChildChannel(channel, "resistant POSIX tree fallback", {
+        gracefulTimeoutMs: 500,
+        forceTimeoutMs: 2_000,
+      }).catch((error) => cleanupFailures.push(error));
+    }
+    if (grandchildPid !== undefined) {
+      await forceTerminatePidTree(grandchildPid, "resistant POSIX grandchild fallback")
+        .catch((error) => cleanupFailures.push(error));
+    }
+    if (cleanupFailures.length > 0) {
+      throw new AggregateError(cleanupFailures, "resistant POSIX fallback cleanup failed");
     }
   }
 });

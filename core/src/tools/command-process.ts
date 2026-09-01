@@ -68,6 +68,13 @@ export interface CommandTreeTerminator {
   ): Promise<CommandTreeTermination>;
 }
 
+export type ProcessGroupSignalOutcome = "delivered" | "gone" | "failed";
+
+export interface PosixProcessGroupController {
+  signal(target: number, signal: 0 | NodeJS.Signals): ProcessGroupSignalOutcome;
+  wait(delayMs: number): Promise<void>;
+}
+
 const systemCommandTimer: CommandTimer = {
   schedule(delayMs, callback) {
     const timeout = setTimeout(callback, delayMs);
@@ -104,17 +111,40 @@ async function boundedWait<T>(promise: Promise<T>, timeoutMs: number): Promise<T
   }
 }
 
-function signalProcessGroup(child: CommandChild, signal: NodeJS.Signals): boolean {
-  const pid = child.pid;
-  if (pid === undefined) {
-    return false;
+const systemPosixProcessGroupController: PosixProcessGroupController = {
+  signal(target, signal) {
+    try {
+      process.kill(target, signal);
+      return "delivered";
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "ESRCH" ? "gone" : "failed";
+    }
+  },
+  wait(delayMs) {
+    return new Promise<void>((resolveWait) => setTimeout(resolveWait, delayMs));
+  },
+};
+
+export async function terminatePosixProcessGroup(
+  pid: number,
+  closed: Promise<[number | null, NodeJS.Signals | null]>,
+  controller: PosixProcessGroupController = systemPosixProcessGroupController,
+): Promise<CommandTreeTermination> {
+  const target = -pid;
+  const termOutcome = controller.signal(target, "SIGTERM");
+  let failed = termOutcome === "failed";
+  if (termOutcome !== "gone") {
+    await controller.wait(250);
+    const probeOutcome = controller.signal(target, 0);
+    failed = probeOutcome === "failed" || failed;
+    if (probeOutcome !== "gone") {
+      const killOutcome = controller.signal(target, "SIGKILL");
+      failed = killOutcome === "failed" || failed;
+    }
   }
-  try {
-    process.kill(-pid, signal);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "ESRCH";
-  }
+  const closeOutcome = await boundedWait(closed, 5_000);
+  failed = closeOutcome === undefined || failed;
+  return { failed, code: failed ? "tree_termination_failed" : null };
 }
 
 async function runWindowsTaskkill(pid: number): Promise<boolean> {
@@ -150,14 +180,7 @@ const systemTreeTerminator: CommandTreeTerminator = {
       return { failed, code: failed ? "tree_termination_failed" : null };
     }
 
-    let signalFailed = !signalProcessGroup(child, "SIGTERM");
-    let closeOutcome = await boundedWait(closed, 250);
-    if (closeOutcome === undefined) {
-      signalFailed = !signalProcessGroup(child, "SIGKILL") || signalFailed;
-      closeOutcome = await boundedWait(closed, 5_000);
-    }
-    const failed = signalFailed || closeOutcome === undefined;
-    return { failed, code: failed ? "tree_termination_failed" : null };
+    return terminatePosixProcessGroup(pid, closed);
   },
 };
 
