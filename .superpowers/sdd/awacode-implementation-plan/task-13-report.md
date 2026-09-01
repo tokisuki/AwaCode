@@ -215,3 +215,57 @@ The pre-existing Windows CTest DLL-environment limitation remains: direct Qt exe
 
 - `d4c7035 fix(desktop): preserve async settings and transcript order`
 - `cf902fb docs: record desktop review round two`
+
+## Review fix round 3
+
+### RED / GREEN
+
+The existing ordering test was strengthened before the production change to assert, immediately after `stream/text → agent/phase → stream/commit`, that `[provisional] first answer` is absent and the committed text remains before `[reflect]`.
+
+RED command:
+
+```powershell
+& D:\mingw64\bin\cmake.exe --build desktop\build-qt6-round2 --target awacode-main-window-test
+# with the documented Qt/MinGW PATH and offscreen variables:
+.\desktop\build-qt6-round2\awacode-main-window-test.exe keepsStreamBeforeLaterTranscriptEventsAndClearsCommittedStateForNextRun
+```
+
+Outcome: `ORDERING_COMMIT_RED_EXIT=1`. The assertion failed as intended because `appendTranscript()` had folded the live message into a plain base string with `[provisional]`, then `stream/commit` no longer found its `messageId`.
+
+GREEN command:
+
+```powershell
+& D:\mingw64\bin\cmake.exe --build desktop\build-qt6-round2 --target awacode-main-window-test
+# with the same runtime variables:
+.\desktop\build-qt6-round2\awacode-main-window-test.exe keepsStreamBeforeLaterTranscriptEventsAndClearsCommittedStateForNextRun
+```
+
+Outcome: `ORDERING_COMMIT_GREEN_EXIT=0`. The transcript now keeps one ordered entry per event, including `messageId` on stream entries; commit clears the provisional state in place, retaining original order without duplication.
+
+Covering Qt GREEN:
+
+```powershell
+& D:\mingw64\bin\cmake.exe --build desktop\build-qt6-round2
+# with the same runtime variables:
+.\desktop\build-qt6-round2\awacode-rpc-codec-test.exe
+.\desktop\build-qt6-round2\awacode-process-manager-test.exe
+.\desktop\build-qt6-round2\awacode-main-window-test.exe
+.\desktop\build-qt6-round2\awacode-dialogs-test.exe
+.\desktop\build-qt6-round2\awacode-models-test.exe
+```
+
+Outcome: all five direct Qt executables returned `0` (`QT_DIRECT_TESTS=5_PASS`).
+
+### Review self-review
+
+- The single ordered `TranscriptEntry` model replaces the split base/active-stream representation that caused ordering and finalization disagreement.
+- Non-stream entries no longer destroy stream identity. A later `stream/commit` finalizes the matching entry in place and cannot duplicate or move its text.
+- The strengthened test observes public transcript output, not private container state, and specifically covers the reviewer-reported phase-before-commit path.
+
+### Concerns
+
+The existing CTest DLL-path propagation limitation is unchanged; direct Qt test executables with the documented runtime PATH are green.
+
+### Round 3 commit
+
+- `45f6add fix(desktop): finalize folded stream entries`
