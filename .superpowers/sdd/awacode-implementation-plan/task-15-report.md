@@ -77,4 +77,8 @@ README 与部署说明均将 Qt 6.8.3/匹配 MinGW 13.1 的 `bin` 加入 `PATH` 
 
 附加命令验证使用 Node 24：无参数退出 2，`--target D:\awacode-outside-target` 被拒绝，明确的 `--target demo\.workspace\round1-command-validation` 成功复位并在验证后清理。`README.txt` 重新按所有 Unicode code point 计数仍为 629；本轮变更的私钥/token 签名扫描和 `git diff --check` 均无异常。
 
-本轮 green 代码与文档会作为新的、未 amend 的提交记录；其准确 SHA 在后续提交证据补充中登记。
+| 提交 | 内容 |
+| --- | --- |
+| `8049da5 fix(demo): reject linked reset ancestors` | 逐祖先链接/junction 拒绝、删除后复制前重验证、真实 sentinel 回归测试，以及 Qt `ctest` PATH 文档修正。 |
+
+以上提交未 amend、rebase 或 push；本报告 SHA 补充以独立文档提交保存。
