@@ -137,6 +137,7 @@ test("startup recovers durable state and composes a configured per-session agent
       "list_files",
       "read_file",
       "run_command",
+      "search_text",
     ]);
     assert.ok(notifications.some((notification) =>
       notification.method === "tool/end"
