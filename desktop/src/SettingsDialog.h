@@ -32,4 +32,6 @@ private:
   QLabel *status_;
   QDialogButtonBox *buttons_ = nullptr;
   QPushButton *testButton_ = nullptr;
+  QPushButton *removeApiKey_ = nullptr;
+  bool removeCredential_ = false;
 };

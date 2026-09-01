@@ -29,6 +29,8 @@ public:
   void setConfigured(bool configured, const QString &model = {});
   void receiveNotification(const QString &method, const QJsonObject &params);
   void receiveResponse(const QString &method, const QJsonValue &result);
+  void receiveResponseForEpoch(const QString &method, const QJsonValue &result, quint64 epoch);
+  quint64 beginWorkspaceSelection(const QString &workspace);
   void receiveError(const QString &method, const QJsonObject &error);
   void coreCrashed(int exitCode);
   void coreStopped(bool cleanEof);
@@ -47,7 +49,20 @@ private slots:
   void showSettings();
 
 private:
-  QString sendRequest(const QString &method, const QJsonObject &params = {});
+  enum class RequestIntent { Normal, ManualSessionCreate, CreateForRun };
+  struct PendingRequest {
+    QString method;
+    quint64 epoch = 0;
+    RequestIntent intent = RequestIntent::Normal;
+    QString prompt;
+  };
+
+  QString sendRequest(const QString &method, const QJsonObject &params = {},
+                      RequestIntent intent = RequestIntent::Normal, const QString &prompt = {});
+  void processResponse(const QString &method, const QJsonValue &result, RequestIntent intent, const QString &prompt);
+  void dispatchRun(const QString &prompt);
+  void invalidateCoreState();
+  void updateControls();
   void setRunning(bool running);
   void appendTranscript(const QString &text);
   void loadSessions();
@@ -64,11 +79,15 @@ private:
 
   AgentProcessManager *manager_ = nullptr;
   bool configured_ = false;
+  bool coreAlive_ = false;
   bool running_ = false;
+  bool dispatchPending_ = false;
+  quint64 workspaceEpoch_ = 0;
   QString workspace_;
   QString projectId_;
   QString sessionId_;
-  QHash<QString, QString> pendingMethods_;
+  QHash<QString, PendingRequest> pendingRequests_;
+  QString currentRunRequestId_;
   QList<TranscriptEntry> transcriptEntries_;
   SessionListModel sessions_;
   ToolTimelineModel tools_;

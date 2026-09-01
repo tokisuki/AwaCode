@@ -67,6 +67,7 @@ test("real JsonRpcPeer calls receive the literal results of core and memory hand
       coreVersion: "0.1.0",
       databaseVersion: 1,
       configured: false,
+      model: null,
       interruptedCount: 0,
     });
     assert.deepEqual(await client.request("workspace/set", { workspace }), {

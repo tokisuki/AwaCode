@@ -34,6 +34,7 @@ test("stdio Core does not consume an already-buffered request until startup conv
       coreVersion: "0.1.0",
       databaseVersion: 1,
       configured: false,
+      model: null,
       interruptedCount: 0,
     });
     assert.equal(Buffer.concat(diagnostics).toString("utf8"), "");

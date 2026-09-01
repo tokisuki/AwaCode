@@ -14,18 +14,69 @@ private slots:
   void disablesRunUntilConfigured();
   void batchesMultipleProvisionalDeltasOnceAndCommitsThem();
   void hydratesPayloadMessagesAndToolCalls();
-  void disablesConflictingControlsWhileRunning();
+  void ignoresBusyWithoutADispatchedRequestId();
   void displaysRpcErrorsAndRestoresRunState();
   void keepsStreamBeforeLaterTranscriptEventsAndClearsCommittedStateForNextRun();
   void marksInterruptedContentAfterCoreCrash();
   void marksUnexpectedEofRestartable();
+  void workspaceEpochDropsStaleResponsesAndRequiresCurrentSession();
+  void crashKeepsRunDisabledUntilHelloRefreshesTheCurrentWorkspace();
+  void manualSessionCreationDoesNotDispatchTheOldPrompt();
+  void reloadMarksRejectedCandidates();
 };
 
 void MainWindowTest::disablesRunUntilConfigured() {
   MainWindow window;
   QVERIFY(!window.runButton()->isEnabled());
   window.setConfigured(true, QStringLiteral("demo-model"));
+  QVERIFY(!window.runButton()->isEnabled());
+}
+
+void MainWindowTest::workspaceEpochDropsStaleResponsesAndRequiresCurrentSession() {
+  MainWindow window;
+  window.setConfigured(true, QStringLiteral("demo-model"));
+  const quint64 oldEpoch = window.beginWorkspaceSelection(QStringLiteral("C:/old"));
+  const quint64 currentEpoch = window.beginWorkspaceSelection(QStringLiteral("C:/new"));
+  window.receiveResponseForEpoch("workspace/set", QJsonObject{{"workspace", "C:/old"}, {"projectId", "old"}}, oldEpoch);
+  QVERIFY(!window.runButton()->isEnabled());
+  window.receiveResponseForEpoch("workspace/set", QJsonObject{{"workspace", "C:/new"}, {"projectId", "new"}}, currentEpoch);
+  window.receiveResponseForEpoch("session/create", QJsonObject{{"id", "current"}, {"title", "New"}, {"status", "idle"}}, currentEpoch);
   QVERIFY(window.runButton()->isEnabled());
+}
+
+void MainWindowTest::crashKeepsRunDisabledUntilHelloRefreshesTheCurrentWorkspace() {
+  MainWindow window;
+  window.setConfigured(true, QStringLiteral("demo-model"));
+  const quint64 epoch = window.beginWorkspaceSelection(QStringLiteral("C:/work"));
+  window.receiveResponseForEpoch("workspace/set", QJsonObject{{"workspace", "C:/work"}, {"projectId", "p"}}, epoch);
+  window.receiveResponseForEpoch("session/create", QJsonObject{{"id", "s"}, {"title", "S"}, {"status", "idle"}}, epoch);
+  QVERIFY(window.runButton()->isEnabled());
+  window.coreCrashed(17);
+  QVERIFY(!window.runButton()->isEnabled());
+  window.receiveResponseForEpoch("core/hello", QJsonObject{{"configured", true}, {"model", "demo-model"}}, epoch);
+  QVERIFY(!window.runButton()->isEnabled());
+}
+
+void MainWindowTest::manualSessionCreationDoesNotDispatchTheOldPrompt() {
+  MainWindow window;
+  window.setConfigured(true);
+  const quint64 epoch = window.beginWorkspaceSelection(QStringLiteral("C:/work"));
+  window.receiveResponseForEpoch("workspace/set", QJsonObject{{"workspace", "C:/work"}, {"projectId", "p"}}, epoch);
+  auto *taskInput = window.findChild<QPlainTextEdit *>(QStringLiteral("taskInput"));
+  taskInput->setPlainText(QStringLiteral("must stay pending"));
+  window.receiveResponseForEpoch("session/create", QJsonObject{{"id", "manual"}, {"title", "Manual"}, {"status", "idle"}}, epoch);
+  QVERIFY(!window.transcriptText().contains(QStringLiteral("You: must stay pending")));
+  QCOMPARE(taskInput->toPlainText(), QStringLiteral("must stay pending"));
+}
+
+void MainWindowTest::reloadMarksRejectedCandidates() {
+  MainWindow window;
+  window.receiveResponse("session/load", QJsonObject{{"messages", QJsonArray{
+    QJsonObject{{"role", "assistant"}, {"payload", QJsonObject{{"text", "superseded"}, {"candidateStatus", "rejected"}}}},
+    QJsonObject{{"role", "assistant"}, {"payload", QJsonObject{{"text", "final"}, {"candidateStatus", "accepted"}}}},
+  }}});
+  QVERIFY(window.transcriptText().contains(QStringLiteral("[rejected] superseded")));
+  QVERIFY(window.transcriptText().contains(QStringLiteral("final")));
 }
 
 void MainWindowTest::keepsStreamBeforeLaterTranscriptEventsAndClearsCommittedStateForNextRun() {
@@ -42,7 +93,7 @@ void MainWindowTest::keepsStreamBeforeLaterTranscriptEventsAndClearsCommittedSta
   QVERIFY(taskInput != nullptr);
   taskInput->setPlainText(QStringLiteral("second task"));
   window.receiveResponse("session/create", QJsonObject{{"id", "second-session"}});
-  QVERIFY(window.transcriptText().indexOf(QStringLiteral("first answer")) < window.transcriptText().indexOf(QStringLiteral("You: second task")));
+  QVERIFY(!window.transcriptText().contains(QStringLiteral("You: second task")));
   window.receiveNotification("stream/text", QJsonObject{{"messageId", "second"}, {"delta", "second answer"}, {"provisional", true}});
   QTRY_VERIFY_WITH_TIMEOUT(window.transcriptText().contains(QStringLiteral("second answer")), 200);
   QCOMPARE(window.transcriptText().count(QStringLiteral("first answer")), 1);
@@ -86,21 +137,22 @@ void MainWindowTest::hydratesPayloadMessagesAndToolCalls() {
   QCOMPARE(window.toolTimelineText(0), QStringLiteral("run_command — success: tests pass"));
 }
 
-void MainWindowTest::disablesConflictingControlsWhileRunning() {
+void MainWindowTest::ignoresBusyWithoutADispatchedRequestId() {
   MainWindow window;
   window.setConfigured(true, QStringLiteral("demo-model"));
+  const quint64 epoch = window.beginWorkspaceSelection(QStringLiteral("C:/work"));
+  window.receiveResponseForEpoch("workspace/set", QJsonObject{{"workspace", "C:/work"}, {"projectId", "p"}}, epoch);
   window.receiveNotification("agent/status", QJsonObject{{"status", "busy"}});
-  QVERIFY(!window.findChild<QPushButton *>(QStringLiteral("chooseWorkspace"))->isEnabled());
-  QVERIFY(!window.findChild<QPushButton *>(QStringLiteral("newSession"))->isEnabled());
-  QVERIFY(!window.findChild<QListView *>(QStringLiteral("sessionList"))->isEnabled());
-  QVERIFY(!window.findChild<QPushButton *>(QStringLiteral("settings"))->isEnabled());
-  QVERIFY(!window.runButton()->isEnabled());
-  QVERIFY(window.findChild<QPushButton *>(QStringLiteral("cancel"))->isEnabled());
+  QVERIFY(window.findChild<QPushButton *>(QStringLiteral("chooseWorkspace"))->isEnabled());
+  QVERIFY(window.runButton()->isEnabled());
+  QVERIFY(!window.findChild<QPushButton *>(QStringLiteral("cancel"))->isEnabled());
 }
 
 void MainWindowTest::displaysRpcErrorsAndRestoresRunState() {
   MainWindow window;
   window.setConfigured(true, QStringLiteral("demo-model"));
+  const quint64 epoch = window.beginWorkspaceSelection(QStringLiteral("C:/work"));
+  window.receiveResponseForEpoch("workspace/set", QJsonObject{{"workspace", "C:/work"}, {"projectId", "p"}}, epoch);
   window.receiveNotification("agent/status", QJsonObject{{"status", "busy"}});
   window.receiveError("agent/run", QJsonObject{{"code", -32005}, {"message", "cancelled"}});
   QVERIFY(window.runButton()->isEnabled());

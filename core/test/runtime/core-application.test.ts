@@ -115,6 +115,7 @@ test("startup recovers durable state and composes a configured per-session agent
       coreVersion: "0.1.0",
       databaseVersion: 1,
       configured: true,
+      model: "fixture-model",
       interruptedCount: 1,
     });
     const recovered = await client.request("session/load", { sessionId: interruptedSession.id }) as {

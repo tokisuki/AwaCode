@@ -14,6 +14,7 @@ private slots:
   void settingsUseCoreCredentialDto();
   void statusPrefillsNonSecretSettingsAndPreservesCredential();
   void saveRemainsOpenUntilResponseIsPresented();
+  void canExplicitlyRemoveAStoredCredential();
   void approvalDefaultsToDeny();
 };
 
@@ -63,6 +64,15 @@ void DialogsTest::statusPrefillsNonSecretSettingsAndPreservesCredential() {
   QCOMPARE(dialog.findChild<QLineEdit *>(QStringLiteral("model"))->text(), QStringLiteral("fixture-model"));
   QCOMPARE(dialog.findChild<QLineEdit *>(QStringLiteral("apiKey"))->text(), QString());
   QCOMPARE(dialog.settings().value("credential").toObject().value("action").toString(), QStringLiteral("keep"));
+}
+
+void DialogsTest::canExplicitlyRemoveAStoredCredential() {
+  SettingsDialog dialog;
+  dialog.applyStatus(QJsonObject{{"hasApiKey", true}});
+  auto *remove = dialog.findChild<QPushButton *>(QStringLiteral("removeApiKey"));
+  QVERIFY(remove != nullptr);
+  QTest::mouseClick(remove, Qt::LeftButton);
+  QCOMPARE(dialog.settings().value("credential").toObject().value("action").toString(), QStringLiteral("remove"));
 }
 
 void DialogsTest::approvalDefaultsToDeny() {

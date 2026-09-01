@@ -26,6 +26,18 @@ SettingsDialog::SettingsDialog(QWidget *parent) : QDialog(parent) {
   layout->addRow(QStringLiteral("Context limit"), contextLimit_);
   layout->addRow(QStringLiteral("Max output"), maxOutput_);
   layout->addRow(QStringLiteral("API key"), apiKey_);
+  removeApiKey_ = new QPushButton(QStringLiteral("Remove saved key"), this);
+  removeApiKey_->setObjectName(QStringLiteral("removeApiKey"));
+  removeApiKey_->setEnabled(false);
+  connect(removeApiKey_, &QPushButton::clicked, this, [this] {
+    removeCredential_ = true;
+    apiKey_->clear();
+    apiKey_->setPlaceholderText(QStringLiteral("Stored key will be removed"));
+  });
+  connect(apiKey_, &QLineEdit::textEdited, this, [this](const QString &text) {
+    if (!text.isEmpty()) removeCredential_ = false;
+  });
+  layout->addRow(QString(), removeApiKey_);
   layout->addRow(status_);
   buttons_ = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel, this);
   testButton_ = buttons_->addButton(QStringLiteral("Test connection"), QDialogButtonBox::ActionRole);
@@ -52,14 +64,18 @@ void SettingsDialog::applyStatus(const QJsonObject &status) {
   contextLimit_->setText(QString::number(status.value("contextLimit").toInt(32768)));
   maxOutput_->setText(QString::number(status.value("maxOutputTokens").toInt(4096)));
   const bool hasApiKey = status.value("hasApiKey").toBool();
+  removeCredential_ = false;
+  removeApiKey_->setEnabled(hasApiKey);
   apiKey_->clear();
   apiKey_->setPlaceholderText(hasApiKey ? QStringLiteral("Stored key preserved") : QString());
   setStatusText(status.value("runnable").toBool() ? QStringLiteral("Configuration is ready") : QStringLiteral("Configuration is incomplete"));
 }
 
 QJsonObject SettingsDialog::settings() const {
-  QJsonObject credential{{"action", apiKey_->text().isEmpty() ? "keep" : "store"}};
-  if (!apiKey_->text().isEmpty()) credential.insert("apiKey", apiKey_->text());
+  const QString action = removeCredential_ ? QStringLiteral("remove")
+    : apiKey_->text().isEmpty() ? QStringLiteral("keep") : QStringLiteral("store");
+  QJsonObject credential{{"action", action}};
+  if (action == QStringLiteral("store")) credential.insert("apiKey", apiKey_->text());
   QJsonObject result{
     {"baseUrl", baseUrl_->text()},
     {"model", model_->text()},

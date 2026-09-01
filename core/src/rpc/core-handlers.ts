@@ -194,12 +194,16 @@ function agentFault(error: unknown): never {
 }
 
 export function registerCoreHandlers(peer: JsonRpcPeer, dependencies: CoreHandlerDependencies): void {
-  peer.register("core/hello", parseHello, async () => ({
-    coreVersion: coreDescriptor.version,
-    databaseVersion: DATABASE_VERSION,
-    configured: (await dependencies.configService.status()).runnable,
-    interruptedCount: dependencies.startup?.interruptedCount ?? 0,
-  }));
+  peer.register("core/hello", parseHello, async () => {
+    const status = await dependencies.configService.status();
+    return {
+      coreVersion: coreDescriptor.version,
+      databaseVersion: DATABASE_VERSION,
+      configured: status.runnable,
+      model: status.model,
+      interruptedCount: dependencies.startup?.interruptedCount ?? 0,
+    };
+  });
 
   peer.register("workspace/set", parseWorkspace, async ({ workspace }) => {
     try {

@@ -18,6 +18,7 @@
 
 MainWindow::MainWindow(AgentProcessManager *manager, QWidget *parent) : QMainWindow(parent) {
   manager_ = manager;
+  coreAlive_ = manager_ == nullptr;
 
   auto *root = new QWidget(this);
   auto *layout = new QVBoxLayout(root);
@@ -103,7 +104,15 @@ MainWindow::MainWindow(AgentProcessManager *manager, QWidget *parent) : QMainWin
     connect(manager_, &AgentProcessManager::protocolError, stderr_, &QPlainTextEdit::appendPlainText);
     connect(manager_, &AgentProcessManager::crashed, this, &MainWindow::coreCrashed);
     connect(manager_, &AgentProcessManager::stopped, this, &MainWindow::coreStopped);
-    connect(manager_, &AgentProcessManager::started, this, [this] { sendRequest(QStringLiteral("core/hello")); });
+    connect(manager_, &AgentProcessManager::started, this, [this] {
+      coreAlive_ = false;
+      running_ = false;
+      dispatchPending_ = false;
+      currentRunRequestId_.clear();
+      pendingRequests_.clear();
+      updateControls();
+      sendRequest(QStringLiteral("core/hello"));
+    });
   }
 }
 
@@ -114,11 +123,12 @@ QString MainWindow::toolTimelineText(int row) const { return tools_.displayText(
 
 void MainWindow::setConfigured(bool configured, const QString &model) {
   configured_ = configured;
-  run_->setEnabled(configured_ && !running_);
+  updateControls();
   if (!model.isEmpty()) setWindowTitle(QStringLiteral("AwaCode Agent Console — %1").arg(model));
 }
 
 void MainWindow::receiveNotification(const QString &method, const QJsonObject &params) {
+  if (!coreAlive_) return;
   if (method == QStringLiteral("stream/text")) {
     const QString messageId = params.value("messageId").toString();
     TranscriptEntry *entry = nullptr;
@@ -147,20 +157,25 @@ void MainWindow::receiveNotification(const QString &method, const QJsonObject &p
     tools_.finished(params);
   } else if (method == QStringLiteral("agent/status")) {
     const QString status = params.value("status").toString();
-    setRunning(status == QStringLiteral("busy"));
+    if (status == QStringLiteral("busy")) {
+      if (!currentRunRequestId_.isEmpty()) setRunning(true);
+    } else {
+      currentRunRequestId_.clear();
+      setRunning(false);
+    }
   }
 }
 
 void MainWindow::coreCrashed(int exitCode) {
   flushBufferedText();
   appendTranscript(QStringLiteral("\n[Core interrupted (exit %1); displayed content is preserved.]\n").arg(exitCode));
-  setRunning(false);
+  invalidateCoreState();
   restart_->setEnabled(true);
 }
 
 void MainWindow::coreStopped(bool cleanEof) {
   flushBufferedText();
-  setRunning(false);
+  invalidateCoreState();
   if (!cleanEof) {
     appendTranscript(QStringLiteral("\n[Core ended unexpectedly; displayed content is preserved.]\n"));
     restart_->setEnabled(true);
@@ -170,26 +185,54 @@ void MainWindow::coreStopped(bool cleanEof) {
 void MainWindow::chooseWorkspace() {
   const QString workspace = QFileDialog::getExistingDirectory(this, QStringLiteral("Choose workspace"), workspace_);
   if (workspace.isEmpty()) return;
+  beginWorkspaceSelection(workspace);
+}
+
+quint64 MainWindow::beginWorkspaceSelection(const QString &workspace) {
+  ++workspaceEpoch_;
+  pendingRequests_.clear();
+  currentRunRequestId_.clear();
+  dispatchPending_ = false;
+  running_ = false;
   workspace_ = workspace;
+  projectId_.clear();
+  sessionId_.clear();
   workspaceField_->setText(workspace_);
+  sessions_.setSessions({});
+  transcriptEntries_.clear();
+  tools_.clear();
+  renderTranscript();
+  updateControls();
   sendRequest(QStringLiteral("workspace/set"), {{"workspace", workspace_}});
+  return workspaceEpoch_;
 }
 
 void MainWindow::createSession() {
   if (projectId_.isEmpty()) return;
-  sendRequest(QStringLiteral("session/create"), {{"projectId", projectId_}});
+  sendRequest(QStringLiteral("session/create"), {{"projectId", projectId_}}, RequestIntent::ManualSessionCreate);
 }
 
 void MainWindow::runTask() {
   const QString prompt = taskInput_->toPlainText().trimmed();
-  if (prompt.isEmpty() || !configured_) return;
+  if (prompt.isEmpty() || !configured_ || !coreAlive_ || projectId_.isEmpty() || running_ || dispatchPending_) return;
   if (sessionId_.isEmpty()) {
-    createSession();
+    dispatchPending_ = true;
+    const QString id = sendRequest(QStringLiteral("session/create"), {{"projectId", projectId_}}, RequestIntent::CreateForRun, prompt);
+    if (id.isEmpty()) dispatchPending_ = false;
+    updateControls();
     return;
   }
+  dispatchRun(prompt);
+}
+
+void MainWindow::dispatchRun(const QString &prompt) {
   tools_.clear();
+  const QString id = sendRequest(QStringLiteral("agent/run"), {{"sessionId", sessionId_}, {"prompt", prompt}});
+  dispatchPending_ = false;
+  if (id.isEmpty()) { updateControls(); return; }
+  currentRunRequestId_ = id;
   appendTranscript(QStringLiteral("\nYou: %1\n").arg(prompt));
-  sendRequest(QStringLiteral("agent/run"), {{"sessionId", sessionId_}, {"prompt", prompt}});
+  taskInput_->clear();
   setRunning(true);
 }
 
@@ -209,18 +252,31 @@ void MainWindow::flushBufferedText() {
 }
 
 void MainWindow::handleResponse(const QString &id, const QJsonValue &result) {
-  const QString method = pendingMethods_.take(id);
-  receiveResponse(method, result);
+  const PendingRequest pending = pendingRequests_.take(id);
+  if (pending.method.isEmpty() || pending.epoch != workspaceEpoch_) return;
+  processResponse(pending.method, result, pending.intent, pending.prompt);
 }
 
 void MainWindow::receiveResponse(const QString &method, const QJsonValue &result) {
+  receiveResponseForEpoch(method, result, workspaceEpoch_);
+}
+
+void MainWindow::receiveResponseForEpoch(const QString &method, const QJsonValue &result, quint64 epoch) {
+  if (epoch != workspaceEpoch_) return;
+  processResponse(method, result, RequestIntent::ManualSessionCreate, {});
+}
+
+void MainWindow::processResponse(const QString &method, const QJsonValue &result, RequestIntent intent, const QString &prompt) {
   const QJsonObject object = result.toObject();
   if (method == QStringLiteral("core/hello")) {
+    coreAlive_ = true;
     setConfigured(object.value("configured").toBool(), object.value("model").toString());
+    if (!workspace_.isEmpty()) sendRequest(QStringLiteral("workspace/set"), {{"workspace", workspace_}});
   } else if (method == QStringLiteral("workspace/set")) {
     projectId_ = object.value("projectId").toString();
     workspace_ = object.value("workspace").toString();
     workspaceField_->setText(workspace_);
+    updateControls();
     loadSessions();
   } else if (method == QStringLiteral("session/list")) {
     QList<SessionSummary> sessions;
@@ -232,16 +288,24 @@ void MainWindow::receiveResponse(const QString &method, const QJsonValue &result
   } else if (method == QStringLiteral("session/create")) {
     sessionId_ = object.value("id").toString();
     sessions_.prepend({sessionId_, object.value("title").toString(), object.value("status").toString()});
-    runTask();
+    dispatchPending_ = false;
+    updateControls();
+    if (intent == RequestIntent::CreateForRun && !prompt.isEmpty()) dispatchRun(prompt);
   } else if (method == QStringLiteral("session/load")) {
     transcriptEntries_.clear();
     for (const QJsonValue &value : object.value("messages").toArray()) {
       const QJsonObject message = value.toObject();
       const QString text = payloadText(message);
-      if (!text.isEmpty()) appendTranscript(QStringLiteral("%1: %2\n").arg(message.value("role").toString(), text));
+      if (!text.isEmpty()) {
+        const QJsonObject payload = message.value("payload").toObject();
+        const QString marker = payload.value("candidateStatus").toString() == QStringLiteral("rejected")
+          ? QStringLiteral("[rejected] ") : QString();
+        appendTranscript(QStringLiteral("%1: %2%3\n").arg(message.value("role").toString(), marker, text));
+      }
     }
     tools_.hydrate(object.value("toolCalls").toArray());
   } else if (method == QStringLiteral("agent/run")) {
+    currentRunRequestId_.clear();
     setRunning(false);
   } else if (method == QStringLiteral("config/save") || method == QStringLiteral("config/status")) {
     setConfigured(object.value("runnable").toBool(), object.value("model").toString());
@@ -255,7 +319,10 @@ void MainWindow::receiveResponse(const QString &method, const QJsonValue &result
 }
 
 void MainWindow::handleResponseError(const QString &id, const QJsonObject &error) {
-  receiveError(pendingMethods_.take(id), error);
+  const PendingRequest pending = pendingRequests_.take(id);
+  if (pending.method.isEmpty() || pending.epoch != workspaceEpoch_) return;
+  dispatchPending_ = false;
+  receiveError(pending.method, error);
 }
 
 void MainWindow::receiveError(const QString &method, const QJsonObject &error) {
@@ -263,6 +330,7 @@ void MainWindow::receiveError(const QString &method, const QJsonObject &error) {
   stderr_->appendPlainText(QStringLiteral("%1: %2").arg(method, message));
   appendTranscript(QStringLiteral("\n[Core error: %1]\n").arg(message));
   if (method == QStringLiteral("agent/run") || method == QStringLiteral("agent/cancel")) setRunning(false);
+  if (method == QStringLiteral("agent/run")) currentRunRequestId_.clear();
   if ((method == QStringLiteral("config/save") || method == QStringLiteral("config/test") || method == QStringLiteral("config/status")) && settingsDialog_ != nullptr) {
     if (method == QStringLiteral("config/save")) settingsDialog_->showSaveResult(message);
     else settingsDialog_->setStatusText(message);
@@ -279,16 +347,16 @@ void MainWindow::showSettings() {
   settingsDialog_.clear();
 }
 
-QString MainWindow::sendRequest(const QString &method, const QJsonObject &params) {
+QString MainWindow::sendRequest(const QString &method, const QJsonObject &params, RequestIntent intent, const QString &prompt) {
   if (manager_ == nullptr || !manager_->isRunning()) return {};
   const QString id = manager_->request(method, params);
-  pendingMethods_.insert(id, method);
+  if (!id.isEmpty()) pendingRequests_.insert(id, {method, workspaceEpoch_, intent, prompt});
   return id;
 }
 
 void MainWindow::setRunning(bool running) {
   running_ = running;
-  run_->setEnabled(configured_ && !running_);
+  updateControls();
   cancel_->setEnabled(running_);
   workspaceField_->setEnabled(!running_);
   chooseWorkspace_->setEnabled(!running_);
@@ -296,6 +364,25 @@ void MainWindow::setRunning(bool running) {
   sessionView_->setEnabled(!running_);
   settingsButton_->setEnabled(!running_);
   taskInput_->setEnabled(!running_);
+}
+
+void MainWindow::invalidateCoreState() {
+  ++workspaceEpoch_;
+  coreAlive_ = false;
+  running_ = false;
+  dispatchPending_ = false;
+  currentRunRequestId_.clear();
+  pendingRequests_.clear();
+  projectId_.clear();
+  sessionId_.clear();
+  sessions_.setSessions({});
+  updateControls();
+}
+
+void MainWindow::updateControls() {
+  const bool idle = !running_ && !dispatchPending_;
+  run_->setEnabled(coreAlive_ && configured_ && idle && !projectId_.isEmpty());
+  cancel_->setEnabled(coreAlive_ && running_);
 }
 
 void MainWindow::appendTranscript(const QString &text) {
@@ -328,7 +415,9 @@ void MainWindow::loadSession(const QString &sessionId) { sendRequest(QStringLite
 
 void MainWindow::handleApproval(const QString &id, const QJsonObject &params) {
   tools_.markApproval(params.value("callId").toString(), QStringLiteral("awaiting approval"));
-  ApprovalDialog dialog(params, this);
+  QJsonObject display = params;
+  display.insert(QStringLiteral("workspace"), workspace_);
+  ApprovalDialog dialog(display, this);
   dialog.exec();
   if (manager_ != nullptr) manager_->replyToApproval(id, dialog.decision());
 }

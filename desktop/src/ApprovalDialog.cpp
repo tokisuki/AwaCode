@@ -11,6 +11,7 @@ ApprovalDialog::ApprovalDialog(const QJsonObject &request, QWidget *parent) : QD
   setWindowTitle(QStringLiteral("Approve local action"));
   auto *layout = new QVBoxLayout(this);
   layout->addWidget(new QLabel(request.value("title").toString(), this));
+  layout->addWidget(new QLabel(QStringLiteral("Workspace: %1").arg(request.value("workspace").toString()), this));
   auto *preview = new QPlainTextEdit(this);
   preview->setReadOnly(true);
   preview->setPlainText(QString::fromUtf8(QJsonDocument(request.value("preview").toObject()).toJson(QJsonDocument::Indented)));
