@@ -152,3 +152,61 @@ Outcome: exit `0`. The scripted provider served the deterministic eight-turn wor
 - `ef6e1ce test(desktop): exercise real core integration`
 
 After `ef6e1ce`, the fresh Qt command rebuilt `desktop/build-qt6-round1` and returned `0` for RpcCodec, process manager, MainWindow, models, and dialogs; the same command ran `real_core_integration.mjs` and returned `0`. The fresh bundled-Node Core verification then returned `0` for typecheck, build, and full dot-reporter test suite.
+
+## Review fix round 2
+
+### RED / GREEN
+
+Focused RED tests were added before production changes. The initial fresh CMake configure attempted a backslash compiler path and correctly stopped with `Invalid character escape '\\c'`; the build directory was deleted and reconfigured with the same required compiler expressed as forward slashes. This was a Windows CMake-cache quoting issue, not a source failure.
+
+The Settings dialog RED was then run with:
+
+```powershell
+& D:\mingw64\bin\cmake.exe --build desktop\build-qt6-round2 --target awacode-dialogs-test
+```
+
+Outcome: expected compile RED: `SettingsDialog` had no `showSaveResult` or `statusText`, proving there was no testable asynchronous save-result lifecycle. The new MainWindow ordering test was built and run before the production change; it returned exit `1`, because a phase appended to `transcriptBase_` rendered before the still-active stream text.
+
+After the minimal fixes, the focused GREEN command was:
+
+```powershell
+& D:\mingw64\bin\cmake.exe --build desktop\build-qt6-round2 --target awacode-main-window-test awacode-dialogs-test
+$env:PATH = "D:\codes\AwaCode\.local\Qt\6.8.3\mingw_64\bin;D:\codes\AwaCode\.local\Qt\Tools\mingw1310_64\bin;$env:PATH"
+$env:QT_QPA_PLATFORM = "offscreen"
+$env:QT_QPA_FONTDIR = "D:\codes\AwaCode\.local\Qt\6.8.3\mingw_64\lib\fonts"
+.\desktop\build-qt6-round2\awacode-main-window-test.exe
+.\desktop\build-qt6-round2\awacode-dialogs-test.exe
+```
+
+Outcome: both returned `0`. The dialog test clicks Save, confirms the dialog remains visible and Save is disabled while the request is pending, then confirms a success result restores controls and remains visible. The ordering test exercises stream delta → phase → commit → actual second `runTask` entry → second delta → later RPC error and verifies display ordering and no duplicated first answer.
+
+Full Qt regression GREEN:
+
+```powershell
+& D:\mingw64\bin\cmake.exe --build desktop\build-qt6-round2
+# with the PATH/QPA variables above:
+.\desktop\build-qt6-round2\awacode-rpc-codec-test.exe
+.\desktop\build-qt6-round2\awacode-process-manager-test.exe
+.\desktop\build-qt6-round2\awacode-main-window-test.exe
+.\desktop\build-qt6-round2\awacode-dialogs-test.exe
+.\desktop\build-qt6-round2\awacode-models-test.exe
+```
+
+Outcome: all five executables returned `0`. The deterministic real Core/actual Qt-process rehearsal also returned `0`:
+
+```powershell
+$env:AWACODE_NODE_PATH = "C:\Users\47643\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe"
+$env:AWACODE_REAL_CORE_PROBE = (Resolve-Path .\desktop\build-qt6-round2\awacode-real-core-probe.exe)
+& $env:AWACODE_NODE_PATH --experimental-strip-types .\desktop\test\real_core_integration.mjs
+```
+
+### Review self-review
+
+- Save no longer calls `accept()` at request emission. The live dialog owns its request-pending state by disabling its buttons; MainWindow calls `showSaveResult` for both `config/save` success and error, restoring controls only after rendering a result.
+- Committed stream messages are removed from active state and appended to the durable transcript at commit time. Any non-stream append folds remaining provisional messages first, preserving chronological display through later phase/user/error events and a following run.
+- The added test reaches the real `runTask` path using a Core-shaped `session/create` response rather than only mutating an `agent/status` notification.
+- `git diff --check` passed before the green-slice commit. The generated `desktop/build-qt6-round2` directory is ignored and absent from Git status.
+
+### Concerns
+
+The pre-existing Windows CTest DLL-environment limitation remains: direct Qt executable runs with the documented Qt/MinGW runtime PATH are the recorded green evidence. No real credential was used.
