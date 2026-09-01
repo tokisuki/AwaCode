@@ -8,6 +8,7 @@ import { ModelConfigService } from "../../src/config/model-config.ts";
 import {
   AgentOrchestrator,
   AgentCancelledError,
+  AgentRunError,
   type AgentOrchestratorOptions,
   type AgentNotification,
 } from "../../src/agent/orchestrator.ts";
@@ -151,7 +152,7 @@ function connectedPeers(): { client: JsonRpcPeer; server: JsonRpcPeer } {
   return { client, server };
 }
 
-test("Plan, serial tools, provisional Execute text, and valid Reflect complete form one durable committed run", async () => {
+test("Plan and serial tools commit the first tool-free Execute response without a Reflect request", async () => {
   const f = await fixture("happy");
   const order: string[] = [];
   const registry = new ToolRegistry();
@@ -164,7 +165,6 @@ test("Plan, serial tools, provisional Execute text, and valid Reflect complete f
       { id: "call-beta", name: "beta", arguments: "{\"value\":\"B\"}" },
     ]),
     response("All checks pass."),
-    response('{"status":"complete","reason":"verified"}'),
   ]);
   const notifications: AgentNotification[] = [];
   const orchestrator = new AgentOrchestrator({
@@ -184,8 +184,8 @@ test("Plan, serial tools, provisional Execute text, and valid Reflect complete f
       runId: "run-happy",
       finalText: "All checks pass.",
       status: "completed",
-      reason: "verified",
-      modelTurns: 4,
+      reason: "model_stop",
+      modelTurns: 3,
       toolCalls: 2,
     });
     assert.deepEqual(order, ["alpha:start:A", "alpha:end:A", "beta:start:B", "beta:end:B"]);
@@ -232,7 +232,7 @@ test("Plan, serial tools, provisional Execute text, and valid Reflect complete f
       && event.params.messageId === "durable-5"), true);
     assert.deepEqual(notifications.at(-1), {
       method: "agent/status",
-      params: { runId: "run-happy", eventSeq: notifications.length, status: "done", reason: "verified" },
+      params: { runId: "run-happy", eventSeq: notifications.length, status: "done", reason: "model_stop" },
     });
 
     const loaded = f.store.loadSession(f.sessionId);
@@ -241,14 +241,123 @@ test("Plan, serial tools, provisional Execute text, and valid Reflect complete f
       ["call-alpha", "success"],
       ["call-beta", "success"],
     ]);
-    assert.equal(loaded.messages.some((message) => message.role === "internal" && message.kind === "reflect"), true);
+    assert.equal(loaded.messages.some((message) => message.role === "internal" && message.kind === "reflect"), false);
     assert.equal(loaded.messages.every((message) => message.status === "complete"), true);
 
-    assert.equal(provider.requests.length, 4);
+    assert.equal(provider.requests.length, 3);
     assert.equal(provider.requests[0]!.tools, undefined);
     assert.deepEqual(provider.requests[1]!.tools?.map((tool) => tool.function.name), ["alpha", "beta"]);
     assert.equal(provider.requests[2]!.messages.some((message) => message.role === "tool" && message.toolCallId === "call-beta"), true);
-    assert.equal(provider.requests[3]!.messages.some((message) => message.role === "assistant" && message.content === "All checks pass."), true);
+    assert.equal(notifications.some((event) => event.method === "agent/phase" && (event.params.phase as string) === "reflect"), false);
+  } finally {
+    f.connection.close();
+  }
+});
+
+test("every user-facing model request requires plain text without Markdown", async () => {
+  const f = await fixture("plain-text");
+  const provider = new ScriptedProvider([response("Plan."), response("Done.")]);
+  const orchestrator = new AgentOrchestrator({
+    store: f.store,
+    provider,
+    tools: new ToolRegistry(),
+    permissionClient: allowPermission,
+    workspace: f.workspace,
+    contextLimit: 32_768,
+    maxOutputTokens: 4_096,
+    systemPrompt: "Custom project instructions.",
+  });
+
+  try {
+    await orchestrator.run({ sessionId: f.sessionId, prompt: "Explain it" });
+    assert.equal(provider.requests.length, 2);
+    for (const request of provider.requests) {
+      const systemText = request.messages
+        .filter((message) => message.role === "system")
+        .map((message) => message.content)
+        .join("\n");
+      assert.match(systemText, /plain text/i);
+      assert.match(systemText, /do not use Markdown/i);
+    }
+  } finally {
+    f.connection.close();
+  }
+});
+
+test("a tool-free Execute response completes only with the stop finish reason", async (t) => {
+  for (const finishReason of ["tool_calls", "unknown", "length", "content_filter", null] as const) {
+    await t.test(String(finishReason), async () => {
+      const f = await fixture(`finish-${String(finishReason)}`);
+      const provider = new ScriptedProvider([
+        response("Plan."),
+        { ...response("Partial answer."), finishReason },
+      ]);
+      const notifications: AgentNotification[] = [];
+      const orchestrator = new AgentOrchestrator({
+        store: f.store,
+        provider,
+        tools: new ToolRegistry(),
+        permissionClient: allowPermission,
+        workspace: f.workspace,
+        contextLimit: 32_768,
+        maxOutputTokens: 4_096,
+        notify: (notification) => { notifications.push(structuredClone(notification)); },
+      });
+
+      try {
+        await assert.rejects(orchestrator.run({ sessionId: f.sessionId, prompt: "Explain it" }),
+          (error: unknown) => error instanceof AgentRunError && /finish reason/i.test(error.message));
+        assert.equal(f.store.loadSession(f.sessionId).session.status, "error");
+        assert.equal(notifications.some((event) => event.method === "stream/commit"), false);
+      } finally {
+        f.connection.close();
+      }
+    });
+  }
+});
+
+test("tool-free completion is accepted in the same write that finalizes its stream", async () => {
+  const f = await fixture("atomic-final");
+  const provider = new ScriptedProvider([response("Plan."), response("Done.")]);
+  const finalize = f.store.finalizeStreamingAssistantMessage.bind(f.store);
+  let statusAtFinalization: unknown;
+  f.store.finalizeStreamingAssistantMessage = (input) => {
+    const message = finalize(input);
+    if (input.kind === "text" && (input.payload as { phase?: unknown }).phase === "execute") {
+      statusAtFinalization = (message.payload as { candidateStatus?: unknown }).candidateStatus;
+    }
+    return message;
+  };
+  const orchestrator = new AgentOrchestrator({
+    store: f.store, provider, tools: new ToolRegistry(), permissionClient: allowPermission, workspace: f.workspace,
+    contextLimit: 32_768, maxOutputTokens: 4_096,
+  });
+
+  try {
+    await orchestrator.run({ sessionId: f.sessionId, prompt: "Finish" });
+    assert.equal(statusAtFinalization, "accepted");
+  } finally {
+    f.connection.close();
+  }
+});
+
+test("a failed final commit notification rejects the durably finalized answer", async () => {
+  const f = await fixture("commit-failure");
+  const provider = new ScriptedProvider([response("Plan."), response("Done.")]);
+  const orchestrator = new AgentOrchestrator({
+    store: f.store, provider, tools: new ToolRegistry(), permissionClient: allowPermission, workspace: f.workspace,
+    contextLimit: 32_768, maxOutputTokens: 4_096,
+    notify(notification) {
+      if (notification.method === "stream/commit") throw new Error("commit notification failed");
+    },
+  });
+
+  try {
+    await assert.rejects(orchestrator.run({ sessionId: f.sessionId, prompt: "Finish" }), /commit notification failed/);
+    const final = f.store.loadSession(f.sessionId).messages.find((message) =>
+      message.role === "assistant" && (message.payload as { text?: unknown }).text === "Done.");
+    assert.equal((final?.payload as { candidateStatus?: unknown }).candidateStatus, "rejected");
+    assert.equal(f.store.loadSession(f.sessionId).session.status, "error");
   } finally {
     f.connection.close();
   }
@@ -263,7 +372,6 @@ test("persists reasoning content and replays it across DeepSeek-style tool turns
     response("Plan.", [], "plan reasoning"),
     response("", [{ id: "reason-call", name: "alpha", arguments: "{\"value\":\"A\"}" }], "tool reasoning"),
     response("Done.", [], "final reasoning"),
-    response('{"status":"complete","reason":"verified"}', [], "reflect reasoning"),
   ]);
   const orchestrator = new AgentOrchestrator({
     store: f.store,
@@ -287,10 +395,7 @@ test("persists reasoning content and replays it across DeepSeek-style tool turns
       .filter((message) => message.role === "assistant")
       .map((message) => (message.payload as { reasoningContent?: unknown }).reasoningContent);
     assert.deepEqual(persisted, ["plan reasoning", "tool reasoning", "final reasoning"]);
-    const internal = f.store.loadSession(f.sessionId).messages
-      .filter((message) => message.role === "internal")
-      .map((message) => (message.payload as { reasoningContent?: unknown }).reasoningContent);
-    assert.deepEqual(internal, ["reflect reasoning"]);
+    assert.equal(f.store.loadSession(f.sessionId).messages.some((message) => message.role === "internal"), false);
   } finally {
     f.connection.close();
   }
@@ -308,7 +413,6 @@ test("replays persisted reasoning and tool history after the database is reopene
       { id: "restart-beta", name: "beta", arguments: "{\"value\":\"B\"}" },
     ], "tool reasoning"),
     response("Done.", [], "final reasoning"),
-    response('{"status":"complete","reason":"verified"}', [], "reflect reasoning"),
   ]);
   await new AgentOrchestrator({
     store: f.store,
@@ -325,7 +429,6 @@ test("replays persisted reasoning and tool history after the database is reopene
   const secondProvider = new ScriptedProvider([
     response("Next plan.", [], "next plan reasoning"),
     response("Still done.", [], "next answer reasoning"),
-    response('{"status":"complete","reason":"verified again"}', [], "next reflect reasoning"),
   ]);
   const secondRegistry = new ToolRegistry();
   secondRegistry.register(scriptedTool("alpha", []));
@@ -369,7 +472,6 @@ test("unknown, invalid, and denied tool calls each persist exactly one terminal 
       { id: "denied", name: "edit_file", arguments: "{\"path\":\"demo.txt\",\"old_text\":\"old\",\"new_text\":\"new\"}" },
     ]),
     response("No changes were made."),
-    response('{"status":"complete","reason":"handled"}'),
   ]);
   const orchestrator = new AgentOrchestrator({
     store: f.store,
@@ -455,155 +557,10 @@ test("cancellation interrupts an awaiting approval, settles the call, and never 
   }
 });
 
-test("malformed Reflect retries once and continue permits one remedial Execute without recursive reflection", async () => {
-  const f = await fixture("reflect-retry");
-  const provider = new ScriptedProvider([
-    response("Plan once."),
-    response("First candidate."),
-    response("not-json"),
-    response('{"status":"continue","reason":"tests still fail"}'),
-    response("Remedial candidate."),
-  ]);
-  const notifications: AgentNotification[] = [];
-  const orchestrator = new AgentOrchestrator({
-    store: f.store,
-    provider,
-    tools: new ToolRegistry(),
-    permissionClient: allowPermission,
-    workspace: f.workspace,
-    contextLimit: 32_768,
-    maxOutputTokens: 4_096,
-    createRunId: () => "run-reflect-retry",
-    notify: (notification) => { notifications.push(structuredClone(notification)); },
-  });
-
-  try {
-    assert.deepEqual(await orchestrator.run({ sessionId: f.sessionId, prompt: "Fix tests" }), {
-      runId: "run-reflect-retry",
-      finalText: "Remedial candidate.",
-      status: "completed",
-      reason: "tests still fail",
-      modelTurns: 5,
-      toolCalls: 0,
-    });
-    assert.equal(provider.requests.length, 5);
-    assert.equal(provider.requests[2]!.tools, undefined);
-    assert.equal(provider.requests[3]!.tools, undefined);
-    assert.equal(provider.requests[3]!.messages.at(-1)?.role, "system");
-    assert.match(provider.requests[3]!.messages.at(-1)!.content as string, /invalid|malformed|exact JSON/i);
-    assert.equal(provider.requests.filter((request) =>
-      request.messages.at(-1)?.role === "system"
-      && (request.messages.at(-1)!.content as string).includes("Review the candidate")).length, 1);
-    const remedialRequest = provider.requests[4]!;
-    assert.match(remedialRequest.messages.at(-1)!.content as string, /tests still fail/);
-    assert.match(remedialRequest.messages.at(-1)!.content as string, /untrusted review text/i);
-    assert.equal(remedialRequest.messages.some((message) => message.role === "assistant" && message.content === "First candidate."), false);
-    const loaded = f.store.loadSession(f.sessionId);
-    assert.equal(loaded.messages.filter((message) => message.role === "internal" && message.kind === "reflect").length, 2);
-    const commits = notifications.filter((event) => event.method === "stream/commit");
-    assert.equal(commits.length, 1);
-    const committed = loaded.messages.find((message) => message.id === commits[0]!.params.messageId);
-    assert.deepEqual(committed?.payload, {
-      text: "Remedial candidate.", phase: "execute", candidateStatus: "accepted", runId: "run-reflect-retry",
-    });
-    const rejected = loaded.messages.find((message) => message.payload !== null
-      && typeof message.payload === "object"
-      && (message.payload as { text?: unknown }).text === "First candidate.");
-    assert.equal((rejected?.payload as { candidateStatus?: unknown }).candidateStatus, "rejected");
-    assert.equal(notifications.some((event) => event.method === "stream/reject"
-      && event.params.messageId === rejected?.id), true);
-  } finally {
-    f.connection.close();
-  }
-});
-
-test("Reflect overflow protects the pending candidate from summaries before rejecting it", async () => {
-  const f = await fixture("reflect-overflow-protection");
-  f.store.insertMessage({
-    sessionId: f.sessionId,
-    role: "assistant",
-    kind: "text",
-    payload: { text: "old context that may be summarized" },
-  });
-  const requests: ModelStreamRequest[] = [];
-  let ordinaryCall = 0;
-  let reflectOverflowed = false;
-  const provider: ModelProvider = {
-    async stream(request) {
-      requests.push({
-        messages: structuredClone(request.messages),
-        ...(request.tools === undefined ? {} : { tools: structuredClone(request.tools) }),
-      });
-      const last = request.messages.at(-1)?.content ?? "";
-      if (request.messages[0]?.content?.includes("structured rolling summary")) {
-        assert.equal(JSON.stringify(request.messages).includes("pending candidate secret"), false);
-        return response("summary of old context only");
-      }
-      if (last.includes("Review the candidate") && !reflectOverflowed) {
-        reflectOverflowed = true;
-        throw new ModelContextOverflowError();
-      }
-      ordinaryCall += 1;
-      return [
-        response("Plan."),
-        response("pending candidate secret"),
-        response('{"status":"continue","reason":"tests fail"}'),
-        response("fixed candidate"),
-      ][ordinaryCall - 1]!;
-    },
-  };
-  const orchestrator = new AgentOrchestrator({
-    store: f.store,
-    provider,
-    tools: new ToolRegistry(),
-    permissionClient: allowPermission,
-    workspace: f.workspace,
-    contextLimit: 32_768,
-    maxOutputTokens: 4_096,
-  });
-  try {
-    const result = await orchestrator.run({ sessionId: f.sessionId, prompt: "Fix it" });
-    assert.equal(result.finalText, "fixed candidate");
-    const summaryRequest = requests.find((request) => request.messages[0]?.content?.includes("structured rolling summary"));
-    assert.ok(summaryRequest);
-    const remedialRequest = requests.at(-1)!;
-    assert.equal(JSON.stringify(remedialRequest.messages).includes("pending candidate secret"), false);
-    assert.equal(f.store.loadContextSnapshot(f.sessionId)?.summary?.includes("pending candidate secret"), false);
-  } finally {
-    f.connection.close();
-  }
-});
-
-test("Reflect continue after the twelfth Execute request closes without a thirteenth remedial Execute", async () => {
-  const f = await fixture("remedial-turn-bound");
-  const registry = new ToolRegistry();
-  registry.register(scriptedTool("alpha", []));
-  const script = [response("Plan.")];
-  for (let index = 1; index <= 11; index += 1) {
-    script.push(response("", [{ id: `bounded-${index}`, name: "alpha", arguments: `{"value":"${index}"}` }]));
-  }
-  script.push(response("Twelfth-turn candidate."));
-  script.push(response('{"status":"continue","reason":"one more change is needed"}'));
-  script.push(response("Stopped at the Execute limit; remedial work was not started."));
-  const provider = new ScriptedProvider(script);
-  const orchestrator = new AgentOrchestrator({
-    store: f.store, provider, tools: registry, permissionClient: allowPermission, workspace: f.workspace,
-    contextLimit: 32_768, maxOutputTokens: 4_096,
-  });
-  try {
-    const result = await orchestrator.run({ sessionId: f.sessionId, prompt: "Bound remediation" });
-    assert.equal(result.reason, "execute_turn_limit");
-    assert.equal(result.finalText, "Stopped at the Execute limit; remedial work was not started.");
-    assert.equal(provider.requests.length, 15);
-    assert.equal(provider.requests.at(-1)!.tools, undefined);
-    assert.match(provider.requests.at(-1)!.messages.at(-1)!.content as string, /execute_turn_limit/);
-  } finally { f.connection.close(); }
-});
-
 test("a run atomically binds non-secret model metadata to its session and persisted messages", async () => {
   const f = await fixture("model-binding");
   const provider = new ScriptedProvider([
-    response("Plan."), response("Candidate."), response('{"status":"complete","reason":"done"}'),
+    response("Plan."), response("Candidate."),
   ]);
   const options: AgentOrchestratorOptions & { modelMetadata: { model: string; contextLimit: number; maxOutputTokens: number } } = {
     store: f.store, provider, tools: new ToolRegistry(), permissionClient: allowPermission, workspace: f.workspace,
@@ -620,36 +577,6 @@ test("a run atomically binds non-secret model metadata to its session and persis
       return message.role === "internal" || (payload.runId === "run-model-binding" && payload.model === "fixture-model");
     }), true);
   } finally { f.connection.close(); }
-});
-
-test("a second malformed Reflect response ends explicitly after exactly one retry", async () => {
-  const f = await fixture("reflect-twice-invalid");
-  const provider = new ScriptedProvider([
-    response("Plan."),
-    response("Candidate."),
-    response("invalid one"),
-    response('{"status":"complete","reason":7}'),
-  ]);
-  const orchestrator = new AgentOrchestrator({
-    store: f.store,
-    provider,
-    tools: new ToolRegistry(),
-    permissionClient: allowPermission,
-    workspace: f.workspace,
-    contextLimit: 32_768,
-    maxOutputTokens: 4_096,
-  });
-
-  try {
-    await assert.rejects(orchestrator.run({ sessionId: f.sessionId, prompt: "Reflect" }),
-      (error: unknown) => error instanceof Error && error.message === "Reflect output was malformed twice.");
-    assert.equal(provider.requests.length, 4);
-    const loaded = f.store.loadSession(f.sessionId);
-    assert.equal(loaded.session.status, "error");
-    assert.equal(loaded.messages.filter((message) => message.role === "internal" && message.kind === "reflect").length, 2);
-  } finally {
-    f.connection.close();
-  }
 });
 
 test("unexpected Plan tool calls are rejected but first settled into complete history", async () => {
@@ -691,7 +618,6 @@ test("a failed required notification settles the run without side effects and do
     response("", [{ id: "notify-call", name: "alpha", arguments: "{\"value\":\"A\"}" }]),
     response("Second plan."),
     response("Second candidate."),
-    response('{"status":"complete","reason":"second run completed"}'),
   ]);
   let failToolStart = true;
   const orchestrator = new AgentOrchestrator({
@@ -740,9 +666,7 @@ test("a failed fire-and-forget text notification is observed by the run without 
         ? response("first plan")
         : providerCalls === 2
           ? response("second plan")
-          : providerCalls === 3
-            ? response("second candidate")
-            : response('{"status":"complete","reason":"recovered"}');
+          : response("second candidate");
       request.onTextDelta?.(scripted.content);
       await new Promise<void>((resolve) => setImmediate(resolve));
       return scripted;
@@ -1053,7 +977,6 @@ test("provider context overflow triggers one persisted compression and retries t
     new ModelContextOverflowError(),
     response("Goal: finish the request.\nCurrent state: planned."),
     response("Candidate complete."),
-    response('{"status":"complete","reason":"verified"}'),
   ];
   const provider: ModelProvider = {
     async stream(request) {
@@ -1080,7 +1003,7 @@ test("provider context overflow triggers one persisted compression and retries t
   try {
     const result = await orchestrator.run({ sessionId: f.sessionId, prompt: "Do it" });
     assert.equal(result.status, "completed");
-    assert.equal(requests.length, 5);
+    assert.equal(requests.length, 4);
     assert.match(requests[2]?.messages[0]?.content ?? "", /structured rolling summary/i);
     assert.equal(requests[2]?.maxOutputTokens, 4_096);
     assert.equal(f.store.loadContextSnapshot(f.sessionId)?.summary, "Goal: finish the request.\nCurrent state: planned.");

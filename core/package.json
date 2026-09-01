@@ -12,7 +12,7 @@
     "cli": "node dist/cli/index.js",
     "typecheck": "tsc --noEmit -p tsconfig.typecheck.json",
     "pretest": "npm run build",
-    "test": "node --test",
+    "test": "node test/run-all.mjs",
     "verify": "npm run typecheck && npm test"
   },
   "devDependencies": {

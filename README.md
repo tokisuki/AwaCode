@@ -6,10 +6,11 @@ AwaCode 是一个本地运行的桌面 Coding Agent：Qt 6 Widgets 桌面控制�
 
 ## 能做什么
 
-- 用 OpenAI-compatible Chat Completions 的流式文本和原生 function calling 驱动单 Agent 的 Plan → Execute → Reflect 循环。
+- 用 OpenAI-compatible Chat Completions 的流式文本和原生 function calling 驱动单 Agent 的 Plan + Execute 工具循环；Execute 首次返回无工具调用的普通文本时直接完成，不再额外请求 Reflect。
 - 为工作区提供 `list_files`、`read_file`、`search_text`、`edit_file`、`write_file`、`run_command` 和 `memory_write` 七个本地工具。
 - 持久化项目、会话、消息、工具事件和上下文快照；Core 重启时将未完成工具调用收敛为 `interrupted`，不自动重放副作用。
 - 提供薄终端客户端和 Qt 桌面端。两者只负责进程管理、显示和审批；模型调用、工具执行和 Agent 决策均在 Core。
+- Qt 文本区不包含 Markdown 渲染器，因此系统约束要求模型的计划、过程说明、收尾和最终回答全部使用纯文本，不输出 Markdown 语法。
 
 ## 前提条件
 

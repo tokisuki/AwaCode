@@ -93,7 +93,6 @@ test("startup recovers durable state and composes a configured per-session agent
     response("Plan."),
     response("", [{ id: "read-demo", name: "read_file", arguments: "{\"path\":\"demo.txt\"}" }]),
     response("Done."),
-    response('{"status":"complete","reason":"verified"}'),
   ]);
   const { client, server } = connectedPeers();
   const notifications: AgentNotification[] = [];
@@ -129,9 +128,12 @@ test("startup recovers durable state and composes a configured per-session agent
     const result = await client.request("agent/run", { sessionId: created.id, prompt: "Read demo.txt" }) as {
       status: string;
       finalText: string;
+      reason: string;
     };
     assert.equal(result.status, "completed");
     assert.equal(result.finalText, "Done.");
+    assert.equal(result.reason, "model_stop");
+    assert.equal(provider.requests.length, 3);
     const systemContext = provider.requests[0]?.messages[0]?.content ?? "";
     assert.match(systemContext, /AwaCode/);
     assert.match(systemContext, new RegExp(workspace.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"));

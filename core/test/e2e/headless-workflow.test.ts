@@ -99,7 +99,6 @@ test("built CLI completes a read, failing test, approved edit, and passing test 
     }),
     toolTurn("call-test-pass", "run_command", { command, cwd: ".", timeout_ms: 30_000 }),
     textTurn("Fixed app.mjs and verified the test now passes."),
-    textTurn('{"status":"complete","reason":"tests pass"}'),
   ]);
   const child = spawnChildChannel(NODE24, [
     CLI_ENTRY,
@@ -126,7 +125,7 @@ test("built CLI completes a read, failing test, approved edit, and passing test 
     assert.equal(signal, null);
     assert.equal(approvals, 3);
     assert.equal(await readFile(join(workspace, "app.mjs"), "utf8"), "export function total() { return 2; }\n");
-    assert.equal(server.requests.length, 8);
+    assert.equal(server.requests.length, 7);
     assert.ok(server.requests.every((request) => request.url === "/v1/chat/completions"));
     assert.ok(server.requests.every((request) => request.authorization === `Bearer ${FIXTURE_KEY}`));
 
@@ -138,9 +137,9 @@ test("built CLI completes a read, failing test, approved edit, and passing test 
     assert.match(stdout, /edit_file success: Edited 1 occurrence/);
     assert.match(stdout, /run_command success: Command completed successfully\./);
     assert.match(stdout, /Fixed app\.mjs and verified the test now passes\./);
-    assert.match(stdout, /\[phase\] reflect/);
+    assert.doesNotMatch(stdout, /\[phase\] reflect/);
     assert.match(stdout, /\[commit\]/);
-    assert.match(stdout, /\[result\] completed: tests pass/);
+    assert.match(stdout, /\[result\] completed: model_stop/);
     assert.equal(stderr, "");
 
     const connection = await openDatabase({ env: { AWACODE_DATA_DIR: dataRoot } });
