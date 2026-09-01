@@ -10,6 +10,7 @@ class DialogsTest final : public QObject {
 
 private slots:
   void settingsUseCoreCredentialDto();
+  void statusPrefillsNonSecretSettingsAndPreservesCredential();
   void approvalDefaultsToDeny();
 };
 
@@ -31,6 +32,18 @@ void DialogsTest::settingsUseCoreCredentialDto() {
   QCOMPARE(settings.value("credential").toObject().value("apiKey").toString(), QStringLiteral("not-a-real-key"));
   QVERIFY(!settings.contains("apiKey"));
   QVERIFY(!settings.contains("limits"));
+}
+
+void DialogsTest::statusPrefillsNonSecretSettingsAndPreservesCredential() {
+  SettingsDialog dialog;
+  dialog.applyStatus(QJsonObject{
+    {"runnable", true}, {"baseUrl", "https://example.invalid/v1"}, {"model", "fixture-model"},
+    {"contextLimit", 4096}, {"maxOutputTokens", 1024}, {"hasApiKey", true},
+  });
+  QCOMPARE(dialog.findChild<QLineEdit *>(QStringLiteral("baseUrl"))->text(), QStringLiteral("https://example.invalid/v1"));
+  QCOMPARE(dialog.findChild<QLineEdit *>(QStringLiteral("model"))->text(), QStringLiteral("fixture-model"));
+  QCOMPARE(dialog.findChild<QLineEdit *>(QStringLiteral("apiKey"))->text(), QString());
+  QCOMPARE(dialog.settings().value("credential").toObject().value("action").toString(), QStringLiteral("keep"));
 }
 
 void DialogsTest::approvalDefaultsToDeny() {

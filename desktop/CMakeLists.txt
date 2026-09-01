@@ -68,6 +68,11 @@ target_include_directories(awacode-dialogs-test PRIVATE src)
 target_link_libraries(awacode-dialogs-test PRIVATE Qt6::Test Qt6::Widgets)
 add_test(NAME awacode-dialogs-test COMMAND awacode-dialogs-test)
 
+add_executable(awacode-real-core-probe test/real_core_probe.cpp)
+target_include_directories(awacode-real-core-probe PRIVATE src)
+target_link_libraries(awacode-real-core-probe PRIVATE Qt6::Core)
+target_sources(awacode-real-core-probe PRIVATE src/RpcCodec.cpp src/AgentProcessManager.cpp)
+
 add_executable(awacode-desktop
   src/main.cpp
   src/RpcCodec.cpp

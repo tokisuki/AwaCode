@@ -99,3 +99,49 @@ Fresh final verification after the third commit: all five Qt Test executables ag
 - Confirmed `session/list` is a JSON array in Core handlers and fixed the initial object-coercion defect before final verification.
 - Confirmed Settings previously emitted a non-authoritative nested `limits` DTO and fixed it to the exact Core parser contract, with a test that ensures no top-level key is emitted.
 - Concern: on this Windows host, CTest's child-process DLL environment propagation was inconsistent (raw `ctest` exited `0xc0000135`; attempts to set CTest runtime PATH caused the `QProcess` fixture to hang). Direct Qt Test executables with the documented Qt/MinGW runtime PATH are green from a fresh build. This is a runner/deployment-environment concern, not a compile or test failure; the documented run/deploy procedure is the supported path.
+
+## Review fix round 1
+
+### RED / GREEN
+
+The focused MainWindow RED command was:
+
+```powershell
+& D:\mingw64\bin\cmake.exe --build desktop\build-qt6-round1 --target awacode-main-window-test
+```
+
+It failed to compile exactly because the intended APIs did not exist: `streamFlushed`, `receiveResponse`, `toolTimelineText`, `receiveError`, and `coreStopped`. The first run after adding the test and implementation also exposed the intended batching failure: `flushed.count()` was `2`, expected `1`; `stream/commit` had incorrectly performed a second timer-flush. The focused process RED, after building the deterministic fixture, reported `stopped(...)=true`, expected `false` for an unprompted normal EOF.
+
+GREEN commands and outcomes:
+
+```powershell
+& D:\mingw64\bin\cmake.exe --build desktop\build-qt6-round1
+$env:PATH = "D:\codes\AwaCode\.local\Qt\6.8.3\mingw_64\bin;D:\codes\AwaCode\.local\Qt\Tools\mingw1310_64\bin;$env:PATH"
+$env:QT_QPA_PLATFORM = "offscreen"
+$env:QT_QPA_FONTDIR = "C:\Windows\Fonts"
+.\desktop\build-qt6-round1\awacode-rpc-codec-test.exe
+.\desktop\build-qt6-round1\awacode-process-manager-test.exe
+.\desktop\build-qt6-round1\awacode-main-window-test.exe
+.\desktop\build-qt6-round1\awacode-models-test.exe
+.\desktop\build-qt6-round1\awacode-dialogs-test.exe
+```
+
+All five returned `0`: the MainWindow suite has 9 passing checks and the process suite has 6, including exact reverse `allow_once` validation and unexpected EOF behavior.
+
+Real Core / Qt-process rehearsal:
+
+```powershell
+$env:AWACODE_REAL_CORE_PROBE = (Resolve-Path .\desktop\build-qt6-round1\awacode-real-core-probe.exe)
+& $env:AWACODE_NODE_PATH --experimental-strip-types .\desktop\test\real_core_integration.mjs
+```
+
+Outcome: exit `0`. The scripted provider served the deterministic eight-turn workflow. The actual Qt `AgentProcessManager` spawned real `core/dist/index.js`, selected workspace, created a session, auto-approved Core reverse permission requests, completed the five-tool edit workflow, closed/restarted Core, and display-only loaded the durable session without extra provider requests. The fixture workspace changed from `return 1` to `return 2`.
+
+### Review self-review
+
+- `session/load` now reads `MessageRecord.payload.text`, not an invented `content` field, and repopulates `ToolTimelineModel` from returned `toolCalls`.
+- Stream state is retained per `messageId`; periodic timer work emits one `streamFlushed` signal for coalesced deltas, while commit changes the retained message from provisional to committed without duplicate rendering.
+- All task-mutating controls are stored and disabled during busy state; cancel is the only enabled run-control.
+- JSON-RPC error responses now clear pending-method state, render a bounded diagnostic, restore running state, and update a live Settings dialog when applicable.
+- Settings fetch `config/status`, preserve stored credentials with `keep`, and display save/test result or Core-sanitized error.
+- A normal Core exit is clean only after requested stdin closure; otherwise MainWindow preserves content and enables manual restart.
