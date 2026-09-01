@@ -338,6 +338,11 @@ export class SessionStore {
     return { session, messages, toolCalls };
   }
 
+  loadProjectForSession(sessionId: string): ProjectRecord {
+    const session = this.getSession(sessionId);
+    return this.getProject(session.projectId);
+  }
+
   insertMessage(input: InsertMessageInput): MessageRecord {
     if (input.role === "tool" || (input.role === "assistant" && input.kind === "tool_calls")) {
       throw new TypeError("tool protocol messages require the atomic assistant tool-call block API");

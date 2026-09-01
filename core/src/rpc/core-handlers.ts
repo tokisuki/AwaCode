@@ -31,6 +31,9 @@ export interface CoreHandlerDependencies {
   configService: ModelConfigService;
   projectIdentityOptions?: ProjectIdentityOptions;
   agent?: AgentControl;
+  startup?: {
+    interruptedCount: number;
+  };
 }
 
 interface WorkspaceParams {
@@ -169,15 +172,18 @@ function agentFault(error: unknown): never {
   if (error instanceof HistoryIntegrityError) {
     throw new RpcFault(RPC_ERROR_CODES.historyIntegrity, "Session history is incomplete");
   }
+  if (error instanceof ModelConfigOperationError) {
+    return configFault(error);
+  }
   return storeFault(error);
 }
 
 export function registerCoreHandlers(peer: JsonRpcPeer, dependencies: CoreHandlerDependencies): void {
-  peer.register("core/hello", parseHello, () => ({
+  peer.register("core/hello", parseHello, async () => ({
     coreVersion: coreDescriptor.version,
     databaseVersion: DATABASE_VERSION,
-    configured: false,
-    interruptedCount: 0,
+    configured: (await dependencies.configService.status()).runnable,
+    interruptedCount: dependencies.startup?.interruptedCount ?? 0,
   }));
 
   peer.register("workspace/set", parseWorkspace, async ({ workspace }) => {

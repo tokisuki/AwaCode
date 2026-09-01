@@ -15,6 +15,7 @@ export interface StdioRpcOptions {
   stdout: Writable;
   stderr: Writable;
   idPrefix: string;
+  autoStart?: boolean;
 }
 
 export class StdioRpc {
@@ -28,6 +29,7 @@ export class StdioRpc {
   private readonly activeReceives = new Set<Promise<void>>();
   private readonly resolveDone: () => void;
   private finished = false;
+  private started = false;
   private terminalWriteError: RpcDisconnectedError | undefined;
 
   constructor(options: StdioRpcOptions) {
@@ -39,16 +41,26 @@ export class StdioRpc {
     let resolveDone!: () => void;
     this.done = new Promise((resolve) => { resolveDone = resolve; });
     this.resolveDone = resolveDone;
-    options.stdin.on("data", (chunk: unknown) => {
+    if (options.autoStart !== false) {
+      this.start();
+    }
+  }
+
+  start(): void {
+    if (this.started || this.finished) {
+      return;
+    }
+    this.started = true;
+    this.options.stdin.on("data", (chunk: unknown) => {
       this.enqueueInput(() => this.processChunk(chunk));
     });
-    options.stdin.once("end", () => {
+    this.options.stdin.once("end", () => {
       this.enqueueInput(() => this.finishEof());
     });
-    options.stdin.once("error", (error: Error) => {
+    this.options.stdin.once("error", (error: Error) => {
       this.enqueueInput(() => this.fail(error));
     });
-    options.stdin.resume();
+    this.options.stdin.resume();
   }
 
   private enqueueWrite(message: JsonRpcMessage, allowTerminalRecord = false): Promise<void> {
