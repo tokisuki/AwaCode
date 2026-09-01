@@ -257,9 +257,14 @@ void MainWindowTest::displaysRpcErrorsAndRestoresRunState() {
   const quint64 epoch = window.beginWorkspaceSelection(QStringLiteral("C:/work"));
   window.receiveResponseForEpoch("workspace/set", QJsonObject{{"workspace", "C:/work"}, {"projectId", "p"}}, epoch);
   window.receiveNotification("agent/status", QJsonObject{{"status", "busy"}});
-  window.receiveError("agent/run", QJsonObject{{"code", -32005}, {"message", "cancelled"}});
+  window.receiveError("agent/run", QJsonObject{
+    {"code", -32008},
+    {"message", "Model request failed"},
+    {"data", QJsonObject{{"detail", "reasoning_content must be passed back"}}},
+  });
   QVERIFY(window.runButton()->isEnabled());
-  QVERIFY(window.transcriptText().contains(QStringLiteral("cancelled")));
+  QVERIFY(window.transcriptText().contains(QStringLiteral("Model request failed")));
+  QVERIFY(window.transcriptText().contains(QStringLiteral("reasoning_content must be passed back")));
 }
 
 void MainWindowTest::marksInterruptedContentAfterCoreCrash() {

@@ -279,7 +279,7 @@ export class AgentOrchestrator {
       this.options.store.finalizeStreamingAssistantMessage({
         messageId: plan.message.id,
         kind: "plan",
-        payload: this.messagePayload(plan.response.content, "plan"),
+        payload: this.messagePayload(plan.response.content, "plan", this.reasoningPayload(plan.response)),
       });
 
       await this.phase("execute");
@@ -304,7 +304,7 @@ export class AgentOrchestrator {
         messageId: reflected.message.id,
         role: "internal",
         kind: "reflect",
-        payload: { text: reflected.response.content, phase: "reflect" },
+        payload: { text: reflected.response.content, phase: "reflect", ...this.reasoningPayload(reflected.response) },
       });
       let decision = parseReflect(reflected.response.content);
       if (decision === null) {
@@ -325,7 +325,7 @@ export class AgentOrchestrator {
           messageId: corrected.message.id,
           role: "internal",
           kind: "reflect",
-          payload: { text: corrected.response.content, phase: "reflect" },
+          payload: { text: corrected.response.content, phase: "reflect", ...this.reasoningPayload(corrected.response) },
         });
         decision = parseReflect(corrected.response.content);
         if (decision === null) {
@@ -409,13 +409,16 @@ export class AgentOrchestrator {
         this.options.store.finalizeStreamingAssistantMessage({
           messageId: turn.message.id,
           kind: "text",
-          payload: this.messagePayload(turn.response.content, "execute", { candidateStatus: "pending" }),
+          payload: this.messagePayload(turn.response.content, "execute", {
+            candidateStatus: "pending",
+            ...this.reasoningPayload(turn.response),
+          }),
         });
         return { turn, stopReason: null };
       }
       this.options.store.finalizeStreamingAssistantWithToolCalls({
         messageId: turn.message.id,
-        payload: this.messagePayload(turn.response.content, "execute"),
+        payload: this.messagePayload(turn.response.content, "execute", this.reasoningPayload(turn.response)),
         toolCalls: turn.response.toolCalls.map((call, ordinal) => ({
           callId: call.id,
           ordinal,
@@ -488,7 +491,11 @@ export class AgentOrchestrator {
     this.options.store.finalizeStreamingAssistantMessage({
       messageId: closing.message.id,
       kind: "text",
-      payload: this.messagePayload(closing.response.content, "closing", { stopReason: reason, candidateStatus: "accepted" }),
+      payload: this.messagePayload(closing.response.content, "closing", {
+        stopReason: reason,
+        candidateStatus: "accepted",
+        ...this.reasoningPayload(closing.response),
+      }),
     });
     await this.commit(closing.message.id);
     return closing;
@@ -662,10 +669,14 @@ export class AgentOrchestrator {
     };
   }
 
+  private reasoningPayload(response: AssistantModelMessage): Record<string, string> {
+    return response.reasoningContent === undefined ? {} : { reasoningContent: response.reasoningContent };
+  }
+
   private async persistRejectedToolCalls(turn: StreamedTurn, _sessionId: string, message: string): Promise<void> {
     this.options.store.finalizeStreamingAssistantWithToolCalls({
       messageId: turn.message.id,
-      payload: { text: turn.response.content, phase: turn.message.kind },
+      payload: { text: turn.response.content, phase: turn.message.kind, ...this.reasoningPayload(turn.response) },
       toolCalls: turn.response.toolCalls.map((call, ordinal) => ({
         callId: call.id,
         ordinal,

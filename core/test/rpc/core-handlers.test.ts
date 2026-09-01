@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { once } from "node:events";
 import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, normalize } from "node:path";
 import test from "node:test";
@@ -13,6 +15,7 @@ import { JsonRpcPeer } from "../../src/protocol/rpc-peer.ts";
 import { RpcFault } from "../../src/protocol/json-rpc.ts";
 import { registerCoreHandlers } from "../../src/rpc/core-handlers.ts";
 import { ContextBudgetError, ContextCompressionError } from "../../src/context/context-manager.ts";
+import { ModelRequestError, OpenAIChatClient } from "../../src/llm/openai-chat-client.ts";
 
 const temporaryDirectories: string[] = [];
 
@@ -217,5 +220,106 @@ test("required context that cannot fit becomes the same explicit RPC boundary", 
     client.close();
     server.close();
     connection.close();
+  }
+});
+
+test("model request failures cross RPC with a bounded safe diagnostic instead of Internal error", async () => {
+  const dataRoot = await temporaryDirectory("model-request-error-data");
+  const connection = await openDatabase({ env: { AWACODE_DATA_DIR: dataRoot } });
+  const store = new SessionStore(connection.db);
+  const { client, server } = connectedPeers();
+  registerCoreHandlers(server, {
+    store,
+    configService: new ModelConfigService({ env: { AWACODE_DATA_DIR: dataRoot } }),
+    agent: {
+      async run() {
+        throw new ModelRequestError("request_failed", "Model request failed", {
+          status: 400,
+          error: { message: "reasoning_content must be passed back" },
+        });
+      },
+      cancel() { return false; },
+    },
+  });
+  try {
+    await assert.rejects(client.request("agent/run", { sessionId: "session", prompt: "continue" }),
+      (error: unknown) => error instanceof RpcFault
+        && error.code === -32008
+        && error.message === "Model request failed"
+        && (error.data as { reason?: unknown }).reason === "request_failed"
+        && (error.data as { detail?: unknown }).detail === "reasoning_content must be passed back");
+  } finally {
+    client.close();
+    server.close();
+    connection.close();
+  }
+});
+
+test("real provider failures are redacted and bounded before crossing RPC", async () => {
+  const activeKey = "fixture-active-super-secret-key";
+  const longPrefix = "provider detail ".repeat(100);
+  const providerServer = createServer((request, response) => {
+    request.resume();
+    response.writeHead(400, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      error: {
+        message: `api_key=${activeKey} authorization=Bearer ${activeKey} ${longPrefix}`,
+        details: { api_key: activeKey },
+      },
+    }));
+  });
+  providerServer.listen(0, "127.0.0.1");
+  await once(providerServer, "listening");
+  const address = providerServer.address();
+  assert.ok(address !== null && typeof address !== "string");
+
+  const dataRoot = await temporaryDirectory("real-model-request-error-data");
+  const connection = await openDatabase({ env: { AWACODE_DATA_DIR: dataRoot } });
+  const store = new SessionStore(connection.db);
+  const { client, server } = connectedPeers();
+  const provider = new OpenAIChatClient({
+    runnable: true,
+    baseUrl: `http://127.0.0.1:${address.port}/v1`,
+    model: "deepseek-v4-flash",
+    contextLimit: 32_768,
+    maxOutputTokens: 4_096,
+    apiKey: activeKey,
+    sources: {
+      baseUrl: "file",
+      model: "file",
+      contextLimit: "file",
+      maxOutputTokens: "file",
+      apiKey: "file",
+    },
+    issues: [],
+  });
+  registerCoreHandlers(server, {
+    store,
+    configService: new ModelConfigService({ env: { AWACODE_DATA_DIR: dataRoot } }),
+    agent: {
+      async run() {
+        await provider.stream({ messages: [{ role: "user", content: "Trigger provider failure" }] });
+        throw new Error("unreachable");
+      },
+      cancel() { return false; },
+    },
+  });
+  try {
+    await assert.rejects(client.request("agent/run", { sessionId: "session", prompt: "continue" }),
+      (error: unknown) => {
+        if (!(error instanceof RpcFault) || error.code !== -32008) return false;
+        const detail = (error.data as { detail?: unknown }).detail;
+        assert.equal(typeof detail, "string");
+        assert.ok((detail as string).length <= 1_000);
+        assert.equal((detail as string).includes(activeKey), false);
+        assert.match(detail as string, /\[REDACTED\]/);
+        return true;
+      });
+  } finally {
+    client.close();
+    server.close();
+    connection.close();
+    providerServer.close();
+    await once(providerServer, "close");
   }
 });

@@ -14,10 +14,16 @@ import { canRetryModelError, retryDelayMilliseconds } from "./retry.ts";
 import type { AssistantModelMessage, FunctionToolCall, ModelProvider, ModelStreamRequest } from "./types.ts";
 import { ModelContextOverflowError } from "./types.ts";
 
-function completionMessages(request: ModelStreamRequest): ChatCompletionMessageParam[] {
+type ReasoningAssistantMessage = ChatCompletionAssistantMessageParam & { reasoning_content?: string };
+
+function isDeepSeekModel(model: string): boolean {
+  return model.toLowerCase().includes("deepseek");
+}
+
+function completionMessages(request: ModelStreamRequest, replayReasoningContent: boolean): ChatCompletionMessageParam[] {
   return request.messages.map((message) => {
     if (message.role === "assistant") {
-      return {
+      const assistant: ReasoningAssistantMessage = {
         role: "assistant",
         content: message.content,
         tool_calls: message.toolCalls.map((call) => ({
@@ -25,7 +31,11 @@ function completionMessages(request: ModelStreamRequest): ChatCompletionMessageP
           type: "function",
           function: { name: call.name, arguments: call.arguments },
         })),
-      } as ChatCompletionAssistantMessageParam;
+      };
+      if (replayReasoningContent) {
+        assistant.reasoning_content = message.reasoningContent ?? "";
+      }
+      return assistant;
     }
     if (message.role === "tool") {
       return {
@@ -175,12 +185,14 @@ export class OpenAIChatClient implements ModelProvider {
   ): Promise<AssistantModelMessage> {
     const completion = await this.client.chat.completions.create({
       model: this.config.model!,
-      messages: completionMessages(request),
+      messages: completionMessages(request, isDeepSeekModel(this.config.model!)),
       max_tokens: request.maxOutputTokens ?? this.config.maxOutputTokens,
       stream: true,
       ...(request.tools === undefined ? {} : { tools: [...request.tools] as ChatCompletionTool[] }),
     }, { signal: request.signal });
     let content = "";
+    let reasoningContent = "";
+    let hasReasoningContent = false;
     let finishReason: string | null = null;
     const toolCalls = new Map<number, PartialToolCall>();
     for await (const chunk of completion as AsyncIterable<ChatCompletionChunk>) {
@@ -192,6 +204,14 @@ export class OpenAIChatClient implements ModelProvider {
         onOutput();
         content += choice.delta.content;
         request.onTextDelta?.(choice.delta.content);
+      }
+      const reasoningDelta = (choice.delta as typeof choice.delta & { reasoning_content?: unknown }).reasoning_content;
+      if (typeof reasoningDelta === "string") {
+        hasReasoningContent = true;
+        reasoningContent += reasoningDelta;
+        if (reasoningDelta.length > 0) {
+          onOutput();
+        }
       }
       for (const fragment of choice.delta.tool_calls ?? []) {
         onOutput();
@@ -214,7 +234,13 @@ export class OpenAIChatClient implements ModelProvider {
     if (finishReason === null) {
       throw new MalformedStreamError();
     }
-    return { role: "assistant", content, toolCalls: completeToolCalls(toolCalls), finishReason };
+    return {
+      role: "assistant",
+      content,
+      ...(hasReasoningContent ? { reasoningContent } : {}),
+      toolCalls: completeToolCalls(toolCalls),
+      finishReason,
+    };
   }
 }
 

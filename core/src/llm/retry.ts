@@ -2,8 +2,17 @@ import { APIConnectionError, APIConnectionTimeoutError, APIError } from "openai"
 
 const MAX_ATTEMPTS = 3;
 
+function isInterruptedStreamTransportError(error: unknown): boolean {
+  if (!(error instanceof TypeError) || typeof error.cause !== "object" || error.cause === null) {
+    return false;
+  }
+  return "code" in error.cause && error.cause.code === "UND_ERR_SOCKET";
+}
+
 export function isRetryableModelError(error: unknown): boolean {
-  if (error instanceof APIConnectionError || error instanceof APIConnectionTimeoutError) {
+  if (error instanceof APIConnectionError
+    || error instanceof APIConnectionTimeoutError
+    || isInterruptedStreamTransportError(error)) {
     return true;
   }
   return error instanceof APIError

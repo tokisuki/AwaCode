@@ -393,13 +393,15 @@ void MainWindow::handleResponseError(const QString &id, const QJsonObject &error
 
 void MainWindow::receiveError(const QString &method, const QJsonObject &error) {
   const QString message = error.value("message").toString(QStringLiteral("Core request failed"));
-  stderr_->appendPlainText(QStringLiteral("%1: %2").arg(method, message));
-  appendTranscript(QStringLiteral("\n[Core error: %1]\n").arg(message));
+  const QString detail = error.value("data").toObject().value("detail").toString();
+  const QString display = detail.isEmpty() ? message : QStringLiteral("%1: %2").arg(message, detail);
+  stderr_->appendPlainText(QStringLiteral("%1: %2").arg(method, display));
+  appendTranscript(QStringLiteral("\n[Core error: %1]\n").arg(display));
   if (method == QStringLiteral("agent/run") || method == QStringLiteral("agent/cancel")) setRunning(false);
   if (method == QStringLiteral("agent/run")) currentRunRequestId_.clear();
   if ((method == QStringLiteral("config/save") || method == QStringLiteral("config/test") || method == QStringLiteral("config/status")) && settingsDialog_ != nullptr) {
-    if (method == QStringLiteral("config/save")) settingsDialog_->showSaveResult(message);
-    else settingsDialog_->setStatusText(message);
+    if (method == QStringLiteral("config/save")) settingsDialog_->showSaveResult(display);
+    else settingsDialog_->setStatusText(display);
   }
 }
 

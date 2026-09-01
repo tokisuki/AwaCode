@@ -64,11 +64,11 @@ function stream(response: ServerResponse, chunks: readonly Record<string, unknow
   response.end("data: [DONE]\n\n");
 }
 
-function config(baseUrl: string): EffectiveModelConfig {
+function config(baseUrl: string, model = "fixture-model"): EffectiveModelConfig {
   return {
     runnable: true,
     baseUrl,
-    model: "fixture-model",
+    model,
     contextLimit: 32768,
     maxOutputTokens: 4096,
     apiKey: "fixture-openai-key",
@@ -82,6 +82,64 @@ function config(baseUrl: string): EffectiveModelConfig {
     issues: [],
   };
 }
+
+test("captures DeepSeek reasoning_content and replays it on tool-bearing requests", async () => {
+  let requestIndex = 0;
+  const server = await scriptedServer((_request, response) => {
+    requestIndex += 1;
+    stream(response, requestIndex === 1
+      ? [
+        { choices: [{ index: 0, delta: { reasoning_content: "inspect " } }] },
+        { choices: [{ index: 0, delta: { reasoning_content: "carefully", content: "Plan." }, finish_reason: "stop" }] },
+      ]
+      : [{ choices: [{ index: 0, delta: { content: "Executing." }, finish_reason: "stop" }] }]);
+  });
+  try {
+    const client = new OpenAIChatClient(config(server.baseUrl, "deepseek-v4-flash"));
+    const plan = await client.stream({ messages: [{ role: "user", content: "Inspect the project" }] });
+    assert.equal(plan.reasoningContent, "inspect carefully");
+
+    await client.stream({
+      messages: [
+        { role: "user", content: "Inspect the project" },
+        { role: "assistant", content: plan.content, reasoningContent: plan.reasoningContent, toolCalls: [] },
+      ],
+      tools: [{ type: "function", function: { name: "list_files", parameters: { type: "object" } } }],
+    });
+
+    const messages = (server.requests[1]?.body as { messages?: Array<Record<string, unknown>> }).messages;
+    assert.deepEqual(messages?.[1], {
+      role: "assistant",
+      content: "Plan.",
+      reasoning_content: "inspect carefully",
+      tool_calls: [],
+    });
+  } finally {
+    await server.close();
+  }
+});
+
+test("fills missing DeepSeek reasoning history but leaves other providers unchanged", async () => {
+  const server = await scriptedServer((_request, response) => {
+    stream(response, [{ choices: [{ index: 0, delta: { content: "ok" }, finish_reason: "stop" }] }]);
+  });
+  const messages = [
+    { role: "user" as const, content: "Continue" },
+    { role: "assistant" as const, content: "Legacy answer", toolCalls: [] },
+  ];
+  const tools = [{ type: "function" as const, function: { name: "list_files", parameters: { type: "object" } } }];
+  try {
+    await new OpenAIChatClient(config(server.baseUrl, "deepseek-v4-flash")).stream({ messages, tools });
+    await new OpenAIChatClient(config(server.baseUrl, "fixture-model")).stream({ messages, tools });
+
+    const deepSeekMessages = (server.requests[0]?.body as { messages: Array<Record<string, unknown>> }).messages;
+    const genericMessages = (server.requests[1]?.body as { messages: Array<Record<string, unknown>> }).messages;
+    assert.equal(deepSeekMessages[1]?.reasoning_content, "");
+    assert.equal(Object.hasOwn(genericMessages[1]!, "reasoning_content"), false);
+  } finally {
+    await server.close();
+  }
+});
 
 test("streams text deltas and returns their complete assistant content", async () => {
   const server = await scriptedServer((_request, response) => {
@@ -375,6 +433,49 @@ test("does not retry after a partially emitted stream fails", async () => {
     }));
     assert.deepEqual(deltas, ["partial"]);
     assert.equal(attempts, 1);
+  } finally {
+    await server.close();
+  }
+});
+
+test("does not retry after a non-empty reasoning-only stream fragment", async () => {
+  let attempts = 0;
+  const server = await scriptedServer((_request, response) => {
+    attempts += 1;
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { reasoning_content: "private reasoning" } }] })}\n\n`);
+    setTimeout(() => response.destroy(new Error("fixture stream break")), 20);
+  });
+  try {
+    await assert.rejects(new OpenAIChatClient(config(server.baseUrl, "deepseek-v4-flash"), {
+      sleep: async () => {
+        throw new Error("must not sleep after reasoning output");
+      },
+    }).stream({ messages: [{ role: "user", content: "Reason first" }] }));
+    assert.equal(attempts, 1);
+  } finally {
+    await server.close();
+  }
+});
+
+test("an empty reasoning marker does not suppress a safe transport retry", async () => {
+  let attempts = 0;
+  const server = await scriptedServer((_request, response) => {
+    attempts += 1;
+    if (attempts === 1) {
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { reasoning_content: "" } }] })}\n\n`);
+      setTimeout(() => response.destroy(new Error("fixture stream break")), 20);
+      return;
+    }
+    stream(response, [{ choices: [{ index: 0, delta: { content: "recovered" }, finish_reason: "stop" }] }]);
+  });
+  try {
+    const result = await new OpenAIChatClient(config(server.baseUrl, "deepseek-v4-flash"), {
+      sleep: async () => undefined,
+    }).stream({ messages: [{ role: "user", content: "Retry empty marker" }] });
+    assert.equal(result.content, "recovered");
+    assert.equal(attempts, 2);
   } finally {
     await server.close();
   }

@@ -99,18 +99,38 @@ function payloadText(payload: unknown): string {
   return JSON.stringify(payload) ?? "";
 }
 
+function payloadReasoningContent(payload: unknown): string | undefined {
+  if (
+    typeof payload === "object"
+    && payload !== null
+    && "reasoningContent" in payload
+    && typeof (payload as { reasoningContent?: unknown }).reasoningContent === "string"
+  ) {
+    return (payload as { reasoningContent: string }).reasoningContent;
+  }
+  return undefined;
+}
+
 function entryBlock(entry: ProviderHistoryEntry): ModelBlock {
   let messages: readonly ModelMessage[];
   if (entry.type === "message") {
     const content = payloadText(entry.payload);
+    const reasoningContent = payloadReasoningContent(entry.payload);
     messages = entry.role === "assistant"
-      ? [{ role: "assistant", content, toolCalls: [] }]
+      ? [{
+        role: "assistant",
+        content,
+        ...(reasoningContent === undefined ? {} : { reasoningContent }),
+        toolCalls: [],
+      }]
       : [{ role: entry.role, content }];
   } else {
+    const reasoningContent = payloadReasoningContent(entry.payload);
     messages = [
       {
         role: "assistant",
         content: payloadText(entry.payload),
+        ...(reasoningContent === undefined ? {} : { reasoningContent }),
         toolCalls: entry.toolCalls.map((call) => ({
           id: call.callId,
           name: call.toolName,

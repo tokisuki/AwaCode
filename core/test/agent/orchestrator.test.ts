@@ -33,6 +33,7 @@ const temporaryDirectories: string[] = [];
 
 interface AgentFixture {
   connection: Awaited<ReturnType<typeof openDatabase>>;
+  dataRoot: string;
   store: SessionStore;
   sessionId: string;
   workspace: WorkspaceGuard;
@@ -41,7 +42,8 @@ interface AgentFixture {
 async function fixture(label: string): Promise<AgentFixture> {
   const directory = await mkdtemp(join(tmpdir(), `awacode-agent-${label}-`));
   temporaryDirectories.push(directory);
-  const connection = await openDatabase({ env: { AWACODE_DATA_DIR: join(directory, "data") } });
+  const dataRoot = join(directory, "data");
+  const connection = await openDatabase({ env: { AWACODE_DATA_DIR: dataRoot } });
   let id = 0;
   const store = new SessionStore(connection.db, {
     now: () => new Date("2026-09-01T01:02:03.000Z"),
@@ -49,7 +51,7 @@ async function fixture(label: string): Promise<AgentFixture> {
   });
   store.upsertProject({ id: "project", kind: "path", value: directory, rootPath: directory });
   const session = store.createSession("project", label);
-  return { connection, store, sessionId: session.id, workspace: await WorkspaceGuard.create(directory) };
+  return { connection, dataRoot, store, sessionId: session.id, workspace: await WorkspaceGuard.create(directory) };
 }
 
 test.after(async () => {
@@ -127,12 +129,17 @@ function scriptedTool(name: string, order: string[]): ToolDefinition<{ value: st
   };
 }
 
-function response(content: string, toolCalls: AssistantModelMessage["toolCalls"] = []): AssistantModelMessage {
+function response(
+  content: string,
+  toolCalls: AssistantModelMessage["toolCalls"] = [],
+  reasoningContent?: string,
+): AssistantModelMessage {
   return {
     role: "assistant",
     content,
     toolCalls,
     finishReason: toolCalls.length === 0 ? "stop" : "tool_calls",
+    ...(reasoningContent === undefined ? {} : { reasoningContent }),
   };
 }
 
@@ -244,6 +251,106 @@ test("Plan, serial tools, provisional Execute text, and valid Reflect complete f
     assert.equal(provider.requests[3]!.messages.some((message) => message.role === "assistant" && message.content === "All checks pass."), true);
   } finally {
     f.connection.close();
+  }
+});
+
+test("persists reasoning content and replays it across DeepSeek-style tool turns", async () => {
+  const f = await fixture("reasoning-replay");
+  const order: string[] = [];
+  const registry = new ToolRegistry();
+  registry.register(scriptedTool("alpha", order));
+  const provider = new ScriptedProvider([
+    response("Plan.", [], "plan reasoning"),
+    response("", [{ id: "reason-call", name: "alpha", arguments: "{\"value\":\"A\"}" }], "tool reasoning"),
+    response("Done.", [], "final reasoning"),
+    response('{"status":"complete","reason":"verified"}', [], "reflect reasoning"),
+  ]);
+  const orchestrator = new AgentOrchestrator({
+    store: f.store,
+    provider,
+    tools: registry,
+    permissionClient: allowPermission,
+    workspace: f.workspace,
+    contextLimit: 32_768,
+    maxOutputTokens: 4_096,
+    createRunId: () => "run-reasoning-replay",
+  });
+
+  try {
+    await orchestrator.run({ sessionId: f.sessionId, prompt: "Inspect it" });
+    const firstExecuteAssistants = provider.requests[1]!.messages.filter((message) => message.role === "assistant");
+    assert.equal(firstExecuteAssistants.at(-1)?.reasoningContent, "plan reasoning");
+    const secondExecuteAssistants = provider.requests[2]!.messages.filter((message) => message.role === "assistant");
+    assert.equal(secondExecuteAssistants.at(-1)?.reasoningContent, "tool reasoning");
+
+    const persisted = f.store.loadSession(f.sessionId).messages
+      .filter((message) => message.role === "assistant")
+      .map((message) => (message.payload as { reasoningContent?: unknown }).reasoningContent);
+    assert.deepEqual(persisted, ["plan reasoning", "tool reasoning", "final reasoning"]);
+    const internal = f.store.loadSession(f.sessionId).messages
+      .filter((message) => message.role === "internal")
+      .map((message) => (message.payload as { reasoningContent?: unknown }).reasoningContent);
+    assert.deepEqual(internal, ["reflect reasoning"]);
+  } finally {
+    f.connection.close();
+  }
+});
+
+test("replays persisted reasoning and tool history after the database is reopened", async () => {
+  const f = await fixture("reasoning-restart");
+  const firstRegistry = new ToolRegistry();
+  firstRegistry.register(scriptedTool("alpha", []));
+  firstRegistry.register(scriptedTool("beta", []));
+  const firstProvider = new ScriptedProvider([
+    response("Plan.", [], "plan reasoning"),
+    response("", [
+      { id: "restart-alpha", name: "alpha", arguments: "{\"value\":\"A\"}" },
+      { id: "restart-beta", name: "beta", arguments: "{\"value\":\"B\"}" },
+    ], "tool reasoning"),
+    response("Done.", [], "final reasoning"),
+    response('{"status":"complete","reason":"verified"}', [], "reflect reasoning"),
+  ]);
+  await new AgentOrchestrator({
+    store: f.store,
+    provider: firstProvider,
+    tools: firstRegistry,
+    permissionClient: allowPermission,
+    workspace: f.workspace,
+    contextLimit: 32_768,
+    maxOutputTokens: 4_096,
+  }).run({ sessionId: f.sessionId, prompt: "First run" });
+  f.connection.close();
+
+  const reopened = await openDatabase({ env: { AWACODE_DATA_DIR: f.dataRoot } });
+  const secondProvider = new ScriptedProvider([
+    response("Next plan.", [], "next plan reasoning"),
+    response("Still done.", [], "next answer reasoning"),
+    response('{"status":"complete","reason":"verified again"}', [], "next reflect reasoning"),
+  ]);
+  const secondRegistry = new ToolRegistry();
+  secondRegistry.register(scriptedTool("alpha", []));
+  secondRegistry.register(scriptedTool("beta", []));
+  try {
+    await new AgentOrchestrator({
+      store: new SessionStore(reopened.db),
+      provider: secondProvider,
+      tools: secondRegistry,
+      permissionClient: allowPermission,
+      workspace: f.workspace,
+      contextLimit: 32_768,
+      maxOutputTokens: 4_096,
+    }).run({ sessionId: f.sessionId, prompt: "Continue after restart" });
+
+    const replayed = secondProvider.requests[1]!.messages;
+    const replayedToolBlock = replayed.find((message) => message.role === "assistant"
+      && message.reasoningContent === "tool reasoning");
+    assert.ok(replayedToolBlock?.role === "assistant");
+    assert.deepEqual(replayedToolBlock.toolCalls.map((call) => call.id), ["restart-alpha", "restart-beta"]);
+    assert.deepEqual(replayed
+      .filter((message) => message.role === "tool")
+      .map((message) => message.toolCallId), ["restart-alpha", "restart-beta"]);
+  } finally {
+    reopened.close();
   }
 });
 

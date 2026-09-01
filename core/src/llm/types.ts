@@ -7,6 +7,7 @@ export interface FunctionToolCall {
 export interface AssistantModelMessage {
   readonly role: "assistant";
   readonly content: string;
+  readonly reasoningContent?: string;
   readonly toolCalls: readonly FunctionToolCall[];
   readonly finishReason: string | null;
 }
@@ -24,6 +25,7 @@ export interface SystemModelMessage {
 export interface AssistantHistoryModelMessage {
   readonly role: "assistant";
   readonly content: string | null;
+  readonly reasoningContent?: string;
   readonly toolCalls: readonly FunctionToolCall[];
 }
 

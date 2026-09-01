@@ -13,6 +13,7 @@ export const RPC_ERROR_CODES = {
   cancelled: -32005,
   configurationOperation: -32006,
   contextLimit: -32007,
+  modelRequest: -32008,
 } as const;
 
 export interface JsonRpcErrorObject {

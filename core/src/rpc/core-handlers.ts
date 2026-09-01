@@ -22,6 +22,7 @@ import {
 import { HistoryIntegrityError } from "../session/history.ts";
 import type { MemoryStore } from "../memory/memory-store.ts";
 import { ContextBudgetError, ContextCompressionError } from "../context/context-manager.ts";
+import { ModelRequestError } from "../llm/openai-chat-client.ts";
 
 export interface AgentControl {
   run(input: AgentRunInput): Promise<AgentRunResult>;
@@ -185,6 +186,20 @@ function agentFault(error: unknown): never {
     throw new RpcFault(RPC_ERROR_CODES.contextLimit, "Required model context does not fit", {
       reason: error.code,
       suggestion: "Increase the context limit or start a new session.",
+    });
+  }
+  if (error instanceof ModelRequestError) {
+    const diagnostic = error.diagnostic;
+    const nested = typeof diagnostic === "object" && diagnostic !== null && "error" in diagnostic
+      ? (diagnostic as { error?: unknown }).error
+      : undefined;
+    const detail = typeof nested === "object" && nested !== null && "message" in nested
+      && typeof (nested as { message?: unknown }).message === "string"
+      ? (nested as { message: string }).message.slice(0, 1_000)
+      : undefined;
+    throw new RpcFault(RPC_ERROR_CODES.modelRequest, "Model request failed", {
+      reason: error.code,
+      ...(detail === undefined ? {} : { detail }),
     });
   }
   if (error instanceof ModelConfigOperationError) {
