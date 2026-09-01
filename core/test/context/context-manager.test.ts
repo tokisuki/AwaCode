@@ -306,7 +306,8 @@ test("global memory precedes project memory so project instructions have priorit
 test("rolling compression persists a replacement summary and never deletes SQLite messages", async () => {
   const { connection, store, session } = await fixture("rolling-summary");
   try {
-    const old = store.insertMessage({ sessionId: session.id, role: "user", kind: "text", payload: { text: "x".repeat(12_000) } });
+    const old = store.insertMessage({ sessionId: session.id, role: "user", kind: "text", payload: { text: "x".repeat(6_000) } });
+    const recent = store.insertMessage({ sessionId: session.id, role: "assistant", kind: "text", payload: { text: "y".repeat(6_000) } });
     const current = store.insertMessage({ sessionId: session.id, role: "user", kind: "text", payload: { text: "current request" } });
     const summaryRequests: Array<{ previousSummary: string | null; messages: readonly unknown[] }> = [];
     const manager = new ContextManager(store, {
@@ -317,11 +318,11 @@ test("rolling compression persists a replacement summary and never deletes SQLit
     });
     const built = await manager.build({
       sessionId: session.id,
-      history: [old, current].map((message) => ({
+      history: [old, recent, current].map((message) => ({
         type: "message" as const,
         messageId: message.id,
         seq: message.seq,
-        role: message.role as "user",
+        role: message.role as "user" | "assistant",
         kind: message.kind,
         payload: message.payload,
       })),
@@ -336,8 +337,8 @@ test("rolling compression persists a replacement summary and never deletes SQLit
     assert.equal(summaryRequests[0]?.previousSummary, null);
     assert.equal(store.loadContextSnapshot(session.id)?.summaryUptoSeq, old.seq);
     assert.equal(store.loadContextSnapshot(session.id)?.summary, "Goal: retain the old requirement.\nNext: handle the current request.");
-    assert.equal(store.loadSession(session.id).messages.length, 2);
-    assert.deepEqual(built.selectedMessageIds, [current.id]);
+    assert.equal(store.loadSession(session.id).messages.length, 3);
+    assert.deepEqual(built.selectedMessageIds, [recent.id, current.id]);
     assert.ok(built.messages.some((message) => message.role === "system" && message.content.includes("retain the old requirement")));
   } finally {
     connection.close();
@@ -410,7 +411,84 @@ test("summary generation failure is explicit instead of silently dropping old hi
     await assert.rejects(manager.build({
       sessionId: session.id,
       history: [
-        { type: "message", messageId: "old", seq: 1, role: "user", kind: "text", payload: { text: "x".repeat(12_000) } },
+        { type: "message", messageId: "old", seq: 1, role: "user", kind: "text", payload: { text: "x".repeat(6_000) } },
+        { type: "message", messageId: "recent", seq: 2, role: "assistant", kind: "text", payload: { text: "y".repeat(6_000) } },
+        { type: "message", messageId: "current", seq: 3, role: "user", kind: "text", payload: { text: "now" } },
+      ],
+      currentUserMessageId: "current",
+      systemText: "baseline",
+      tools: [],
+      contextLimit: 2_100,
+      maxOutputTokens: 100,
+    }), (error: unknown) => error instanceof ContextCompressionError && error.code === "context_compression_failed");
+    assert.equal(store.loadContextSnapshot(session.id)?.summary, null);
+  } finally {
+    connection.close();
+  }
+});
+
+test("rolling compression batches whole blocks within the provider context limit", async () => {
+  const { connection, store, session } = await fixture("summary-input-budget");
+  try {
+    const contextLimit = 2_100;
+    const summaryPrompt = "Generate a structured rolling summary of the conversation. Cover: goal; constraints and decisions; completed work; current state; blockers; next steps; relevant files. Replace, do not merely append to, any previous summary. Do not call tools.";
+    const history: ProviderHistoryEntry[] = [
+      { type: "message", messageId: "old-1", seq: 1, role: "user", kind: "text", payload: { text: "a".repeat(4_500) } },
+      { type: "message", messageId: "old-2", seq: 2, role: "assistant", kind: "text", payload: { text: "b".repeat(4_500) } },
+      { type: "message", messageId: "recent", seq: 3, role: "assistant", kind: "text", payload: { text: "c".repeat(4_500) } },
+      { type: "message", messageId: "current", seq: 4, role: "user", kind: "text", payload: { text: "now" } },
+    ];
+    const requestTotals: number[] = [];
+    const batchRoles: string[][] = [];
+    const manager = new ContextManager(store, {
+      summaryGenerator: async (request) => {
+        const providerMessages = [
+          { role: "system", content: summaryPrompt },
+          ...(request.previousSummary === null
+            ? []
+            : [{ role: "system", content: `Previous rolling summary:\n${request.previousSummary}` }]),
+          ...request.messages,
+        ];
+        requestTotals.push(estimateTextTokens(JSON.stringify(providerMessages)) + request.maxOutputTokens);
+        batchRoles.push(request.messages.map((message) => message.role));
+        return `summary-${requestTotals.length}`;
+      },
+    });
+
+    await manager.build({
+      sessionId: session.id,
+      history,
+      currentUserMessageId: "current",
+      systemText: "baseline",
+      tools: [],
+      contextLimit,
+      maxOutputTokens: 100,
+    });
+
+    assert.ok(requestTotals.length >= 2);
+    assert.ok(requestTotals.every((total) => total <= contextLimit), JSON.stringify(requestTotals));
+    assert.deepEqual(batchRoles, [["user"], ["assistant"]]);
+    assert.equal(store.loadContextSnapshot(session.id)?.summary, "summary-2");
+    assert.equal(store.loadContextSnapshot(session.id)?.summaryUptoSeq, 2);
+  } finally {
+    connection.close();
+  }
+});
+
+test("rolling compression rejects an indivisible oversized block before provider dispatch", async () => {
+  const { connection, store, session } = await fixture("summary-indivisible");
+  try {
+    let providerCalls = 0;
+    const manager = new ContextManager(store, {
+      summaryGenerator: async () => {
+        providerCalls += 1;
+        return "must not run";
+      },
+    });
+    await assert.rejects(manager.build({
+      sessionId: session.id,
+      history: [
+        { type: "message", messageId: "oversized", seq: 1, role: "user", kind: "text", payload: { text: "x".repeat(10_000) } },
         { type: "message", messageId: "current", seq: 2, role: "user", kind: "text", payload: { text: "now" } },
       ],
       currentUserMessageId: "current",
@@ -419,6 +497,7 @@ test("summary generation failure is explicit instead of silently dropping old hi
       contextLimit: 2_100,
       maxOutputTokens: 100,
     }), (error: unknown) => error instanceof ContextCompressionError && error.code === "context_compression_failed");
+    assert.equal(providerCalls, 0);
     assert.equal(store.loadContextSnapshot(session.id)?.summary, null);
   } finally {
     connection.close();

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import { ContextCompressionError, ContextManager, type BuildContextInput } from "../context/context-manager.ts";
+import { ContextCompressionError, ContextManager, SUMMARY_SYSTEM_PROMPT, type BuildContextInput } from "../context/context-manager.ts";
 import type {
   AssistantModelMessage,
   FunctionToolDefinition,
@@ -119,7 +119,6 @@ const REFLECT_CORRECTION_PROMPT = 'The previous Reflect output was invalid or ma
 const MAX_EXECUTE_TURNS = 12;
 const MAX_TOOL_EXECUTIONS = 24;
 const DEFAULT_SYSTEM_PROMPT = "You are AwaCode, a careful coding agent. Call memory_write only when the current user explicitly asks to remember, update, or forget information. Never infer or automatically write memory. Default unspecified memory scope to project; use global only for explicit cross-project preferences.";
-const SUMMARY_PROMPT = "Generate a structured rolling summary of the conversation. Cover: goal; constraints and decisions; completed work; current state; blockers; next steps; relevant files. Replace, do not merely append to, any previous summary. Do not call tools.";
 
 function isContextOverflow(error: unknown): boolean {
   return error instanceof ModelContextOverflowError
@@ -209,7 +208,7 @@ export class AgentOrchestrator {
         this.modelTurns += 1;
         const response = await this.options.provider.stream({
           messages: [
-            { role: "system", content: SUMMARY_PROMPT },
+            { role: "system", content: SUMMARY_SYSTEM_PROMPT },
             ...(request.previousSummary === null
               ? []
               : [{ role: "system" as const, content: `Previous rolling summary:\n${request.previousSummary}` }]),

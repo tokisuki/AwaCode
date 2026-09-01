@@ -43,6 +43,8 @@ export interface SummaryRequest {
   readonly signal?: AbortSignal;
 }
 
+export const SUMMARY_SYSTEM_PROMPT = "Generate a structured rolling summary of the conversation. Cover: goal; constraints and decisions; completed work; current state; blockers; next steps; relevant files. Replace, do not merely append to, any previous summary. Do not call tools.";
+
 export interface BuildContextInput {
   readonly sessionId: string;
   readonly history: readonly ProviderHistoryEntry[];
@@ -131,6 +133,23 @@ function entryBlock(entry: ProviderHistoryEntry): ModelBlock {
 
 function fixedTokens(messages: readonly ModelMessage[], tools: readonly FunctionToolDefinition[]): number {
   return estimateTextTokens(JSON.stringify(messages)) + estimateTextTokens(JSON.stringify(tools));
+}
+
+function summaryMessages(previousSummary: string | null, messages: readonly ModelMessage[]): readonly ModelMessage[] {
+  return [
+    { role: "system", content: SUMMARY_SYSTEM_PROMPT },
+    ...(previousSummary === null
+      ? []
+      : [{ role: "system" as const, content: `Previous rolling summary:\n${previousSummary}` }]),
+    ...messages,
+  ];
+}
+
+function summaryBlockMessages(block: ModelBlock): readonly ModelMessage[] {
+  return block.messages.map((message): ModelMessage =>
+    message.role === "tool"
+      ? { ...message, content: [...message.content].slice(0, 2_000).join("") }
+      : message);
 }
 
 function memoryFromSnapshot(value: unknown): MemoryTexts | undefined {
@@ -296,26 +315,47 @@ export class ContextManager {
     blocks: readonly ModelBlock[],
   ): Promise<void> {
     try {
-      const messages = blocks.flatMap((block) => block.messages).map((message): ModelMessage =>
-        message.role === "tool"
-          ? { ...message, content: [...message.content].slice(0, 2_000).join("") }
-          : message);
-      const summary = (await this.summaryGenerator!({
-        previousSummary,
-        messages,
-        maxOutputTokens: Math.min(input.maxOutputTokens, 4_096),
-        ...(input.signal === undefined ? {} : { signal: input.signal }),
-      })).trim();
-      if (summary.length === 0) {
-        throw new Error("empty summary");
+      const maxOutputTokens = Math.min(input.maxOutputTokens, 4_096);
+      let nextBlock = 0;
+      let replacementSummary = previousSummary;
+      let summaryUptoSeq = 0;
+      while (nextBlock < blocks.length) {
+        const batchMessages: ModelMessage[] = [];
+        let batchEnd = nextBlock;
+        while (batchEnd < blocks.length) {
+          const candidateMessages = [...batchMessages, ...summaryBlockMessages(blocks[batchEnd]!)];
+          const requestTokens = estimateTextTokens(JSON.stringify(summaryMessages(replacementSummary, candidateMessages)))
+            + maxOutputTokens;
+          if (requestTokens > input.contextLimit) {
+            break;
+          }
+          batchMessages.push(...summaryBlockMessages(blocks[batchEnd]!));
+          batchEnd += 1;
+        }
+        if (batchEnd === nextBlock) {
+          throw new ContextCompressionError("context_compression_failed", {
+            cause: new Error("A required atomic summary block does not fit within the provider context limit."),
+          });
+        }
+        const generated = (await this.summaryGenerator!({
+          previousSummary: replacementSummary,
+          messages: batchMessages,
+          maxOutputTokens,
+          ...(input.signal === undefined ? {} : { signal: input.signal }),
+        })).trim();
+        if (generated.length === 0) {
+          throw new Error("empty summary");
+        }
+        replacementSummary = generated;
+        summaryUptoSeq = Math.max(...blocks.slice(nextBlock, batchEnd).map((block) => block.seq));
+        nextBlock = batchEnd;
       }
-      const summaryUptoSeq = Math.max(...blocks.map((block) => block.seq));
       this.store.saveContextSnapshot({
         sessionId: input.sessionId,
         baseline,
         sourceSnapshot,
         baselineSeq: summaryUptoSeq,
-        summary,
+        summary: replacementSummary,
         summaryUptoSeq,
       });
     } catch (error) {
