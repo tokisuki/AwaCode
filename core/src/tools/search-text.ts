@@ -84,6 +84,7 @@ function isSafeRegexPattern(pattern: string): boolean {
       parent.hasAlternation ||= frame.hasAlternation;
       parent.hasQuantifier ||= frame.hasQuantifier;
       parent.unboundedQuantifiers += frame.unboundedQuantifiers;
+      if (parent.unboundedQuantifiers > 1) return false;
       atom = { kind: "group", hasAlternation: frame.hasAlternation, hasQuantifier: frame.hasQuantifier };
       continue;
     }

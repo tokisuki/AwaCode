@@ -52,6 +52,8 @@ test("search_text validates its exact bounded input contract", () => {
     { query: "(((a+)))+$", is_regex: true },
     { query: "((a|aa))+$", is_regex: true },
     { query: "(((a|aa)))+$", is_regex: true },
+    { query: "a*(?:a*)X", is_regex: true },
+    { query: "(?:a*)(?:a*)X", is_regex: true },
     { query: "x", is_regex: "yes" },
   ]) {
     assert.throws(() => searchTextTool.validate(invalid), ToolValidationError);
@@ -59,6 +61,18 @@ test("search_text validates its exact bounded input contract", () => {
   for (const safe of ["((literal))", "^((ab))+$", "^((foo)-(?:bar))$"]) {
     assert.doesNotThrow(() => searchTextTool.validate({ query: safe, is_regex: true }));
   }
+});
+
+test("search_text rejects separated unbounded repetitions before scanning a 1 MiB line", async () => {
+  const { root, context } = await fixture("regex-wrapper-backtracking");
+  await writeFile(join(root, "large.txt"), `${"a".repeat(1024 * 1024 - 1)}Y`, "utf8");
+
+  assert.throws(
+    () => searchTextTool.validate({ query: "a*(?:a*)X", is_regex: true }),
+    ToolValidationError,
+  );
+  // Validation rejects the expression; execution is deliberately never reached.
+  assert.equal(context.signal.aborted, false);
 });
 
 test("search_text caps a file that grows after its size check", async () => {
