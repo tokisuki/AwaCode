@@ -85,7 +85,11 @@ async function waitBounded(settled: Promise<unknown>, timeoutMs: number): Promis
 }
 
 export async function cancelAgentRun(options: CancelAgentRunOptions): Promise<void> {
-  await options.requestCancel().catch(() => undefined);
+  try {
+    void options.requestCancel().catch(() => undefined);
+  } catch {
+    // A synchronous transport failure must not bypass the bounded child wait.
+  }
   const exited = await (options.wait ?? waitBounded)(options.childExit, options.timeoutMs ?? 1_500);
   if (!exited) {
     options.terminateChild();

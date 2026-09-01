@@ -130,3 +130,37 @@ test("cancellation requests agent/cancel, waits boundedly, then terminates a stu
   });
   assert.deepEqual(events, ["cancel"]);
 });
+
+test("an unresponsive cancel RPC cannot prevent the bounded wait from terminating Core", { timeout: 500 }, async () => {
+  const events: string[] = [];
+  const unhandled: unknown[] = [];
+  const onUnhandled = (error: unknown) => { unhandled.push(error); };
+  process.on("unhandledRejection", onUnhandled);
+  let rejectCancel!: (error: Error) => void;
+  const cancelRequest = new Promise<never>((_resolve, reject) => { rejectCancel = reject; });
+  let releaseExit!: () => void;
+  const childExit = new Promise<void>((resolve) => { releaseExit = resolve; });
+  try {
+    await cancelAgentRun({
+      requestCancel: () => {
+        events.push("cancel");
+        return cancelRequest;
+      },
+      childExit,
+      wait: async () => {
+        events.push("wait");
+        return false;
+      },
+      terminateChild: () => {
+        events.push("terminate");
+        releaseExit();
+      },
+    });
+    rejectCancel(new Error("late fixture cancellation rejection"));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(events, ["cancel", "wait", "terminate"]);
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+});
