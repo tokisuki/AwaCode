@@ -13,11 +13,24 @@ import {
 } from "../project/project-identity.ts";
 import { RPC_ERROR_CODES, RpcFault } from "../protocol/json-rpc.ts";
 import type { JsonRpcPeer } from "../protocol/rpc-peer.ts";
+import {
+  AgentBusyError,
+  AgentCancelledError,
+  type AgentRunInput,
+  type AgentRunResult,
+} from "../agent/orchestrator.ts";
+import { HistoryIntegrityError } from "../session/history.ts";
+
+export interface AgentControl {
+  run(input: AgentRunInput): Promise<AgentRunResult>;
+  cancel(): boolean;
+}
 
 export interface CoreHandlerDependencies {
   store: SessionStore;
   configService: ModelConfigService;
   projectIdentityOptions?: ProjectIdentityOptions;
+  agent?: AgentControl;
 }
 
 interface WorkspaceParams {
@@ -34,6 +47,27 @@ interface CreateSessionParams extends ProjectParams {
 
 interface SessionParams {
   sessionId: string;
+}
+
+function parseAgentRun(value: unknown): AgentRunInput {
+  if (
+    !isRecord(value)
+    || !hasExactKeys(value, ["sessionId", "prompt"])
+    || typeof value.sessionId !== "string"
+    || value.sessionId.trim().length === 0
+    || typeof value.prompt !== "string"
+    || value.prompt.trim().length === 0
+  ) {
+    throw new TypeError("agent/run params must contain nonblank sessionId and prompt strings");
+  }
+  return { sessionId: value.sessionId, prompt: value.prompt };
+}
+
+function parseAgentCancel(value: unknown): Record<string, never> {
+  if (!isRecord(value) || Object.keys(value).length !== 0) {
+    throw new TypeError("agent/cancel params must be an empty object");
+  }
+  return {};
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -125,6 +159,19 @@ function configFault(error: unknown): never {
   throw new RpcFault(RPC_ERROR_CODES.configurationOperation, "Model configuration operation failed");
 }
 
+function agentFault(error: unknown): never {
+  if (error instanceof AgentBusyError) {
+    throw new RpcFault(RPC_ERROR_CODES.busy, "Agent is busy");
+  }
+  if (error instanceof AgentCancelledError) {
+    throw new RpcFault(RPC_ERROR_CODES.cancelled, "Agent run cancelled", error.result);
+  }
+  if (error instanceof HistoryIntegrityError) {
+    throw new RpcFault(RPC_ERROR_CODES.historyIntegrity, "Session history is incomplete");
+  }
+  return storeFault(error);
+}
+
 export function registerCoreHandlers(peer: JsonRpcPeer, dependencies: CoreHandlerDependencies): void {
   peer.register("core/hello", parseHello, () => ({
     coreVersion: coreDescriptor.version,
@@ -193,4 +240,18 @@ export function registerCoreHandlers(peer: JsonRpcPeer, dependencies: CoreHandle
       return configFault(error);
     }
   });
+
+  if (dependencies.agent !== undefined) {
+    peer.register("agent/run", parseAgentRun, async (input) => {
+      try {
+        return await dependencies.agent!.run(input);
+      } catch (error) {
+        return agentFault(error);
+      }
+    });
+
+    peer.register("agent/cancel", parseAgentCancel, () => ({
+      signalled: dependencies.agent!.cancel(),
+    }));
+  }
 }

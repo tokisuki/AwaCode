@@ -1,0 +1,680 @@
+import assert from "node:assert/strict";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+
+import { ModelConfigService } from "../../src/config/model-config.ts";
+import {
+  AgentOrchestrator,
+  AgentCancelledError,
+  type AgentNotification,
+} from "../../src/agent/orchestrator.ts";
+import type {
+  AssistantModelMessage,
+  ModelProvider,
+  ModelStreamRequest,
+} from "../../src/llm/types.ts";
+import { openDatabase } from "../../src/persistence/database.ts";
+import { SessionStore } from "../../src/persistence/session-store.ts";
+import { RpcFault } from "../../src/protocol/json-rpc.ts";
+import { JsonRpcPeer } from "../../src/protocol/rpc-peer.ts";
+import { registerCoreHandlers } from "../../src/rpc/core-handlers.ts";
+import { WorkspaceGuard } from "../../src/security/workspace-guard.ts";
+import type { ToolDefinition, ToolResult } from "../../src/tools/contracts.ts";
+import type { PermissionClient } from "../../src/tools/permission.ts";
+import { ToolRegistry } from "../../src/tools/registry.ts";
+import { editFileTool } from "../../src/tools/edit-file.ts";
+
+const temporaryDirectories: string[] = [];
+
+interface AgentFixture {
+  connection: Awaited<ReturnType<typeof openDatabase>>;
+  store: SessionStore;
+  sessionId: string;
+  workspace: WorkspaceGuard;
+}
+
+async function fixture(label: string): Promise<AgentFixture> {
+  const directory = await mkdtemp(join(tmpdir(), `awacode-agent-${label}-`));
+  temporaryDirectories.push(directory);
+  const connection = await openDatabase({ env: { AWACODE_DATA_DIR: join(directory, "data") } });
+  let id = 0;
+  const store = new SessionStore(connection.db, {
+    now: () => new Date("2026-09-01T01:02:03.000Z"),
+    randomUUID: () => `durable-${++id}`,
+  });
+  store.upsertProject({ id: "project", kind: "path", value: directory, rootPath: directory });
+  const session = store.createSession("project", label);
+  return { connection, store, sessionId: session.id, workspace: await WorkspaceGuard.create(directory) };
+}
+
+test.after(async () => {
+  await Promise.all(temporaryDirectories.map((directory) => rm(directory, { recursive: true, force: true })));
+});
+
+class ScriptedProvider implements ModelProvider {
+  readonly requests: ModelStreamRequest[] = [];
+  private readonly script: AssistantModelMessage[];
+
+  constructor(script: AssistantModelMessage[]) {
+    this.script = [...script];
+  }
+
+  async stream(request: ModelStreamRequest): Promise<AssistantModelMessage> {
+    this.requests.push({
+      messages: structuredClone(request.messages),
+      ...(request.tools === undefined ? {} : { tools: structuredClone(request.tools) }),
+    });
+    if (request.signal?.aborted) {
+      throw new DOMException("aborted", "AbortError");
+    }
+    const response = this.script.shift();
+    if (response === undefined) {
+      throw new Error("script exhausted");
+    }
+    if (response.content.length > 0) {
+      request.onTextDelta?.(response.content);
+    }
+    return structuredClone(response);
+  }
+}
+
+const allowPermission: PermissionClient = {
+  async requestPermission() {
+    return "allow_once";
+  },
+};
+
+function scriptedTool(name: string, order: string[]): ToolDefinition<{ value: string }> {
+  return {
+    name,
+    description: `${name} fixture tool`,
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["value"],
+      properties: { value: { type: "string" } },
+    },
+    approval: "none",
+    validate(value) {
+      if (
+        typeof value !== "object"
+        || value === null
+        || Array.isArray(value)
+        || Object.keys(value).length !== 1
+        || typeof (value as { value?: unknown }).value !== "string"
+      ) {
+        throw new TypeError("invalid fixture input");
+      }
+      return { value: (value as { value: string }).value };
+    },
+    async execute(input): Promise<ToolResult> {
+      order.push(`${name}:start:${input.value}`);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      order.push(`${name}:end:${input.value}`);
+      return {
+        status: "success",
+        summary: `${name} completed`,
+        content: input.value,
+        durationMs: 1,
+        metadata: { name },
+      };
+    },
+  };
+}
+
+function response(content: string, toolCalls: AssistantModelMessage["toolCalls"] = []): AssistantModelMessage {
+  return {
+    role: "assistant",
+    content,
+    toolCalls,
+    finishReason: toolCalls.length === 0 ? "stop" : "tool_calls",
+  };
+}
+
+function connectedPeers(): { client: JsonRpcPeer; server: JsonRpcPeer } {
+  let client!: JsonRpcPeer;
+  let server!: JsonRpcPeer;
+  client = new JsonRpcPeer({ idPrefix: "ui-", send: (message) => server.receive(message) });
+  server = new JsonRpcPeer({ idPrefix: "core-", send: (message) => client.receive(message) });
+  return { client, server };
+}
+
+test("Plan, serial tools, provisional Execute text, and valid Reflect complete form one durable committed run", async () => {
+  const f = await fixture("happy");
+  const order: string[] = [];
+  const registry = new ToolRegistry();
+  registry.register(scriptedTool("alpha", order));
+  registry.register(scriptedTool("beta", order));
+  const provider = new ScriptedProvider([
+    response("Inspect, then edit."),
+    response("", [
+      { id: "call-alpha", name: "alpha", arguments: "{\"value\":\"A\"}" },
+      { id: "call-beta", name: "beta", arguments: "{\"value\":\"B\"}" },
+    ]),
+    response("All checks pass."),
+    response('{"status":"complete","reason":"verified"}'),
+  ]);
+  const notifications: AgentNotification[] = [];
+  const orchestrator = new AgentOrchestrator({
+    store: f.store,
+    provider,
+    tools: registry,
+    permissionClient: allowPermission,
+    workspace: f.workspace,
+    contextLimit: 32_768,
+    maxOutputTokens: 4_096,
+    createRunId: () => "run-happy",
+    notify: async (notification) => { notifications.push(structuredClone(notification)); },
+  });
+
+  try {
+    assert.deepEqual(await orchestrator.run({ sessionId: f.sessionId, prompt: "Fix it" }), {
+      runId: "run-happy",
+      finalText: "All checks pass.",
+      status: "completed",
+      reason: "verified",
+      modelTurns: 4,
+      toolCalls: 2,
+    });
+    assert.deepEqual(order, ["alpha:start:A", "alpha:end:A", "beta:start:B", "beta:end:B"]);
+    assert.deepEqual(notifications.map((event) => event.params.eventSeq),
+      notifications.map((_, index) => index + 1));
+    assert.equal(notifications.every((event) => event.params.runId === "run-happy"), true);
+    assert.equal(notifications.some((event) => event.method === "stream/commit"
+      && event.params.messageId === "durable-5"), true);
+
+    const loaded = f.store.loadSession(f.sessionId);
+    assert.equal(loaded.session.status, "completed");
+    assert.deepEqual(loaded.toolCalls.map((call) => [call.callId, call.status]), [
+      ["call-alpha", "success"],
+      ["call-beta", "success"],
+    ]);
+    assert.equal(loaded.messages.some((message) => message.role === "internal" && message.kind === "reflect"), true);
+    assert.equal(loaded.messages.every((message) => message.status === "complete"), true);
+
+    assert.equal(provider.requests.length, 4);
+    assert.equal(provider.requests[0]!.tools, undefined);
+    assert.deepEqual(provider.requests[1]!.tools?.map((tool) => tool.function.name), ["alpha", "beta"]);
+    assert.equal(provider.requests[2]!.messages.some((message) => message.role === "tool" && message.toolCallId === "call-beta"), true);
+    assert.equal(provider.requests[3]!.messages.some((message) => message.role === "assistant" && message.content === "All checks pass."), true);
+  } finally {
+    f.connection.close();
+  }
+});
+
+test("unknown, invalid, and denied tool calls each persist exactly one terminal result", async () => {
+  const f = await fixture("tool-failures");
+  await writeFile(join(f.workspace.rootPath, "demo.txt"), "old", "utf8");
+  const registry = new ToolRegistry();
+  registry.register(scriptedTool("alpha", []));
+  registry.register(editFileTool);
+  const provider = new ScriptedProvider([
+    response("Plan."),
+    response("", [
+      { id: "unknown", name: "missing_tool", arguments: "{}" },
+      { id: "malformed", name: "alpha", arguments: "{" },
+      { id: "invalid", name: "alpha", arguments: "{\"wrong\":true}" },
+      { id: "denied", name: "edit_file", arguments: "{\"path\":\"demo.txt\",\"old_text\":\"old\",\"new_text\":\"new\"}" },
+    ]),
+    response("No changes were made."),
+    response('{"status":"complete","reason":"handled"}'),
+  ]);
+  const orchestrator = new AgentOrchestrator({
+    store: f.store,
+    provider,
+    tools: registry,
+    permissionClient: { async requestPermission() { return "deny"; } },
+    workspace: f.workspace,
+    contextLimit: 32_768,
+    maxOutputTokens: 4_096,
+  });
+
+  try {
+    const result = await orchestrator.run({ sessionId: f.sessionId, prompt: "Try tools" });
+    assert.equal(result.status, "completed");
+    assert.equal(await readFile(join(f.workspace.rootPath, "demo.txt"), "utf8"), "old");
+    const calls = f.store.loadSession(f.sessionId).toolCalls;
+    assert.deepEqual(calls.map((call) => [call.callId, call.status, call.result !== null]), [
+      ["unknown", "failure", true],
+      ["malformed", "failure", true],
+      ["invalid", "failure", true],
+      ["denied", "denied", true],
+    ]);
+    assert.equal(new Set(calls.map((call) => call.callId)).size, 4);
+  } finally {
+    f.connection.close();
+  }
+});
+
+test("cancellation interrupts an awaiting approval, settles the call, and never auto-replays it", async () => {
+  const f = await fixture("cancel");
+  await writeFile(join(f.workspace.rootPath, "demo.txt"), "old", "utf8");
+  const registry = new ToolRegistry();
+  registry.register(editFileTool);
+  const provider = new ScriptedProvider([
+    response("Plan."),
+    response("", [{
+      id: "cancelled-edit",
+      name: "edit_file",
+      arguments: "{\"path\":\"demo.txt\",\"old_text\":\"old\",\"new_text\":\"new\"}",
+    }]),
+  ]);
+  let approvalEntered!: () => void;
+  const entered = new Promise<void>((resolve) => { approvalEntered = resolve; });
+  const permissionClient: PermissionClient = {
+    requestPermission(_request, options) {
+      approvalEntered();
+      return new Promise((_resolve, reject) => {
+        const signal = options?.signal;
+        if (signal?.aborted) {
+          reject(signal.reason);
+          return;
+        }
+        signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    },
+  };
+  const orchestrator = new AgentOrchestrator({
+    store: f.store,
+    provider,
+    tools: registry,
+    permissionClient,
+    workspace: f.workspace,
+    contextLimit: 32_768,
+    maxOutputTokens: 4_096,
+  });
+
+  try {
+    const running = orchestrator.run({ sessionId: f.sessionId, prompt: "Edit it" });
+    await entered;
+    assert.equal(orchestrator.cancel(), true);
+    await assert.rejects(running, (error: unknown) =>
+      error instanceof AgentCancelledError && error.result.status === "cancelled");
+    assert.equal(orchestrator.cancel(), false);
+    const loaded = f.store.loadSession(f.sessionId);
+    assert.equal(loaded.session.status, "cancelled");
+    assert.deepEqual(loaded.toolCalls.map((call) => [call.callId, call.status, call.result !== null]), [
+      ["cancelled-edit", "interrupted", true],
+    ]);
+    assert.equal(loaded.messages.filter((message) => message.status === "streaming").length, 0);
+    assert.equal(await readFile(join(f.workspace.rootPath, "demo.txt"), "utf8"), "old");
+  } finally {
+    f.connection.close();
+  }
+});
+
+test("malformed Reflect retries once and continue permits one remedial Execute without recursive reflection", async () => {
+  const f = await fixture("reflect-retry");
+  const provider = new ScriptedProvider([
+    response("Plan once."),
+    response("First candidate."),
+    response("not-json"),
+    response('{"status":"continue","reason":"tests still fail"}'),
+    response("Remedial candidate."),
+  ]);
+  const notifications: AgentNotification[] = [];
+  const orchestrator = new AgentOrchestrator({
+    store: f.store,
+    provider,
+    tools: new ToolRegistry(),
+    permissionClient: allowPermission,
+    workspace: f.workspace,
+    contextLimit: 32_768,
+    maxOutputTokens: 4_096,
+    createRunId: () => "run-reflect-retry",
+    notify: (notification) => { notifications.push(structuredClone(notification)); },
+  });
+
+  try {
+    assert.deepEqual(await orchestrator.run({ sessionId: f.sessionId, prompt: "Fix tests" }), {
+      runId: "run-reflect-retry",
+      finalText: "Remedial candidate.",
+      status: "completed",
+      reason: "tests still fail",
+      modelTurns: 5,
+      toolCalls: 0,
+    });
+    assert.equal(provider.requests.length, 5);
+    assert.equal(provider.requests[2]!.tools, undefined);
+    assert.equal(provider.requests[3]!.tools, undefined);
+    assert.equal(provider.requests[3]!.messages.at(-1)?.role, "system");
+    assert.match(provider.requests[3]!.messages.at(-1)!.content as string, /invalid|malformed|exact JSON/i);
+    assert.equal(provider.requests.filter((request) =>
+      request.messages.at(-1)?.role === "system"
+      && (request.messages.at(-1)!.content as string).includes("Review the candidate")).length, 1);
+    const loaded = f.store.loadSession(f.sessionId);
+    assert.equal(loaded.messages.filter((message) => message.role === "internal" && message.kind === "reflect").length, 2);
+    const commits = notifications.filter((event) => event.method === "stream/commit");
+    assert.equal(commits.length, 1);
+    const committed = loaded.messages.find((message) => message.id === commits[0]!.params.messageId);
+    assert.deepEqual(committed?.payload, { text: "Remedial candidate.", phase: "execute" });
+  } finally {
+    f.connection.close();
+  }
+});
+
+test("a second malformed Reflect response ends explicitly after exactly one retry", async () => {
+  const f = await fixture("reflect-twice-invalid");
+  const provider = new ScriptedProvider([
+    response("Plan."),
+    response("Candidate."),
+    response("invalid one"),
+    response('{"status":"complete","reason":7}'),
+  ]);
+  const orchestrator = new AgentOrchestrator({
+    store: f.store,
+    provider,
+    tools: new ToolRegistry(),
+    permissionClient: allowPermission,
+    workspace: f.workspace,
+    contextLimit: 32_768,
+    maxOutputTokens: 4_096,
+  });
+
+  try {
+    await assert.rejects(orchestrator.run({ sessionId: f.sessionId, prompt: "Reflect" }),
+      (error: unknown) => error instanceof Error && error.message === "Reflect output was malformed twice.");
+    assert.equal(provider.requests.length, 4);
+    const loaded = f.store.loadSession(f.sessionId);
+    assert.equal(loaded.session.status, "error");
+    assert.equal(loaded.messages.filter((message) => message.role === "internal" && message.kind === "reflect").length, 2);
+  } finally {
+    f.connection.close();
+  }
+});
+
+test("unexpected Plan tool calls are rejected but first settled into complete history", async () => {
+  const f = await fixture("plan-tool-call");
+  const provider = new ScriptedProvider([
+    response("", [{ id: "plan-call", name: "missing_tool", arguments: "{}" }]),
+  ]);
+  const orchestrator = new AgentOrchestrator({
+    store: f.store,
+    provider,
+    tools: new ToolRegistry(),
+    permissionClient: allowPermission,
+    workspace: f.workspace,
+    contextLimit: 32_768,
+    maxOutputTokens: 4_096,
+  });
+
+  try {
+    await assert.rejects(orchestrator.run({ sessionId: f.sessionId, prompt: "Plan" }),
+      (error: unknown) => error instanceof Error && error.message === "Plan returned unexpected tool calls.");
+    const loaded = f.store.loadSession(f.sessionId);
+    assert.equal(loaded.session.status, "error");
+    assert.deepEqual(loaded.toolCalls.map((call) => [call.callId, call.status, call.result !== null]), [
+      ["plan-call", "failure", true],
+    ]);
+    assert.equal(provider.requests.length, 1);
+  } finally {
+    f.connection.close();
+  }
+});
+
+test("a notification failure after a tool block is durable settles that session instead of leaving pending work", async () => {
+  const f = await fixture("notification-failure");
+  const registry = new ToolRegistry();
+  registry.register(scriptedTool("alpha", []));
+  const provider = new ScriptedProvider([
+    response("Plan."),
+    response("", [{ id: "notify-call", name: "alpha", arguments: "{\"value\":\"A\"}" }]),
+  ]);
+  const orchestrator = new AgentOrchestrator({
+    store: f.store,
+    provider,
+    tools: registry,
+    permissionClient: allowPermission,
+    workspace: f.workspace,
+    contextLimit: 32_768,
+    maxOutputTokens: 4_096,
+    notify(notification) {
+      if (notification.method === "tool/start") {
+        throw new Error("fixture notification failure");
+      }
+    },
+  });
+
+  try {
+    await assert.rejects(orchestrator.run({ sessionId: f.sessionId, prompt: "Notify" }), /notification failure/);
+    const loaded = f.store.loadSession(f.sessionId);
+    assert.equal(loaded.session.status, "error");
+    assert.deepEqual(loaded.toolCalls.map((call) => [call.callId, call.status, call.result !== null]), [
+      ["notify-call", "interrupted", true],
+    ]);
+    assert.equal(loaded.messages.filter((message) => message.status === "streaming").length, 0);
+  } finally {
+    f.connection.close();
+  }
+});
+
+test("the twelfth Execute tool turn closes with one no-tools summary instead of requesting a thirteenth tool turn", async () => {
+  const f = await fixture("turn-limit");
+  const registry = new ToolRegistry();
+  registry.register(scriptedTool("alpha", []));
+  const script = [response("Plan.")];
+  for (let index = 1; index <= 12; index += 1) {
+    script.push(response("", [{ id: `turn-${index}`, name: "alpha", arguments: `{"value":"${index}"}` }]));
+  }
+  script.push(response("Stopped after twelve Execute turns; remaining work is reported."));
+  const provider = new ScriptedProvider(script);
+  const orchestrator = new AgentOrchestrator({
+    store: f.store,
+    provider,
+    tools: registry,
+    permissionClient: allowPermission,
+    workspace: f.workspace,
+    contextLimit: 32_768,
+    maxOutputTokens: 4_096,
+  });
+
+  try {
+    const result = await orchestrator.run({ sessionId: f.sessionId, prompt: "Loop" });
+    assert.deepEqual({
+      finalText: result.finalText,
+      status: result.status,
+      reason: result.reason,
+      modelTurns: result.modelTurns,
+      toolCalls: result.toolCalls,
+    }, {
+      finalText: "Stopped after twelve Execute turns; remaining work is reported.",
+      status: "completed",
+      reason: "execute_turn_limit",
+      modelTurns: 14,
+      toolCalls: 12,
+    });
+    assert.equal(provider.requests.length, 14);
+    assert.equal(provider.requests.at(-1)!.tools, undefined);
+    assert.match(provider.requests.at(-1)!.messages.at(-1)!.content as string, /completed work/i);
+    assert.match(provider.requests.at(-1)!.messages.at(-1)!.content as string, /unfinished work/i);
+    assert.match(provider.requests.at(-1)!.messages.at(-1)!.content as string, /execute_turn_limit/);
+  } finally {
+    f.connection.close();
+  }
+});
+
+test("only twenty-four tools execute and later calls in the persisted block receive non-executed failures", async () => {
+  const f = await fixture("tool-limit");
+  const registry = new ToolRegistry();
+  registry.register(scriptedTool("alpha", []));
+  const calls = Array.from({ length: 25 }, (_, index) => ({
+    id: `tool-${index + 1}`,
+    name: "alpha",
+    arguments: `{"value":"${index + 1}"}`,
+  }));
+  const provider = new ScriptedProvider([
+    response("Plan."),
+    response("", calls),
+    response("Stopped at the tool limit."),
+  ]);
+  const orchestrator = new AgentOrchestrator({
+    store: f.store,
+    provider,
+    tools: registry,
+    permissionClient: allowPermission,
+    workspace: f.workspace,
+    contextLimit: 32_768,
+    maxOutputTokens: 4_096,
+  });
+
+  try {
+    const result = await orchestrator.run({ sessionId: f.sessionId, prompt: "Many tools" });
+    assert.equal(result.reason, "tool_call_limit");
+    assert.equal(result.toolCalls, 24);
+    assert.equal(provider.requests.length, 3);
+    assert.equal(provider.requests[2]!.tools, undefined);
+    const persisted = f.store.loadSession(f.sessionId).toolCalls;
+    assert.equal(persisted.length, 25);
+    assert.equal(persisted[23]!.status, "success");
+    assert.equal(persisted[24]!.status, "failure");
+    assert.deepEqual((persisted[24]!.result as ToolResult).metadata, {
+      error: "tool_call_limit",
+      sideEffects: "none",
+    });
+  } finally {
+    f.connection.close();
+  }
+});
+
+test("the third consecutive identical canonical call is persisted as a non-executed failure and closes the run", async () => {
+  const f = await fixture("repeat-limit");
+  const order: string[] = [];
+  const registry = new ToolRegistry();
+  registry.register(scriptedTool("alpha", order));
+  const provider = new ScriptedProvider([
+    response("Plan."),
+    response("", [
+      { id: "repeat-1", name: "alpha", arguments: "{\"value\":\"same\"}" },
+      { id: "repeat-2", name: "alpha", arguments: "{ \"value\" : \"same\" }" },
+      { id: "repeat-3", name: "alpha", arguments: "{\"value\":\"same\"}" },
+    ]),
+    response("Stopped because the same call repeated."),
+  ]);
+  const orchestrator = new AgentOrchestrator({
+    store: f.store,
+    provider,
+    tools: registry,
+    permissionClient: allowPermission,
+    workspace: f.workspace,
+    contextLimit: 32_768,
+    maxOutputTokens: 4_096,
+  });
+
+  try {
+    const result = await orchestrator.run({ sessionId: f.sessionId, prompt: "Repeat" });
+    assert.equal(result.reason, "repeated_tool_call");
+    assert.equal(result.toolCalls, 2);
+    assert.deepEqual(order, ["alpha:start:same", "alpha:end:same", "alpha:start:same", "alpha:end:same"]);
+    const third = f.store.loadToolCall("repeat-3");
+    assert.equal(third.status, "failure");
+    assert.deepEqual((third.result as ToolResult).metadata, {
+      error: "repeated_tool_call",
+      sideEffects: "none",
+    });
+  } finally {
+    f.connection.close();
+  }
+});
+
+test("agent RPC validates exact params, reports busy, signals cancellation, and maps cancellation stably", async () => {
+  const f = await fixture("rpc-busy");
+  let entered!: () => void;
+  const providerEntered = new Promise<void>((resolve) => { entered = resolve; });
+  const blockingProvider: ModelProvider = {
+    async stream(request): Promise<AssistantModelMessage> {
+      entered();
+      return new Promise<AssistantModelMessage>((_resolve, reject) => {
+        const rejectAbort = () => reject(request.signal?.reason ?? new DOMException("aborted", "AbortError"));
+        if (request.signal?.aborted) {
+          rejectAbort();
+        } else {
+          request.signal?.addEventListener("abort", rejectAbort, { once: true });
+        }
+      });
+    },
+  };
+  const agent = new AgentOrchestrator({
+    store: f.store,
+    provider: blockingProvider,
+    tools: new ToolRegistry(),
+    permissionClient: allowPermission,
+    workspace: f.workspace,
+    contextLimit: 32_768,
+    maxOutputTokens: 4_096,
+  });
+  const { client, server } = connectedPeers();
+  registerCoreHandlers(server, {
+    store: f.store,
+    configService: new ModelConfigService({ env: { AWACODE_DATA_DIR: join(f.workspace.rootPath, "config") } }),
+    agent,
+  });
+
+  try {
+    for (const params of [undefined, {}, { sessionId: f.sessionId, prompt: "" }, { sessionId: f.sessionId, prompt: "go", extra: true }]) {
+      await assert.rejects(
+        params === undefined ? client.request("agent/run") : client.request("agent/run", params),
+        (error: unknown) => error instanceof RpcFault && error.code === -32602,
+      );
+    }
+    await assert.rejects(client.request("agent/cancel", { extra: true }),
+      (error: unknown) => error instanceof RpcFault && error.code === -32602);
+
+    const running = client.request("agent/run", { sessionId: f.sessionId, prompt: "go" });
+    await providerEntered;
+    await assert.rejects(client.request("agent/run", { sessionId: f.sessionId, prompt: "second" }),
+      (error: unknown) => error instanceof RpcFault && error.code === -32001 && error.message === "Agent is busy");
+    assert.deepEqual(await client.request("agent/cancel", {}), { signalled: true });
+    await assert.rejects(running,
+      (error: unknown) => error instanceof RpcFault && error.code === -32005 && error.message === "Agent run cancelled");
+    assert.deepEqual(await client.request("agent/cancel", {}), { signalled: false });
+  } finally {
+    client.close();
+    server.close();
+    f.connection.close();
+  }
+});
+
+test("agent RPC maps persisted incomplete tool history to history-integrity without calling the provider", async () => {
+  const f = await fixture("rpc-history");
+  f.store.insertAssistantMessageWithToolCalls({
+    sessionId: f.sessionId,
+    payload: { text: "orphan pending", phase: "execute" },
+    toolCalls: [{ callId: "pending-before-run", ordinal: 0, toolName: "alpha", inputText: "{}" }],
+  });
+  f.connection.db.prepare(`
+    UPDATE tool_calls
+    SET status = 'failure', result_json = NULL, finished_at = '2026-09-01T01:02:03.000Z'
+    WHERE call_id = 'pending-before-run'
+  `).run();
+  let providerCalls = 0;
+  const agent = new AgentOrchestrator({
+    store: f.store,
+    provider: { async stream() { providerCalls += 1; return response("must not run"); } },
+    tools: new ToolRegistry(),
+    permissionClient: allowPermission,
+    workspace: f.workspace,
+    contextLimit: 32_768,
+    maxOutputTokens: 4_096,
+  });
+  const { client, server } = connectedPeers();
+  registerCoreHandlers(server, {
+    store: f.store,
+    configService: new ModelConfigService({ env: { AWACODE_DATA_DIR: join(f.workspace.rootPath, "config") } }),
+    agent,
+  });
+
+  try {
+    await assert.rejects(client.request("agent/run", { sessionId: f.sessionId, prompt: "resume" }),
+      (error: unknown) => error instanceof RpcFault
+        && error.code === -32004
+        && error.message === "Session history is incomplete");
+    assert.equal(providerCalls, 0);
+    assert.equal(f.store.loadSession(f.sessionId).session.status, "error");
+  } finally {
+    client.close();
+    server.close();
+    f.connection.close();
+  }
+});

@@ -70,6 +70,25 @@ export interface LoadedSession {
   toolCalls: ToolCallRecord[];
 }
 
+export interface ContextSnapshotRecord {
+  sessionId: string;
+  baseline: string;
+  sourceSnapshot: unknown;
+  baselineSeq: number;
+  summary: string | null;
+  summaryUptoSeq: number;
+  updatedAt: string;
+}
+
+export interface SaveContextSnapshotInput {
+  sessionId: string;
+  baseline: string;
+  sourceSnapshot: unknown;
+  baselineSeq: number;
+  summary: string | null;
+  summaryUptoSeq: number;
+}
+
 export interface InsertMessageInput {
   sessionId: string;
   role: MessageRole;
@@ -94,6 +113,25 @@ export interface InsertAssistantMessageWithToolCallsInput {
 export interface InsertedAssistantToolCallBlock {
   message: MessageRecord;
   toolCalls: ToolCallRecord[];
+}
+
+export interface CreateStreamingAssistantMessageInput {
+  sessionId: string;
+  kind: string;
+  payload: unknown;
+}
+
+export interface FinalizeStreamingAssistantMessageInput {
+  messageId: string;
+  role?: "assistant" | "internal";
+  kind: string;
+  payload: unknown;
+}
+
+export interface FinalizeStreamingAssistantWithToolCallsInput {
+  messageId: string;
+  payload: unknown;
+  toolCalls: readonly PendingToolCallInput[];
 }
 
 export interface CompareAndSwapToolCallInput {
@@ -198,6 +236,18 @@ function toolCallRecord(row: Record<string, unknown>): ToolCallRecord {
     createdAt: String(row.created_at),
     startedAt: row.started_at === null ? null : String(row.started_at),
     finishedAt: row.finished_at === null ? null : String(row.finished_at),
+  };
+}
+
+function contextSnapshotRecord(row: Record<string, unknown>): ContextSnapshotRecord {
+  return {
+    sessionId: String(row.session_id),
+    baseline: String(row.baseline),
+    sourceSnapshot: parseJson(String(row.source_snapshot_json)),
+    baselineSeq: Number(row.baseline_seq),
+    summary: row.summary === null ? null : String(row.summary),
+    summaryUptoSeq: Number(row.summary_upto_seq),
+    updatedAt: String(row.updated_at),
   };
 }
 
@@ -382,8 +432,189 @@ export class SessionStore {
     }
   }
 
+  setSessionStatus(sessionId: string, status: SessionStatus): SessionRecord {
+    const now = this.currentDate().toISOString();
+    const updated = this.db.prepare(`
+      UPDATE sessions SET status = ?, updated_at = ? WHERE id = ?
+    `).run(status, now, sessionId);
+    if (updated.changes !== 1) {
+      throw new StoreNotFoundError("session", sessionId);
+    }
+    return this.getSession(sessionId);
+  }
+
+  createStreamingAssistantMessage(input: CreateStreamingAssistantMessageInput): MessageRecord {
+    return this.insertMessage({
+      sessionId: input.sessionId,
+      role: "assistant",
+      kind: input.kind,
+      payload: input.payload,
+      status: "streaming",
+    });
+  }
+
+  finalizeStreamingAssistantMessage(input: FinalizeStreamingAssistantMessageInput): MessageRecord {
+    const now = this.currentDate().toISOString();
+    const updated = this.db.prepare(`
+      UPDATE messages
+      SET role = ?, kind = ?, payload_json = ?, status = 'complete', updated_at = ?
+      WHERE id = ? AND role = 'assistant' AND status = 'streaming'
+    `).run(input.role ?? "assistant", input.kind, stringifyJson(input.payload), now, input.messageId);
+    if (updated.changes !== 1) {
+      throw new StoreNotFoundError("session", input.messageId);
+    }
+    return this.getMessage(input.messageId);
+  }
+
+  finalizeStreamingAssistantWithToolCalls(
+    input: FinalizeStreamingAssistantWithToolCallsInput,
+  ): InsertedAssistantToolCallBlock {
+    if (input.toolCalls.length === 0) {
+      throw new TypeError("an atomic assistant tool-call block requires at least one tool call");
+    }
+    const now = this.currentDate().toISOString();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const updated = this.db.prepare(`
+        UPDATE messages
+        SET kind = 'tool_calls', payload_json = ?, status = 'complete', updated_at = ?
+        WHERE id = ? AND role = 'assistant' AND status = 'streaming'
+      `).run(stringifyJson(input.payload), now, input.messageId);
+      if (updated.changes !== 1) {
+        throw new StoreNotFoundError("session", input.messageId);
+      }
+      const message = this.getMessage(input.messageId);
+      const insertCall = this.db.prepare(`
+        INSERT INTO tool_calls
+          (call_id, session_id, assistant_message_id, ordinal, tool_name, input_text, status,
+           result_json, error_text, created_at, started_at, finished_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, NULL, NULL)
+      `);
+      for (const [index, call] of input.toolCalls.entries()) {
+        if (!Number.isSafeInteger(call.ordinal) || call.ordinal !== index) {
+          throw new RangeError("tool-call ordinals must be unique and zero-based in array order");
+        }
+        insertCall.run(
+          call.callId,
+          message.sessionId,
+          message.id,
+          call.ordinal,
+          call.toolName,
+          call.inputText,
+          now,
+        );
+      }
+      this.db.exec("COMMIT");
+      return {
+        message: this.getMessage(input.messageId),
+        toolCalls: input.toolCalls.map((call) => this.getToolCall(call.callId)),
+      };
+    } catch (error) {
+      this.rollback();
+      throw error;
+    }
+  }
+
+  interruptStreamingAssistantMessage(messageId: string): MessageRecord {
+    const now = this.currentDate().toISOString();
+    this.db.prepare(`
+      UPDATE messages SET status = 'interrupted', updated_at = ?
+      WHERE id = ? AND role = 'assistant' AND status = 'streaming'
+    `).run(now, messageId);
+    return this.getMessage(messageId);
+  }
+
+  interruptSessionState(sessionId: string): Omit<RecoverySummary, "sessionsInterrupted"> {
+    const now = this.currentDate().toISOString();
+    const recovery = createToolCallRecoveryRecords();
+    const notStartedJson = stringifyTerminalToolCallResult(recovery.notStarted.result);
+    const outcomeUnknownJson = stringifyTerminalToolCallResult(recovery.outcomeUnknown.result);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.requireSession(sessionId);
+      const messagesInterrupted = Number(this.db.prepare(`
+        UPDATE messages
+        SET status = 'interrupted', updated_at = ?
+        WHERE session_id = ? AND role = 'assistant' AND status = 'streaming'
+      `).run(now, sessionId).changes);
+      const notStartedCallsInterrupted = Number(this.db.prepare(`
+        UPDATE tool_calls
+        SET status = 'interrupted', result_json = ?, error_text = ?, finished_at = ?
+        WHERE session_id = ? AND status IN ('pending', 'awaiting_approval')
+      `).run(notStartedJson, recovery.notStarted.errorText, now, sessionId).changes);
+      const outcomeUnknownCallsInterrupted = Number(this.db.prepare(`
+        UPDATE tool_calls
+        SET status = 'interrupted', result_json = ?, error_text = ?, finished_at = ?
+        WHERE session_id = ? AND status = 'running'
+      `).run(outcomeUnknownJson, recovery.outcomeUnknown.errorText, now, sessionId).changes);
+      this.db.exec("COMMIT");
+      return {
+        interruptedCount: notStartedCallsInterrupted + outcomeUnknownCallsInterrupted,
+        messagesInterrupted,
+        notStartedCallsInterrupted,
+        outcomeUnknownCallsInterrupted,
+      };
+    } catch (error) {
+      this.rollback();
+      throw error;
+    }
+  }
+
   loadToolCall(callId: string): ToolCallRecord {
     return this.getToolCall(callId);
+  }
+
+  loadContextSnapshot(sessionId: string): ContextSnapshotRecord | null {
+    this.requireSession(sessionId);
+    const row = this.db.prepare(`
+      SELECT session_id, baseline, source_snapshot_json, baseline_seq, summary,
+             summary_upto_seq, updated_at
+      FROM context_snapshots
+      WHERE session_id = ?
+    `).get(sessionId) as Record<string, unknown> | undefined;
+    return row === undefined ? null : contextSnapshotRecord(row);
+  }
+
+  saveContextSnapshot(input: SaveContextSnapshotInput): ContextSnapshotRecord {
+    if (
+      !Number.isSafeInteger(input.baselineSeq)
+      || input.baselineSeq < 0
+      || !Number.isSafeInteger(input.summaryUptoSeq)
+      || input.summaryUptoSeq < 0
+    ) {
+      throw new RangeError("context snapshot sequence values must be nonnegative safe integers");
+    }
+    const now = this.currentDate().toISOString();
+    const sourceSnapshotJson = stringifyJson(input.sourceSnapshot);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.requireSession(input.sessionId);
+      this.db.prepare(`
+        INSERT INTO context_snapshots
+          (session_id, baseline, source_snapshot_json, baseline_seq, summary, summary_upto_seq, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(session_id) DO UPDATE SET
+          baseline = excluded.baseline,
+          source_snapshot_json = excluded.source_snapshot_json,
+          baseline_seq = excluded.baseline_seq,
+          summary = excluded.summary,
+          summary_upto_seq = excluded.summary_upto_seq,
+          updated_at = excluded.updated_at
+      `).run(
+        input.sessionId,
+        input.baseline,
+        sourceSnapshotJson,
+        input.baselineSeq,
+        input.summary,
+        input.summaryUptoSeq,
+        now,
+      );
+      this.db.exec("COMMIT");
+      return this.loadContextSnapshot(input.sessionId) as ContextSnapshotRecord;
+    } catch (error) {
+      this.rollback();
+      throw error;
+    }
   }
 
   compareAndSwapToolCall(input: CompareAndSwapToolCallInput): CompareAndSwapToolCallResult {
