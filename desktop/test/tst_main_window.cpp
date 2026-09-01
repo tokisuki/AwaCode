@@ -24,6 +24,10 @@ private slots:
   void manualSessionCreationDoesNotDispatchTheOldPrompt();
   void reloadMarksRejectedCandidates();
   void liveRejectReplacesTheProvisionalMarker();
+  void newestSessionLoadWinsWithinOneWorkspaceEpoch();
+  void newestSessionListWinsWithinOneWorkspaceEpoch();
+  void helloSurvivesWorkspaceSelectionOnTheSameConnection();
+  void newestCreateIntentWinsWithinOneWorkspaceEpoch();
 };
 
 void MainWindowTest::disablesRunUntilConfigured() {
@@ -68,6 +72,69 @@ void MainWindowTest::manualSessionCreationDoesNotDispatchTheOldPrompt() {
   window.receiveResponseForEpoch("session/create", QJsonObject{{"id", "manual"}, {"title", "Manual"}, {"status", "idle"}}, epoch);
   QVERIFY(!window.transcriptText().contains(QStringLiteral("You: must stay pending")));
   QCOMPARE(taskInput->toPlainText(), QStringLiteral("must stay pending"));
+}
+
+void MainWindowTest::newestSessionLoadWinsWithinOneWorkspaceEpoch() {
+  MainWindow window;
+  const quint64 epoch = window.beginWorkspaceSelection(QStringLiteral("C:/work"));
+  const quint64 loadA = window.beginRequestGeneration(QStringLiteral("session/load"), QStringLiteral("A"));
+  const quint64 loadB = window.beginRequestGeneration(QStringLiteral("session/load"), QStringLiteral("B"));
+  window.receiveResponseForGeneration("session/load", QJsonObject{{"messages", QJsonArray{
+    QJsonObject{{"role", "assistant"}, {"payload", QJsonObject{{"text", "from B"}}}},
+  }}}, epoch, loadB, QStringLiteral("B"));
+  window.receiveResponseForGeneration("session/load", QJsonObject{{"messages", QJsonArray{
+    QJsonObject{{"role", "assistant"}, {"payload", QJsonObject{{"text", "stale A"}}}},
+  }}}, epoch, loadA, QStringLiteral("A"));
+  QVERIFY(window.transcriptText().contains(QStringLiteral("from B")));
+  QVERIFY(!window.transcriptText().contains(QStringLiteral("stale A")));
+}
+
+void MainWindowTest::newestSessionListWinsWithinOneWorkspaceEpoch() {
+  MainWindow window;
+  const quint64 epoch = window.beginWorkspaceSelection(QStringLiteral("C:/work"));
+  const quint64 first = window.beginRequestGeneration(QStringLiteral("session/list"), QStringLiteral("p"));
+  const quint64 second = window.beginRequestGeneration(QStringLiteral("session/list"), QStringLiteral("p"));
+  window.receiveResponseForGeneration("session/list", QJsonArray{
+    QJsonObject{{"id", "new"}, {"title", "Newest"}, {"status", "idle"}},
+  }, epoch, second, QStringLiteral("p"));
+  window.receiveResponseForGeneration("session/list", QJsonArray{
+    QJsonObject{{"id", "old"}, {"title", "Stale"}, {"status", "idle"}},
+  }, epoch, first, QStringLiteral("p"));
+  auto *view = window.findChild<QListView *>(QStringLiteral("sessionList"));
+  QCOMPARE(view->model()->rowCount(), 1);
+  QCOMPARE(view->model()->index(0, 0).data().toString(), QStringLiteral("Newest"));
+}
+
+void MainWindowTest::helloSurvivesWorkspaceSelectionOnTheSameConnection() {
+  MainWindow window;
+  window.coreCrashed(19);
+  QVERIFY(!window.findChild<QPushButton *>(QStringLiteral("chooseWorkspace"))->isEnabled());
+  const quint64 helloGeneration = window.beginRequestGeneration(QStringLiteral("core/hello"));
+  const quint64 epoch = window.beginWorkspaceSelection(QStringLiteral("C:/new"));
+  window.receiveResponseForGeneration("core/hello",
+    QJsonObject{{"configured", true}, {"model", "demo"}}, epoch - 1, helloGeneration);
+  QVERIFY(window.findChild<QPushButton *>(QStringLiteral("chooseWorkspace"))->isEnabled());
+  QVERIFY(!window.runButton()->isEnabled());
+}
+
+void MainWindowTest::newestCreateIntentWinsWithinOneWorkspaceEpoch() {
+  MainWindow window;
+  window.setConfigured(true);
+  const quint64 epoch = window.beginWorkspaceSelection(QStringLiteral("C:/work"));
+  auto *taskInput = window.findChild<QPlainTextEdit *>(QStringLiteral("taskInput"));
+  taskInput->setPlainText(QStringLiteral("old run prompt"));
+  const quint64 runCreate = window.beginRequestGeneration(QStringLiteral("session/create"), QStringLiteral("p"));
+  const quint64 manualCreate = window.beginRequestGeneration(QStringLiteral("session/create"), QStringLiteral("p"));
+  window.receiveResponseForGeneration("session/create",
+    QJsonObject{{"id", "run-session"}, {"title", "Run"}, {"status", "idle"}},
+    epoch, runCreate, QStringLiteral("p"), true, QStringLiteral("old run prompt"));
+  QCOMPARE(taskInput->toPlainText(), QStringLiteral("old run prompt"));
+  QVERIFY(!window.transcriptText().contains(QStringLiteral("You: old run prompt")));
+  window.receiveResponseForGeneration("session/create",
+    QJsonObject{{"id", "manual"}, {"title", "Manual"}, {"status", "idle"}},
+    epoch, manualCreate, QStringLiteral("p"), false);
+  QCOMPARE(taskInput->toPlainText(), QStringLiteral("old run prompt"));
+  QVERIFY(!window.transcriptText().contains(QStringLiteral("You: old run prompt")));
 }
 
 void MainWindowTest::reloadMarksRejectedCandidates() {

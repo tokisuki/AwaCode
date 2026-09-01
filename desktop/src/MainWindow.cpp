@@ -105,6 +105,7 @@ MainWindow::MainWindow(AgentProcessManager *manager, QWidget *parent) : QMainWin
     connect(manager_, &AgentProcessManager::crashed, this, &MainWindow::coreCrashed);
     connect(manager_, &AgentProcessManager::stopped, this, &MainWindow::coreStopped);
     connect(manager_, &AgentProcessManager::started, this, [this] {
+      ++connectionGeneration_;
       coreAlive_ = false;
       running_ = false;
       dispatchPending_ = false;
@@ -197,7 +198,10 @@ void MainWindow::chooseWorkspace() {
 
 quint64 MainWindow::beginWorkspaceSelection(const QString &workspace) {
   ++workspaceEpoch_;
-  pendingRequests_.clear();
+  for (auto it = pendingRequests_.begin(); it != pendingRequests_.end();) {
+    if (it->method != QStringLiteral("core/hello")) it = pendingRequests_.erase(it);
+    else ++it;
+  }
   currentRunRequestId_.clear();
   dispatchPending_ = false;
   running_ = false;
@@ -215,8 +219,11 @@ quint64 MainWindow::beginWorkspaceSelection(const QString &workspace) {
 }
 
 void MainWindow::createSession() {
-  if (projectId_.isEmpty()) return;
-  sendRequest(QStringLiteral("session/create"), {{"projectId", projectId_}}, RequestIntent::ManualSessionCreate);
+  if (projectId_.isEmpty() || dispatchPending_ || running_ || !coreAlive_) return;
+  dispatchPending_ = true;
+  const QString id = sendRequest(QStringLiteral("session/create"), {{"projectId", projectId_}}, RequestIntent::ManualSessionCreate);
+  if (id.isEmpty()) dispatchPending_ = false;
+  updateControls();
 }
 
 void MainWindow::runTask() {
@@ -260,7 +267,7 @@ void MainWindow::flushBufferedText() {
 
 void MainWindow::handleResponse(const QString &id, const QJsonValue &result) {
   const PendingRequest pending = pendingRequests_.take(id);
-  if (pending.method.isEmpty() || pending.epoch != workspaceEpoch_) return;
+  if (pending.method.isEmpty() || !isCurrentRequest(pending)) return;
   processResponse(pending.method, result, pending.intent, pending.prompt);
 }
 
@@ -271,6 +278,44 @@ void MainWindow::receiveResponse(const QString &method, const QJsonValue &result
 void MainWindow::receiveResponseForEpoch(const QString &method, const QJsonValue &result, quint64 epoch) {
   if (epoch != workspaceEpoch_) return;
   processResponse(method, result, RequestIntent::ManualSessionCreate, {});
+}
+
+quint64 MainWindow::beginRequestGeneration(const QString &method, const QString &target) {
+  if (method == QStringLiteral("session/list")) {
+    sessionListTarget_ = target;
+    return ++sessionListGeneration_;
+  }
+  if (method == QStringLiteral("session/load")) {
+    sessionLoadTarget_ = target;
+    return ++sessionLoadGeneration_;
+  }
+  if (method == QStringLiteral("session/create")) {
+    sessionCreateTarget_ = target;
+    return ++sessionCreateGeneration_;
+  }
+  return method == QStringLiteral("core/hello") ? connectionGeneration_ : 0;
+}
+
+void MainWindow::receiveResponseForGeneration(const QString &method, const QJsonValue &result, quint64 epoch,
+                                               quint64 generation, const QString &target,
+                                               bool createForRun, const QString &prompt) {
+  const PendingRequest pending{method, epoch, connectionGeneration_, generation, target,
+    createForRun ? RequestIntent::CreateForRun : RequestIntent::ManualSessionCreate, prompt};
+  if (!isCurrentRequest(pending)) return;
+  processResponse(method, result, pending.intent, pending.prompt);
+}
+
+bool MainWindow::isCurrentRequest(const PendingRequest &pending) const {
+  if (pending.connectionGeneration != connectionGeneration_) return false;
+  if (pending.method == QStringLiteral("core/hello")) return true;
+  if (pending.epoch != workspaceEpoch_) return false;
+  if (pending.method == QStringLiteral("session/list"))
+    return pending.generation == sessionListGeneration_ && pending.target == sessionListTarget_;
+  if (pending.method == QStringLiteral("session/load"))
+    return pending.generation == sessionLoadGeneration_ && pending.target == sessionLoadTarget_;
+  if (pending.method == QStringLiteral("session/create"))
+    return pending.generation == sessionCreateGeneration_ && pending.target == sessionCreateTarget_;
+  return true;
 }
 
 void MainWindow::processResponse(const QString &method, const QJsonValue &result, RequestIntent intent, const QString &prompt) {
@@ -327,7 +372,7 @@ void MainWindow::processResponse(const QString &method, const QJsonValue &result
 
 void MainWindow::handleResponseError(const QString &id, const QJsonObject &error) {
   const PendingRequest pending = pendingRequests_.take(id);
-  if (pending.method.isEmpty() || pending.epoch != workspaceEpoch_) return;
+  if (pending.method.isEmpty() || !isCurrentRequest(pending)) return;
   dispatchPending_ = false;
   receiveError(pending.method, error);
 }
@@ -356,24 +401,26 @@ void MainWindow::showSettings() {
 
 QString MainWindow::sendRequest(const QString &method, const QJsonObject &params, RequestIntent intent, const QString &prompt) {
   if (manager_ == nullptr || !manager_->isRunning()) return {};
+  QString target;
+  if (method == QStringLiteral("session/list") || method == QStringLiteral("session/create"))
+    target = params.value(QStringLiteral("projectId")).toString();
+  else if (method == QStringLiteral("session/load"))
+    target = params.value(QStringLiteral("sessionId")).toString();
+  const quint64 generation = beginRequestGeneration(method, target);
   const QString id = manager_->request(method, params);
-  if (!id.isEmpty()) pendingRequests_.insert(id, {method, workspaceEpoch_, intent, prompt});
+  if (!id.isEmpty()) pendingRequests_.insert(id, {
+    method, workspaceEpoch_, connectionGeneration_, generation, target, intent, prompt,
+  });
   return id;
 }
 
 void MainWindow::setRunning(bool running) {
   running_ = running;
   updateControls();
-  cancel_->setEnabled(running_);
-  workspaceField_->setEnabled(!running_);
-  chooseWorkspace_->setEnabled(!running_);
-  newSession_->setEnabled(!running_);
-  sessionView_->setEnabled(!running_);
-  settingsButton_->setEnabled(!running_);
-  taskInput_->setEnabled(!running_);
 }
 
 void MainWindow::invalidateCoreState() {
+  ++connectionGeneration_;
   ++workspaceEpoch_;
   coreAlive_ = false;
   running_ = false;
@@ -387,9 +434,15 @@ void MainWindow::invalidateCoreState() {
 }
 
 void MainWindow::updateControls() {
-  const bool idle = !running_ && !dispatchPending_;
-  run_->setEnabled(coreAlive_ && configured_ && idle && !projectId_.isEmpty());
+  const bool idle = coreAlive_ && !running_ && !dispatchPending_;
+  run_->setEnabled(configured_ && idle && !projectId_.isEmpty());
   cancel_->setEnabled(coreAlive_ && running_);
+  workspaceField_->setEnabled(idle);
+  chooseWorkspace_->setEnabled(idle);
+  newSession_->setEnabled(idle && !projectId_.isEmpty());
+  sessionView_->setEnabled(idle && !projectId_.isEmpty());
+  settingsButton_->setEnabled(idle);
+  taskInput_->setEnabled(idle);
 }
 
 void MainWindow::appendTranscript(const QString &text) {
@@ -422,9 +475,7 @@ void MainWindow::loadSession(const QString &sessionId) { sendRequest(QStringLite
 
 void MainWindow::handleApproval(const QString &id, const QJsonObject &params) {
   tools_.markApproval(params.value("callId").toString(), QStringLiteral("awaiting approval"));
-  QJsonObject display = params;
-  display.insert(QStringLiteral("workspace"), workspace_);
-  ApprovalDialog dialog(display, this);
+  ApprovalDialog dialog(params, this);
   dialog.exec();
   if (manager_ != nullptr) manager_->replyToApproval(id, dialog.decision());
 }

@@ -30,6 +30,10 @@ public:
   void receiveNotification(const QString &method, const QJsonObject &params);
   void receiveResponse(const QString &method, const QJsonValue &result);
   void receiveResponseForEpoch(const QString &method, const QJsonValue &result, quint64 epoch);
+  quint64 beginRequestGeneration(const QString &method, const QString &target = {});
+  void receiveResponseForGeneration(const QString &method, const QJsonValue &result, quint64 epoch,
+                                    quint64 generation, const QString &target = {},
+                                    bool createForRun = false, const QString &prompt = {});
   quint64 beginWorkspaceSelection(const QString &workspace);
   void receiveError(const QString &method, const QJsonObject &error);
   void coreCrashed(int exitCode);
@@ -53,6 +57,9 @@ private:
   struct PendingRequest {
     QString method;
     quint64 epoch = 0;
+    quint64 connectionGeneration = 0;
+    quint64 generation = 0;
+    QString target;
     RequestIntent intent = RequestIntent::Normal;
     QString prompt;
   };
@@ -60,6 +67,7 @@ private:
   QString sendRequest(const QString &method, const QJsonObject &params = {},
                       RequestIntent intent = RequestIntent::Normal, const QString &prompt = {});
   void processResponse(const QString &method, const QJsonValue &result, RequestIntent intent, const QString &prompt);
+  bool isCurrentRequest(const PendingRequest &pending) const;
   void dispatchRun(const QString &prompt);
   void invalidateCoreState();
   void updateControls();
@@ -84,6 +92,13 @@ private:
   bool running_ = false;
   bool dispatchPending_ = false;
   quint64 workspaceEpoch_ = 0;
+  quint64 connectionGeneration_ = 1;
+  quint64 sessionListGeneration_ = 0;
+  quint64 sessionLoadGeneration_ = 0;
+  quint64 sessionCreateGeneration_ = 0;
+  QString sessionListTarget_;
+  QString sessionLoadTarget_;
+  QString sessionCreateTarget_;
   QString workspace_;
   QString projectId_;
   QString sessionId_;
