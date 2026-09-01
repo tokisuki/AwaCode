@@ -1,10 +1,14 @@
 import {
+  type ChildProcessByStdio,
   execFile,
   spawn,
   type ChildProcessWithoutNullStreams,
   type SpawnOptionsWithoutStdio,
 } from "node:child_process";
+import type { Readable } from "node:stream";
 import { resolve } from "node:path";
+
+type ChildWithoutStdin = ChildProcessByStdio<null, Readable, Readable>;
 
 export interface ChildLineReader {
   nextLine(timeoutMs?: number): Promise<string>;
@@ -32,7 +36,9 @@ export interface ChildTerminationOptions {
   forceTimeoutMs?: number;
 }
 
-export function childLineReader(child: ChildProcessWithoutNullStreams): ChildLineReader {
+export function childLineReader(
+  child: ChildProcessWithoutNullStreams | ChildWithoutStdin,
+): ChildLineReader {
   const lines: string[] = [];
   const waiters: Array<{
     resolve(line: string): void;
@@ -130,7 +136,7 @@ export function childLineReader(child: ChildProcessWithoutNullStreams): ChildLin
 }
 
 export function createChildChannel(
-  child: ChildProcessWithoutNullStreams,
+  child: ChildProcessWithoutNullStreams | ChildWithoutStdin,
   options: ChildChannelOptions = {},
 ): ChildChannel {
   const lines = childLineReader(child);
@@ -159,7 +165,7 @@ export function createChildChannel(
   child.on("error", onError);
 
   return {
-    child,
+    child: child as ChildProcessWithoutNullStreams,
     lines,
     exited,
     closed: closePromise,
@@ -266,9 +272,9 @@ function requestTermination(
     return Promise.resolve();
   }
   if (process.platform === "win32") {
-    return windowsTaskkill(pid, force, timeoutMs).then((treeTerminated) => {
+    return windowsTaskkill(pid, true, timeoutMs).then((treeTerminated) => {
       if (!treeTerminated && !channel.isClosed()) {
-        channel.child.kill(force ? "SIGKILL" : "SIGTERM");
+        channel.child.kill("SIGKILL");
       }
     });
   }
@@ -332,7 +338,7 @@ export async function disposeChildChannel(
   } finally {
     const cleanupActions = [
       () => channel.disposeListeners(),
-      () => channel.child.stdin.destroy(),
+      () => channel.child.stdin?.destroy(),
       () => channel.child.stdout.destroy(),
       () => channel.child.stderr.destroy(),
     ];

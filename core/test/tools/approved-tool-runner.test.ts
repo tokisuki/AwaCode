@@ -139,7 +139,10 @@ test("persists pending to awaiting_approval to running to success around one app
     ]);
     assert.equal(requests.length, 1);
     assert.equal(requests[0]?.callId, setup.callId);
-    assert.equal(requests[0]?.preview.path, "sample.txt");
+    assert.equal(requests[0]?.kind, "write");
+    if (requests[0]?.kind === "write") {
+      assert.equal(requests[0].preview.path, "sample.txt");
+    }
     assert.equal(await readFile(targetPath, "utf8"), "before new after");
     const stored = setup.store.loadToolCall(setup.callId);
     assert.equal(stored.status, "success");
@@ -220,7 +223,10 @@ test("approves and executes the persisted input rather than independent caller i
 
     assert.equal(result.status, "success");
     assert.equal(requests.length, 1);
-    assert.equal(requests[0]?.preview.after, "persisted");
+    assert.equal(requests[0]?.kind, "write");
+    if (requests[0]?.kind === "write") {
+      assert.equal(requests[0].preview.after, "persisted");
+    }
     assert.equal(await readFile(targetPath, "utf8"), "before persisted after");
     assert.deepEqual(setup.store.loadToolCall(setup.callId).result, result);
   } finally {

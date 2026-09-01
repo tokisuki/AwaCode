@@ -13,7 +13,7 @@ import {
 } from "./contracts.ts";
 import { ApprovedToolBindingError, runApprovedTool } from "./approved-tool-runner.ts";
 import type { ApprovalInterruptionCode } from "./approved-tool-runner.ts";
-import { PERMISSION_TEXT_PREVIEW_BYTES, type PermissionRequest } from "./permission.ts";
+import { PERMISSION_TEXT_PREVIEW_BYTES, type WritePermissionRequest } from "./permission.ts";
 import type { PermissionClient } from "./permission.ts";
 import type { SessionStore } from "../persistence/session-store.ts";
 import { truncateUtf8Output } from "./truncate.ts";
@@ -53,7 +53,7 @@ export interface PreparedEditFile {
   readonly digest: string;
   readonly identity: EditFileIdentity;
   readonly mode: number;
-  readonly permission: Omit<PermissionRequest, "callId">;
+  readonly permission: Omit<WritePermissionRequest, "callId">;
 }
 
 export interface AppliedEditFile {

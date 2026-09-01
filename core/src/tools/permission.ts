@@ -4,11 +4,12 @@ import { JsonRpcPeer } from "../protocol/rpc-peer.ts";
 
 export const DEFAULT_PERMISSION_TIMEOUT_MS = 10 * 60 * 1_000;
 export const PERMISSION_TEXT_PREVIEW_BYTES = 4 * 1024;
+export const COMMAND_PERMISSION_WARNING = "This command runs with current-user permissions and may access paths outside the workspace.";
 
 export type PermissionKind = "write" | "command";
 export type PermissionDecision = "allow_once" | "deny";
 
-export interface PermissionPreview {
+export interface WritePermissionPreview {
   path: string;
   replacementCount: number;
   before: string;
@@ -16,12 +17,31 @@ export interface PermissionPreview {
   sha256: string;
 }
 
-export interface PermissionRequest {
-  callId: string;
-  kind: PermissionKind;
-  title: string;
-  preview: PermissionPreview;
+export interface CommandPermissionPreview {
+  command: string;
+  cwd: string;
+  timeoutMs: number;
+  warning: string;
 }
+
+export interface WritePermissionRequest {
+  callId: string;
+  kind: "write";
+  title: string;
+  preview: WritePermissionPreview;
+}
+
+export interface CommandPermissionRequest {
+  callId: string;
+  kind: "command";
+  title: string;
+  preview: CommandPermissionPreview;
+}
+
+export type PermissionRequest = WritePermissionRequest | CommandPermissionRequest;
+export type PermissionRequestWithoutCallId =
+  | Omit<WritePermissionRequest, "callId">
+  | Omit<CommandPermissionRequest, "callId">;
 
 export interface PermissionRequestOptions {
   signal?: AbortSignal;
@@ -81,7 +101,10 @@ function exactDataObject(value: unknown, keys: readonly string[]): Record<string
   return value as Record<string, unknown>;
 }
 
-function safeRelativeDisplayPath(value: string): boolean {
+function safeRelativeDisplayPath(value: string, allowRoot = false): boolean {
+  if (allowRoot && value === ".") {
+    return true;
+  }
   const components = value.split("/");
   return value.length > 0
     && value.length <= 4_096
@@ -94,10 +117,8 @@ function safeRelativeDisplayPath(value: string): boolean {
 
 function validatedPermissionRequest(value: PermissionRequest): PermissionRequest {
   const input = exactDataObject(value, ["callId", "kind", "title", "preview"]);
-  const preview = exactDataObject(input?.preview, ["path", "replacementCount", "before", "after", "sha256"]);
   if (
     input === undefined
-    || preview === undefined
     || typeof input.callId !== "string"
     || input.callId.trim().length === 0
     || (input.kind !== "write" && input.kind !== "command")
@@ -105,30 +126,66 @@ function validatedPermissionRequest(value: PermissionRequest): PermissionRequest
     || input.title.trim().length === 0
     || input.title.length > 160
     || /[\r\n\u0000-\u001f\u007f]/.test(input.title)
-    || typeof preview.path !== "string"
-    || !safeRelativeDisplayPath(preview.path)
-    || typeof preview.replacementCount !== "number"
-    || !Number.isSafeInteger(preview.replacementCount)
-    || preview.replacementCount < 1
-    || typeof preview.before !== "string"
-    || Buffer.byteLength(preview.before) > PERMISSION_TEXT_PREVIEW_BYTES
-    || typeof preview.after !== "string"
-    || Buffer.byteLength(preview.after) > PERMISSION_TEXT_PREVIEW_BYTES
-    || typeof preview.sha256 !== "string"
-    || !/^[a-f0-9]{64}$/.test(preview.sha256)
+  ) {
+    throw new PermissionProtocolError();
+  }
+  if (input.kind === "write") {
+    const preview = exactDataObject(input.preview, ["path", "replacementCount", "before", "after", "sha256"]);
+    if (
+      preview === undefined
+      || typeof preview.path !== "string"
+      || !safeRelativeDisplayPath(preview.path)
+      || typeof preview.replacementCount !== "number"
+      || !Number.isSafeInteger(preview.replacementCount)
+      || preview.replacementCount < 1
+      || typeof preview.before !== "string"
+      || Buffer.byteLength(preview.before) > PERMISSION_TEXT_PREVIEW_BYTES
+      || typeof preview.after !== "string"
+      || Buffer.byteLength(preview.after) > PERMISSION_TEXT_PREVIEW_BYTES
+      || typeof preview.sha256 !== "string"
+      || !/^[a-f0-9]{64}$/.test(preview.sha256)
+    ) {
+      throw new PermissionProtocolError();
+    }
+    return {
+      callId: input.callId,
+      kind: "write",
+      title: input.title,
+      preview: {
+        path: preview.path,
+        replacementCount: preview.replacementCount,
+        before: preview.before,
+        after: preview.after,
+        sha256: preview.sha256,
+      },
+    };
+  }
+  const preview = exactDataObject(input.preview, ["command", "cwd", "timeoutMs", "warning"]);
+  if (
+    preview === undefined
+    || typeof preview.command !== "string"
+    || preview.command.trim().length === 0
+    || preview.command.includes("\0")
+    || Buffer.byteLength(preview.command) > 16 * 1024
+    || typeof preview.cwd !== "string"
+    || !safeRelativeDisplayPath(preview.cwd, true)
+    || typeof preview.timeoutMs !== "number"
+    || !Number.isSafeInteger(preview.timeoutMs)
+    || preview.timeoutMs < 1
+    || preview.timeoutMs > 180_000
+    || preview.warning !== COMMAND_PERMISSION_WARNING
   ) {
     throw new PermissionProtocolError();
   }
   return {
     callId: input.callId,
-    kind: input.kind,
+    kind: "command",
     title: input.title,
     preview: {
-      path: preview.path,
-      replacementCount: preview.replacementCount,
-      before: preview.before,
-      after: preview.after,
-      sha256: preview.sha256,
+      command: preview.command,
+      cwd: preview.cwd,
+      timeoutMs: preview.timeoutMs,
+      warning: COMMAND_PERMISSION_WARNING,
     },
   };
 }

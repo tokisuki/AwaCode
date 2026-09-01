@@ -69,6 +69,12 @@ export function assertExactPlainObject(
   if (ownKeys.some((key) => typeof key !== "string" || !allowed.has(key))) {
     throw new ToolValidationError();
   }
+  for (const key of ownKeys) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !descriptor.enumerable || !("value" in descriptor)) {
+      throw new ToolValidationError();
+    }
+  }
   if (requiredKeys.some((key) => !Object.hasOwn(value, key))) {
     throw new ToolValidationError();
   }

@@ -9,6 +9,7 @@ import {
   PermissionProtocolError,
   PermissionTimeoutError,
   type PermissionTimer,
+  type CommandPermissionRequest,
   type PermissionRequest,
 } from "../../src/tools/permission.ts";
 
@@ -230,6 +231,58 @@ test("rejects unsafe or non-exact approval DTOs before sending protocol content"
     );
   }
   assert.deepEqual(sent, []);
+});
+
+test("round-trips the exact command approval variant and rejects cross-kind previews", async () => {
+  const warning = "This command runs with current-user permissions and may access paths outside the workspace.";
+  const commandRequest: CommandPermissionRequest = {
+    callId: "call-command-1",
+    kind: "command",
+    title: "Run shell command",
+    preview: {
+      command: `Write-Output '${"中".repeat(5_000)}'`,
+      cwd: ".",
+      timeoutMs: 180_000,
+      warning,
+    },
+  };
+  const { core, ui } = pairedPeers();
+  let observed: unknown;
+  ui.register("permission/request", (value) => value, (params) => {
+    observed = params;
+    return "allow_once";
+  });
+  const client = new JsonRpcPermissionClient(core, {
+    schedule() { return () => {}; },
+  });
+
+  assert.equal(await client.requestPermission(commandRequest), "allow_once");
+  assert.deepEqual(observed, commandRequest);
+
+  const writeShapedCommand = { ...request, kind: "command" };
+  const commandShapedWrite = { ...commandRequest, kind: "write" };
+  const invalid: unknown[] = [
+    writeShapedCommand,
+    commandShapedWrite,
+    { ...commandRequest, preview: { ...commandRequest.preview, warning: "trust me" } },
+    { ...commandRequest, preview: { ...commandRequest.preview, command: " " } },
+    { ...commandRequest, preview: { ...commandRequest.preview, command: "echo\0bad" } },
+    { ...commandRequest, preview: { ...commandRequest.preview, command: "a".repeat(16 * 1024 + 1) } },
+    { ...commandRequest, preview: { ...commandRequest.preview, cwd: "../outside" } },
+    { ...commandRequest, preview: { ...commandRequest.preview, cwd: "C:/outside" } },
+    { ...commandRequest, preview: { ...commandRequest.preview, cwd: "nested\\path" } },
+    { ...commandRequest, preview: { ...commandRequest.preview, timeoutMs: 0 } },
+    { ...commandRequest, preview: { ...commandRequest.preview, timeoutMs: 1.5 } },
+    { ...commandRequest, preview: { ...commandRequest.preview, timeoutMs: 180_001 } },
+    { ...commandRequest, preview: { ...commandRequest.preview, extra: true } },
+    { ...commandRequest, preview: { ...commandRequest.preview, timeoutMs: undefined } },
+  ];
+  for (const value of invalid) {
+    await assert.rejects(
+      client.requestPermission(value as PermissionRequest),
+      PermissionProtocolError,
+    );
+  }
 });
 
 test("removes an external abort listener when timer setup fails before the request is sent", async () => {

@@ -9,7 +9,7 @@ import {
   PermissionProtocolError,
   PermissionTimeoutError,
   type PermissionClient,
-  type PermissionRequest,
+  type PermissionRequestWithoutCallId,
 } from "./permission.ts";
 
 export type ToolResultDraft = Omit<ToolResult, "durationMs">;
@@ -41,7 +41,7 @@ export interface ApprovedToolSpec<TInput, TPrepared> {
   name: string;
   validate(value: unknown): TInput;
   prepare(input: TInput, context: ToolContext): Promise<TPrepared>;
-  permission(prepared: TPrepared): Omit<PermissionRequest, "callId">;
+  permission(prepared: TPrepared): PermissionRequestWithoutCallId;
   denied(): ToolResultDraft;
   approvalInterrupted(code: ApprovalInterruptionCode): ToolResultDraft;
   failed(error: unknown, phase: "preparation" | "execution"): ToolResultDraft;
