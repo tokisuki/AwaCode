@@ -16,7 +16,28 @@ export interface UserModelMessage {
   readonly content: string;
 }
 
-export type ModelMessage = UserModelMessage;
+export interface SystemModelMessage {
+  readonly role: "system";
+  readonly content: string;
+}
+
+export interface AssistantHistoryModelMessage {
+  readonly role: "assistant";
+  readonly content: string | null;
+  readonly toolCalls: readonly FunctionToolCall[];
+}
+
+export interface ToolResultModelMessage {
+  readonly role: "tool";
+  readonly toolCallId: string;
+  readonly content: string;
+}
+
+export type ModelMessage =
+  | SystemModelMessage
+  | UserModelMessage
+  | AssistantHistoryModelMessage
+  | ToolResultModelMessage;
 
 export interface FunctionToolDefinition {
   readonly type: "function";

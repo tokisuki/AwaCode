@@ -113,6 +113,43 @@ test("streams text deltas and returns their complete assistant content", async (
   }
 });
 
+test("serializes system, assistant-tool, and tool-result history for a continuation", async () => {
+  const server = await scriptedServer((_request, response) => {
+    stream(response, [{ choices: [{ index: 0, delta: { content: "continued" }, finish_reason: "stop" }] }]);
+  });
+  try {
+    await new OpenAIChatClient(config(server.baseUrl)).stream({
+      messages: [
+        { role: "system", content: "You are a coding assistant." },
+        { role: "user", content: "Inspect the file." },
+        {
+          role: "assistant",
+          content: "I will inspect it.",
+          toolCalls: [{ id: "call_read", name: "read_file", arguments: "{\"path\":\"src/app.ts\"}" }],
+        },
+        { role: "tool", toolCallId: "call_read", content: "export const value = 1;" },
+      ],
+    });
+
+    assert.deepEqual((server.requests[0]?.body as { messages?: unknown }).messages, [
+      { role: "system", content: "You are a coding assistant." },
+      { role: "user", content: "Inspect the file." },
+      {
+        role: "assistant",
+        content: "I will inspect it.",
+        tool_calls: [{
+          id: "call_read",
+          type: "function",
+          function: { name: "read_file", arguments: "{\"path\":\"src/app.ts\"}" },
+        }],
+      },
+      { role: "tool", tool_call_id: "call_read", content: "export const value = 1;" },
+    ]);
+  } finally {
+    await server.close();
+  }
+});
+
 test("assembles fragmented function tool calls in their stream index order", async () => {
   const server = await scriptedServer((_request, response) => {
     stream(response, [

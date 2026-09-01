@@ -1,5 +1,11 @@
 import OpenAI from "openai";
-import type { ChatCompletionChunk, ChatCompletionMessageParam, ChatCompletionTool } from "openai/resources/chat/completions";
+import type {
+  ChatCompletionAssistantMessageParam,
+  ChatCompletionChunk,
+  ChatCompletionMessageParam,
+  ChatCompletionTool,
+  ChatCompletionToolMessageParam,
+} from "openai/resources/chat/completions";
 
 import type { EffectiveModelConfig } from "../config/model-config.ts";
 import { redactDiagnostic } from "../config/diagnostic-redactor.ts";
@@ -8,7 +14,27 @@ import { canRetryModelError, retryDelayMilliseconds } from "./retry.ts";
 import type { AssistantModelMessage, FunctionToolCall, ModelProvider, ModelStreamRequest } from "./types.ts";
 
 function completionMessages(request: ModelStreamRequest): ChatCompletionMessageParam[] {
-  return request.messages.map((message) => ({ role: message.role, content: message.content }));
+  return request.messages.map((message) => {
+    if (message.role === "assistant") {
+      return {
+        role: "assistant",
+        content: message.content,
+        tool_calls: message.toolCalls.map((call) => ({
+          id: call.id,
+          type: "function",
+          function: { name: call.name, arguments: call.arguments },
+        })),
+      } as ChatCompletionAssistantMessageParam;
+    }
+    if (message.role === "tool") {
+      return {
+        role: "tool",
+        tool_call_id: message.toolCallId,
+        content: message.content,
+      } as ChatCompletionToolMessageParam;
+    }
+    return { role: message.role, content: message.content };
+  });
 }
 
 interface PartialToolCall {
