@@ -1,7 +1,5 @@
-import { createHash } from "node:crypto";
 import { mkdir } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import { canonicalDatabaseKey } from "./migration-lock.ts";
@@ -25,10 +23,9 @@ function isBusy(error: unknown): boolean {
 
 export async function acquireDataRootLock(databasePath: string): Promise<DataRootLock> {
   const canonical = await canonicalDatabaseKey(databasePath);
-  const directory = resolve(tmpdir(), "awacode-data-root-locks");
+  const directory = dirname(canonical);
   await mkdir(directory, { recursive: true });
-  const name = `${createHash("sha256").update(canonical).digest("hex")}.db`;
-  const lock = new DatabaseSync(resolve(directory, name));
+  const lock = new DatabaseSync(resolve(directory, ".awacode-core-lock.db"));
   try {
     lock.exec("PRAGMA busy_timeout = 0");
     lock.exec("CREATE TABLE IF NOT EXISTS owner_lock (singleton INTEGER PRIMARY KEY CHECK (singleton = 1)) STRICT");

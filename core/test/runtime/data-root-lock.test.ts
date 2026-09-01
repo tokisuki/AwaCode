@@ -37,3 +37,25 @@ test("a live Core exclusively owns its data root and a crashed owner releases it
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("two real Cores share the same data-root lock even with different TEMP directories", async () => {
+  const root = await mkdtemp(join(tmpdir(), "awacode-root-lock-cross-temp-"));
+  const tempA = await mkdtemp(join(tmpdir(), "awacode-lock-temp-a-"));
+  const tempB = await mkdtemp(join(tmpdir(), "awacode-lock-temp-b-"));
+  const fixture = join(import.meta.dirname, "..", "..", "test-fixtures", "data-root-core-child.ts");
+  const holder = spawnChildChannel(process.execPath, [fixture, root], {
+    env: { ...process.env, TEMP: tempA, TMP: tempA },
+  });
+  let contender;
+  try {
+    assert.equal(await holder.lines.nextLine(), "READY");
+    contender = spawnChildChannel(process.execPath, [fixture, root, "attempt"], {
+      env: { ...process.env, TEMP: tempB, TMP: tempB },
+    });
+    assert.equal(await contender.lines.nextLine(), "LOCKED");
+  } finally {
+    if (contender !== undefined) await disposeChildChannel(contender, "cross-temp contender").catch(() => undefined);
+    await disposeChildChannel(holder, "cross-temp holder").catch(() => undefined);
+    await Promise.all([root, tempA, tempB].map((path) => rm(path, { recursive: true, force: true })));
+  }
+});
