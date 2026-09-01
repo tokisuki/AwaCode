@@ -24,26 +24,30 @@ MainWindow::MainWindow(AgentProcessManager *manager, QWidget *parent) : QMainWin
   auto *top = new QHBoxLayout;
   workspaceField_ = new QLineEdit(root);
   workspaceField_->setReadOnly(true);
-  auto *choose = new QPushButton(QStringLiteral("Choose workspace"), root);
-  auto *settings = new QPushButton(QStringLiteral("Settings"), root);
+  chooseWorkspace_ = new QPushButton(QStringLiteral("Choose workspace"), root);
+  chooseWorkspace_->setObjectName(QStringLiteral("chooseWorkspace"));
+  settingsButton_ = new QPushButton(QStringLiteral("Settings"), root);
+  settingsButton_->setObjectName(QStringLiteral("settings"));
   restart_ = new QPushButton(QStringLiteral("Restart Core"), root);
   restart_->setEnabled(false);
   top->addWidget(new QLabel(QStringLiteral("Workspace"), root));
   top->addWidget(workspaceField_, 1);
-  top->addWidget(choose);
+  top->addWidget(chooseWorkspace_);
   top->addWidget(new QLabel(QStringLiteral("Core"), root));
-  top->addWidget(settings);
+  top->addWidget(settingsButton_);
   top->addWidget(restart_);
   layout->addLayout(top);
 
   auto *splitter = new QSplitter(root);
   auto *left = new QWidget(splitter);
   auto *leftLayout = new QVBoxLayout(left);
-  auto *newSession = new QPushButton(QStringLiteral("New session"), left);
-  auto *sessionView = new QListView(left);
-  sessionView->setModel(&sessions_);
-  leftLayout->addWidget(newSession);
-  leftLayout->addWidget(sessionView);
+  newSession_ = new QPushButton(QStringLiteral("New session"), left);
+  newSession_->setObjectName(QStringLiteral("newSession"));
+  sessionView_ = new QListView(left);
+  sessionView_->setObjectName(QStringLiteral("sessionList"));
+  sessionView_->setModel(&sessions_);
+  leftLayout->addWidget(newSession_);
+  leftLayout->addWidget(sessionView_);
   transcript_ = new QPlainTextEdit(splitter);
   transcript_->setReadOnly(true);
   auto *toolView = new QListView(splitter);
@@ -60,6 +64,7 @@ MainWindow::MainWindow(AgentProcessManager *manager, QWidget *parent) : QMainWin
   auto *bottom = new QHBoxLayout;
   run_ = new QPushButton(QStringLiteral("Run"), root);
   cancel_ = new QPushButton(QStringLiteral("Cancel"), root);
+  cancel_->setObjectName(QStringLiteral("cancel"));
   cancel_->setEnabled(false);
   bottom->addStretch();
   bottom->addWidget(run_);
@@ -78,12 +83,12 @@ MainWindow::MainWindow(AgentProcessManager *manager, QWidget *parent) : QMainWin
   streamTimer_ = new QTimer(this);
   streamTimer_->setInterval(16);
   connect(streamTimer_, &QTimer::timeout, this, &MainWindow::flushBufferedText);
-  connect(choose, &QPushButton::clicked, this, &MainWindow::chooseWorkspace);
-  connect(newSession, &QPushButton::clicked, this, &MainWindow::createSession);
-  connect(sessionView, &QListView::clicked, this, &MainWindow::selectSession);
+  connect(chooseWorkspace_, &QPushButton::clicked, this, &MainWindow::chooseWorkspace);
+  connect(newSession_, &QPushButton::clicked, this, &MainWindow::createSession);
+  connect(sessionView_, &QListView::clicked, this, &MainWindow::selectSession);
   connect(run_, &QPushButton::clicked, this, &MainWindow::runTask);
   connect(cancel_, &QPushButton::clicked, this, [this] { if (manager_) manager_->cancel(); });
-  connect(settings, &QPushButton::clicked, this, &MainWindow::showSettings);
+  connect(settingsButton_, &QPushButton::clicked, this, &MainWindow::showSettings);
   connect(restart_, &QPushButton::clicked, this, [this] {
     if (manager_ != nullptr) { manager_->restart(); restart_->setEnabled(false); }
   });
@@ -92,10 +97,11 @@ MainWindow::MainWindow(AgentProcessManager *manager, QWidget *parent) : QMainWin
     connect(manager_, &AgentProcessManager::notificationReceived, this, &MainWindow::receiveNotification);
     connect(manager_, &AgentProcessManager::approvalRequested, this, &MainWindow::handleApproval);
     connect(manager_, &AgentProcessManager::responseReceived, this, &MainWindow::handleResponse);
+    connect(manager_, &AgentProcessManager::responseError, this, &MainWindow::handleResponseError);
     connect(manager_, &AgentProcessManager::stderrReceived, stderr_, &QPlainTextEdit::appendPlainText);
     connect(manager_, &AgentProcessManager::protocolError, stderr_, &QPlainTextEdit::appendPlainText);
     connect(manager_, &AgentProcessManager::crashed, this, &MainWindow::coreCrashed);
-    connect(manager_, &AgentProcessManager::stopped, this, [this](bool) { setRunning(false); });
+    connect(manager_, &AgentProcessManager::stopped, this, &MainWindow::coreStopped);
     connect(manager_, &AgentProcessManager::started, this, [this] { sendRequest(QStringLiteral("core/hello")); });
   }
 }
@@ -103,6 +109,7 @@ MainWindow::MainWindow(AgentProcessManager *manager, QWidget *parent) : QMainWin
 QPushButton *MainWindow::runButton() const { return run_; }
 QPushButton *MainWindow::restartButton() const { return restart_; }
 QString MainWindow::transcriptText() const { return transcript_->toPlainText(); }
+QString MainWindow::toolTimelineText(int row) const { return tools_.displayText(row); }
 
 void MainWindow::setConfigured(bool configured, const QString &model) {
   configured_ = configured;
@@ -112,11 +119,19 @@ void MainWindow::setConfigured(bool configured, const QString &model) {
 
 void MainWindow::receiveNotification(const QString &method, const QJsonObject &params) {
   if (method == QStringLiteral("stream/text")) {
-    provisionalText_[params.value("messageId").toString()].append(params.value("delta").toString());
+    const QString messageId = params.value("messageId").toString();
+    if (!streamMessages_.contains(messageId)) streamMessageOrder_.append(messageId);
+    StreamMessage &message = streamMessages_[messageId];
+    message.text.append(params.value("delta").toString());
+    message.provisional = params.value("provisional").toBool();
     if (!streamTimer_->isActive()) streamTimer_->start();
   } else if (method == QStringLiteral("stream/commit")) {
-    flushBufferedText();
-    provisionalText_.remove(params.value("messageId").toString());
+    streamTimer_->stop();
+    renderTranscript();
+    StreamMessage &message = streamMessages_[params.value("messageId").toString()];
+    message.provisional = false;
+    message.committed = true;
+    renderTranscript();
   } else if (method == QStringLiteral("agent/phase")) {
     appendTranscript(QStringLiteral("\n[%1]\n").arg(params.value("phase").toString()));
   } else if (method == QStringLiteral("tool/start")) {
@@ -134,6 +149,15 @@ void MainWindow::coreCrashed(int exitCode) {
   appendTranscript(QStringLiteral("\n[Core interrupted (exit %1); displayed content is preserved.]\n").arg(exitCode));
   setRunning(false);
   restart_->setEnabled(true);
+}
+
+void MainWindow::coreStopped(bool cleanEof) {
+  flushBufferedText();
+  setRunning(false);
+  if (!cleanEof) {
+    appendTranscript(QStringLiteral("\n[Core ended unexpectedly; displayed content is preserved.]\n"));
+    restart_->setEnabled(true);
+  }
 }
 
 void MainWindow::chooseWorkspace() {
@@ -168,17 +192,21 @@ void MainWindow::selectSession(const QModelIndex &index) {
 }
 
 void MainWindow::flushBufferedText() {
-  if (provisionalText_.isEmpty()) {
+  if (streamMessages_.isEmpty()) {
     streamTimer_->stop();
     return;
   }
-  for (auto it = provisionalText_.cbegin(); it != provisionalText_.cend(); ++it) appendTranscript(it.value());
-  provisionalText_.clear();
+  renderTranscript();
   streamTimer_->stop();
+  emit streamFlushed();
 }
 
 void MainWindow::handleResponse(const QString &id, const QJsonValue &result) {
   const QString method = pendingMethods_.take(id);
+  receiveResponse(method, result);
+}
+
+void MainWindow::receiveResponse(const QString &method, const QJsonValue &result) {
   const QJsonObject object = result.toObject();
   if (method == QStringLiteral("core/hello")) {
     setConfigured(object.value("configured").toBool(), object.value("model").toString());
@@ -199,23 +227,47 @@ void MainWindow::handleResponse(const QString &id, const QJsonValue &result) {
     sessions_.prepend({sessionId_, object.value("title").toString(), object.value("status").toString()});
     runTask();
   } else if (method == QStringLiteral("session/load")) {
-    transcript_->clear();
+    transcriptBase_.clear();
+    streamMessages_.clear();
+    streamMessageOrder_.clear();
     for (const QJsonValue &value : object.value("messages").toArray()) {
       const QJsonObject message = value.toObject();
-      appendTranscript(QStringLiteral("%1: %2\n").arg(message.value("role").toString(), message.value("content").toString()));
+      const QString text = payloadText(message);
+      if (!text.isEmpty()) appendTranscript(QStringLiteral("%1: %2\n").arg(message.value("role").toString(), text));
     }
+    tools_.hydrate(object.value("toolCalls").toArray());
   } else if (method == QStringLiteral("agent/run")) {
     setRunning(false);
   } else if (method == QStringLiteral("config/save") || method == QStringLiteral("config/status")) {
     setConfigured(object.value("runnable").toBool(), object.value("model").toString());
+    if (settingsDialog_ != nullptr) settingsDialog_->applyStatus(object);
+  } else if (method == QStringLiteral("config/test")) {
+    if (settingsDialog_ != nullptr) settingsDialog_->setStatusText(object.value("message").toString());
+  }
+}
+
+void MainWindow::handleResponseError(const QString &id, const QJsonObject &error) {
+  receiveError(pendingMethods_.take(id), error);
+}
+
+void MainWindow::receiveError(const QString &method, const QJsonObject &error) {
+  const QString message = error.value("message").toString(QStringLiteral("Core request failed"));
+  stderr_->appendPlainText(QStringLiteral("%1: %2").arg(method, message));
+  appendTranscript(QStringLiteral("\n[Core error: %1]\n").arg(message));
+  if (method == QStringLiteral("agent/run") || method == QStringLiteral("agent/cancel")) setRunning(false);
+  if ((method == QStringLiteral("config/save") || method == QStringLiteral("config/test") || method == QStringLiteral("config/status")) && settingsDialog_ != nullptr) {
+    settingsDialog_->setStatusText(message);
   }
 }
 
 void MainWindow::showSettings() {
   SettingsDialog dialog(this);
+  settingsDialog_ = &dialog;
   connect(&dialog, &SettingsDialog::saveRequested, this, [this](const QJsonObject &settings) { sendRequest(QStringLiteral("config/save"), settings); });
   connect(&dialog, &SettingsDialog::testRequested, this, [this] { sendRequest(QStringLiteral("config/test")); });
+  sendRequest(QStringLiteral("config/status"));
   dialog.exec();
+  settingsDialog_.clear();
 }
 
 QString MainWindow::sendRequest(const QString &method, const QJsonObject &params) {
@@ -230,9 +282,35 @@ void MainWindow::setRunning(bool running) {
   run_->setEnabled(configured_ && !running_);
   cancel_->setEnabled(running_);
   workspaceField_->setEnabled(!running_);
+  chooseWorkspace_->setEnabled(!running_);
+  newSession_->setEnabled(!running_);
+  sessionView_->setEnabled(!running_);
+  settingsButton_->setEnabled(!running_);
+  taskInput_->setEnabled(!running_);
 }
 
-void MainWindow::appendTranscript(const QString &text) { transcript_->moveCursor(QTextCursor::End); transcript_->insertPlainText(text); }
+void MainWindow::appendTranscript(const QString &text) { transcriptBase_.append(text); renderTranscript(); }
+
+void MainWindow::renderTranscript() {
+  QString text = transcriptBase_;
+  for (const QString &id : streamMessageOrder_) {
+    const StreamMessage message = streamMessages_.value(id);
+    text += message.provisional && !message.committed
+      ? QStringLiteral("[provisional] %1").arg(message.text)
+      : message.text;
+  }
+  transcript_->setPlainText(text);
+  transcript_->moveCursor(QTextCursor::End);
+}
+
+QString MainWindow::payloadText(const QJsonObject &message) const {
+  const QJsonValue payload = message.value("payload");
+  if (payload.isObject()) {
+    const QJsonObject object = payload.toObject();
+    if (object.value("text").isString()) return object.value("text").toString();
+  }
+  return {};
+}
 
 void MainWindow::loadSessions() { sendRequest(QStringLiteral("session/list"), {{"projectId", projectId_}}); }
 void MainWindow::loadSession(const QString &sessionId) { sendRequest(QStringLiteral("session/load"), {{"sessionId", sessionId}}); }

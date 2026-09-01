@@ -12,8 +12,10 @@ AgentProcessManager::AgentProcessManager(QString program, QStringList arguments,
           [this](int exitCode, QProcess::ExitStatus status) {
             readStandardOutput();
             readStandardError();
-            const bool clean = status == QProcess::NormalExit && exitCode == 0 && codec_.finish();
-            if (!codec_.failed() && clean) emit stopped(true);
+            const bool validEof = codec_.finish();
+            if (!codec_.failed() && status == QProcess::NormalExit && exitCode == 0 && validEof) {
+              emit stopped(inputClosed_);
+            }
             else {
               if (codec_.failed()) emit protocolError(codec_.errorString());
               emit crashed(exitCode);

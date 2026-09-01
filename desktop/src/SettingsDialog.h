@@ -12,6 +12,7 @@ class SettingsDialog final : public QDialog {
 public:
   explicit SettingsDialog(QWidget *parent = nullptr);
   void setStatusText(const QString &text);
+  void applyStatus(const QJsonObject &status);
   QJsonObject settings() const;
 
 signals:

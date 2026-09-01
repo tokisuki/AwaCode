@@ -8,6 +8,7 @@ class AgentProcessManagerTest final : public QObject {
 private slots:
   void startsHandlesReverseApprovalAndCleanEof();
   void preservesArrayRpcResults();
+  void treatsUnpromptedNormalEofAsUnexpected();
   void reportsCrash();
 };
 
@@ -27,9 +28,18 @@ void AgentProcessManagerTest::startsHandlesReverseApprovalAndCleanEof() {
   QTRY_VERIFY_WITH_TIMEOUT(!response.isEmpty(), 2'000);
   QCOMPARE(response.constFirst().at(0).toString(), requestId);
   QCOMPARE(response.constFirst().at(1).toJsonValue().toObject().value("configured").toBool(), false);
+  QCOMPARE(response.constFirst().at(1).toJsonValue().toObject().value("approvalAccepted").toBool(), true);
   manager.closeInput();
   QVERIFY(stopped.wait(2'000));
   QCOMPARE(stopped.constFirst().at(0).toBool(), true);
+}
+
+void AgentProcessManagerTest::treatsUnpromptedNormalEofAsUnexpected() {
+  AgentProcessManager manager(QString::fromUtf8(AWACODE_FAKE_CORE_PATH), {"--eof"});
+  QSignalSpy stopped(&manager, &AgentProcessManager::stopped);
+  manager.start();
+  QVERIFY(stopped.wait(2'000));
+  QCOMPARE(stopped.constFirst().at(0).toBool(), false);
 }
 
 void AgentProcessManagerTest::preservesArrayRpcResults() {

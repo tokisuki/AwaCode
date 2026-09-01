@@ -37,6 +37,17 @@ SettingsDialog::SettingsDialog(QWidget *parent) : QDialog(parent) {
 
 void SettingsDialog::setStatusText(const QString &text) { status_->setText(text); }
 
+void SettingsDialog::applyStatus(const QJsonObject &status) {
+  baseUrl_->setText(status.value("baseUrl").toString());
+  model_->setText(status.value("model").toString());
+  contextLimit_->setText(QString::number(status.value("contextLimit").toInt(32768)));
+  maxOutput_->setText(QString::number(status.value("maxOutputTokens").toInt(4096)));
+  const bool hasApiKey = status.value("hasApiKey").toBool();
+  apiKey_->clear();
+  apiKey_->setPlaceholderText(hasApiKey ? QStringLiteral("Stored key preserved") : QString());
+  setStatusText(status.value("runnable").toBool() ? QStringLiteral("Configuration is ready") : QStringLiteral("Configuration is incomplete"));
+}
+
 QJsonObject SettingsDialog::settings() const {
   QJsonObject credential{{"action", apiKey_->text().isEmpty() ? "keep" : "store"}};
   if (!apiKey_->text().isEmpty()) credential.insert("apiKey", apiKey_->text());

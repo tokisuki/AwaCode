@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QAbstractListModel>
+#include <QJsonArray>
 #include <QJsonObject>
 
 struct ToolTimelineEntry {
@@ -21,6 +22,8 @@ public:
   void started(const QJsonObject &params);
   void finished(const QJsonObject &params);
   void markApproval(const QString &callId, const QString &status);
+  void hydrate(const QJsonArray &toolCalls);
+  QString displayText(int row) const;
   void clear();
 
 private:

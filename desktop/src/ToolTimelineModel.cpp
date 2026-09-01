@@ -42,6 +42,27 @@ void ToolTimelineModel::markApproval(const QString &callId, const QString &statu
   }
 }
 
+void ToolTimelineModel::hydrate(const QJsonArray &toolCalls) {
+  beginResetModel();
+  entries_.clear();
+  for (const QJsonValue &value : toolCalls) {
+    const QJsonObject call = value.toObject();
+    const QJsonObject result = call.value("result").toObject();
+    entries_.append({
+      call.value("callId").toString(),
+      call.value("toolName").toString(),
+      call.value("status").toString(),
+      result.value("durationMs").toInt(),
+      result.value("summary").toString(call.value("errorText").toString()),
+    });
+  }
+  endResetModel();
+}
+
+QString ToolTimelineModel::displayText(int row) const {
+  return data(index(row, 0), Qt::DisplayRole).toString();
+}
+
 void ToolTimelineModel::clear() {
   beginResetModel();
   entries_.clear();
