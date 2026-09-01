@@ -14,6 +14,11 @@ SettingsDialog::SettingsDialog(QWidget *parent) : QDialog(parent) {
   contextLimit_ = new QLineEdit(QStringLiteral("32768"), this);
   maxOutput_ = new QLineEdit(QStringLiteral("4096"), this);
   apiKey_ = new QLineEdit(this);
+  baseUrl_->setObjectName(QStringLiteral("baseUrl"));
+  model_->setObjectName(QStringLiteral("model"));
+  contextLimit_->setObjectName(QStringLiteral("contextLimit"));
+  maxOutput_->setObjectName(QStringLiteral("maxOutputTokens"));
+  apiKey_->setObjectName(QStringLiteral("apiKey"));
   apiKey_->setEchoMode(QLineEdit::Password);
   status_ = new QLabel(this);
   layout->addRow(QStringLiteral("Base URL"), baseUrl_);
@@ -33,8 +38,14 @@ SettingsDialog::SettingsDialog(QWidget *parent) : QDialog(parent) {
 void SettingsDialog::setStatusText(const QString &text) { status_->setText(text); }
 
 QJsonObject SettingsDialog::settings() const {
-  QJsonObject limits{{"contextLimit", contextLimit_->text().toInt()}, {"maxOutputTokens", maxOutput_->text().toInt()}};
-  QJsonObject result{{"baseUrl", baseUrl_->text()}, {"model", model_->text()}, {"limits", limits}};
-  if (!apiKey_->text().isEmpty()) result.insert("apiKey", apiKey_->text());
+  QJsonObject credential{{"action", apiKey_->text().isEmpty() ? "keep" : "store"}};
+  if (!apiKey_->text().isEmpty()) credential.insert("apiKey", apiKey_->text());
+  QJsonObject result{
+    {"baseUrl", baseUrl_->text()},
+    {"model", model_->text()},
+    {"contextLimit", contextLimit_->text().toInt()},
+    {"maxOutputTokens", maxOutput_->text().toInt()},
+    {"credential", credential},
+  };
   return result;
 }

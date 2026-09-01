@@ -35,3 +35,33 @@ npm run cli -- --resume <session-id>
 ```
 
 `--resume` 只加载并显示历史，不会自动调用模型或执行工具。编辑文件与运行命令时，终端只接受 `allow_once` 或 `deny`。若当前 shell 不是 Node.js 24，可将 `AWACODE_NODE_PATH` 指向 Node 24 可执行文件后运行已构建 CLI。
+
+## Qt 6 桌面控制台
+
+桌面端是 Qt 6 Widgets Agent 控制台，而不是 IDE：它选择工作区、浏览与新建会话、
+展示计划/流式文本/工具时间线、逐次请求本地副作用审批，并可查看 Core stderr、取消任务或在异常退出后手动重启。
+桌面端不调用模型，也不执行 Agent 工具；它仅以 JSON-RPC 2.0 over NDJSON/stdin/stdout 管理 Core 子进程。
+
+先使用 Node 24 构建 Core，再从仓库根目录配置并构建桌面端。以下路径是本项目固定验证过的 Qt 6.8.3 / MinGW-w64 13.1 工具链；不要替换为 Anaconda Qt 5 或 `D:\mingw64` 的编译器。
+
+```powershell
+$node24 = "C:\Users\47643\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe"
+Push-Location core
+& $node24 .\node_modules\typescript\bin\tsc -p tsconfig.json
+Pop-Location
+
+& D:\mingw64\bin\cmake.exe -S desktop -B desktop\build-qt6 -G Ninja `
+  "-DCMAKE_PREFIX_PATH=D:/codes/AwaCode/.local/Qt/6.8.3/mingw_64" `
+  "-DCMAKE_CXX_COMPILER=D:/codes/AwaCode/.local/Qt/Tools/mingw1310_64/bin/g++.exe"
+& D:\mingw64\bin\cmake.exe --build desktop\build-qt6
+```
+
+为运行时提供 Qt 与 MinGW DLL 路径；可选的 `AWACODE_NODE_PATH` 应指向 Node 24。首次启动没有有效模型配置时，桌面端仍可浏览历史但会禁用运行按钮；在“Settings”中由用户主动提供配置。不要把 API Key 写入命令行、Git、SQLite 或文档。
+
+```powershell
+$env:PATH = "D:\codes\AwaCode\.local\Qt\6.8.3\mingw_64\bin;D:\codes\AwaCode\.local\Qt\Tools\mingw1310_64\bin;$env:PATH"
+$env:AWACODE_NODE_PATH = "C:\Users\47643\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe"
+.\desktop\build-qt6\awacode-desktop.exe
+```
+
+用 Qt 目录中的 `windeployqt.exe` 为演示副本部署 Qt DLL；Core 的 `core/dist/` 和运行时 Node 仍须按上面的启动约定可用。不要把本机的 `%LOCALAPPDATA%\AwaCode`、凭据文件或生成的 `desktop/build-qt6/` 提交进仓库。

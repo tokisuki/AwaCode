@@ -1,4 +1,5 @@
 #include <QCoreApplication>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QTextStream>
@@ -24,6 +25,9 @@ int main(int argc, char *argv[]) {
             {"params", QJsonObject{{"callId", "call-1"}, {"kind", "command"}, {"title", "Run test"}}}});
       send({{"jsonrpc", "2.0"}, {"id", message.value("id").toString()},
             {"result", QJsonObject{{"configured", false}}}});
+    } else if (message.value("method").toString() == "session/list") {
+      send({{"jsonrpc", "2.0"}, {"id", message.value("id").toString()},
+            {"result", QJsonArray{QJsonObject{{"id", "session-1"}, {"title", "Session"}, {"status", "idle"}}}}});
     }
   }
   return 0;

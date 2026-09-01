@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QJsonObject>
+#include <QJsonValue>
 #include <QObject>
 #include <QProcess>
 
@@ -29,7 +30,7 @@ signals:
   void stderrReceived(const QString &text);
   void notificationReceived(const QString &method, const QJsonObject &params);
   void approvalRequested(const QString &requestId, const QJsonObject &params);
-  void responseReceived(const QString &requestId, const QJsonObject &result);
+  void responseReceived(const QString &requestId, const QJsonValue &result);
   void responseError(const QString &requestId, const QJsonObject &error);
 
 private slots:

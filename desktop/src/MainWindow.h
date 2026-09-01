@@ -2,6 +2,7 @@
 
 #include <QHash>
 #include <QJsonObject>
+#include <QJsonValue>
 #include <QMainWindow>
 #include <QPushButton>
 
@@ -31,7 +32,7 @@ private slots:
   void runTask();
   void selectSession(const QModelIndex &index);
   void flushBufferedText();
-  void handleResponse(const QString &id, const QJsonObject &result);
+  void handleResponse(const QString &id, const QJsonValue &result);
   void showSettings();
 
 private:
@@ -43,7 +44,6 @@ private:
   void handleApproval(const QString &id, const QJsonObject &params);
 
   AgentProcessManager *manager_ = nullptr;
-  bool ownsManager_ = false;
   bool configured_ = false;
   bool running_ = false;
   QString workspace_;

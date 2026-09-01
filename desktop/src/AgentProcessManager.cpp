@@ -93,7 +93,7 @@ void AgentProcessManager::processMessage(const QJsonObject &message) {
     emit protocolError(QStringLiteral("invalid_response"));
     return;
   }
-  if (message.contains("result")) emit responseReceived(id, message.value("result").toObject());
+  if (message.contains("result")) emit responseReceived(id, message.value("result"));
   else if (message.contains("error")) emit responseError(id, message.value("error").toObject());
   else emit protocolError(QStringLiteral("invalid_response"));
 }

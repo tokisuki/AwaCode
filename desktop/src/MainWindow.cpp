@@ -1,6 +1,5 @@
 #include "MainWindow.h"
 
-#include <QDir>
 #include <QFileDialog>
 #include <QHBoxLayout>
 #include <QJsonArray>
@@ -18,13 +17,7 @@
 #include "SettingsDialog.h"
 
 MainWindow::MainWindow(AgentProcessManager *manager, QWidget *parent) : QMainWindow(parent) {
-  if (manager == nullptr) {
-    manager_ = new AgentProcessManager(qEnvironmentVariable("AWACODE_NODE_PATH", QStringLiteral("node")),
-                                       {QDir::current().filePath(QStringLiteral("core/dist/index.js"))}, this);
-    ownsManager_ = true;
-  } else {
-    manager_ = manager;
-  }
+  manager_ = manager;
 
   auto *root = new QWidget(this);
   auto *layout = new QVBoxLayout(root);
@@ -91,16 +84,20 @@ MainWindow::MainWindow(AgentProcessManager *manager, QWidget *parent) : QMainWin
   connect(run_, &QPushButton::clicked, this, &MainWindow::runTask);
   connect(cancel_, &QPushButton::clicked, this, [this] { if (manager_) manager_->cancel(); });
   connect(settings, &QPushButton::clicked, this, &MainWindow::showSettings);
-  connect(restart_, &QPushButton::clicked, this, [this] { manager_->restart(); restart_->setEnabled(false); });
+  connect(restart_, &QPushButton::clicked, this, [this] {
+    if (manager_ != nullptr) { manager_->restart(); restart_->setEnabled(false); }
+  });
 
-  connect(manager_, &AgentProcessManager::notificationReceived, this, &MainWindow::receiveNotification);
-  connect(manager_, &AgentProcessManager::approvalRequested, this, &MainWindow::handleApproval);
-  connect(manager_, &AgentProcessManager::responseReceived, this, &MainWindow::handleResponse);
-  connect(manager_, &AgentProcessManager::stderrReceived, stderr_, &QPlainTextEdit::appendPlainText);
-  connect(manager_, &AgentProcessManager::protocolError, stderr_, &QPlainTextEdit::appendPlainText);
-  connect(manager_, &AgentProcessManager::crashed, this, &MainWindow::coreCrashed);
-  connect(manager_, &AgentProcessManager::stopped, this, [this](bool) { setRunning(false); });
-  connect(manager_, &AgentProcessManager::started, this, [this] { sendRequest(QStringLiteral("core/hello")); });
+  if (manager_ != nullptr) {
+    connect(manager_, &AgentProcessManager::notificationReceived, this, &MainWindow::receiveNotification);
+    connect(manager_, &AgentProcessManager::approvalRequested, this, &MainWindow::handleApproval);
+    connect(manager_, &AgentProcessManager::responseReceived, this, &MainWindow::handleResponse);
+    connect(manager_, &AgentProcessManager::stderrReceived, stderr_, &QPlainTextEdit::appendPlainText);
+    connect(manager_, &AgentProcessManager::protocolError, stderr_, &QPlainTextEdit::appendPlainText);
+    connect(manager_, &AgentProcessManager::crashed, this, &MainWindow::coreCrashed);
+    connect(manager_, &AgentProcessManager::stopped, this, [this](bool) { setRunning(false); });
+    connect(manager_, &AgentProcessManager::started, this, [this] { sendRequest(QStringLiteral("core/hello")); });
+  }
 }
 
 QPushButton *MainWindow::runButton() const { return run_; }
@@ -180,34 +177,37 @@ void MainWindow::flushBufferedText() {
   streamTimer_->stop();
 }
 
-void MainWindow::handleResponse(const QString &id, const QJsonObject &result) {
+void MainWindow::handleResponse(const QString &id, const QJsonValue &result) {
   const QString method = pendingMethods_.take(id);
+  const QJsonObject object = result.toObject();
   if (method == QStringLiteral("core/hello")) {
-    setConfigured(result.value("configured").toBool(), result.value("model").toString());
+    setConfigured(object.value("configured").toBool(), object.value("model").toString());
   } else if (method == QStringLiteral("workspace/set")) {
-    projectId_ = result.value("projectId").toString();
-    workspace_ = result.value("workspace").toString();
+    projectId_ = object.value("projectId").toString();
+    workspace_ = object.value("workspace").toString();
     workspaceField_->setText(workspace_);
     loadSessions();
   } else if (method == QStringLiteral("session/list")) {
     QList<SessionSummary> sessions;
-    for (const QJsonValue &value : result.value("items").toArray()) {
+    for (const QJsonValue &value : result.toArray()) {
       const QJsonObject session = value.toObject();
       sessions.append({session.value("id").toString(), session.value("title").toString(), session.value("status").toString()});
     }
     sessions_.setSessions(sessions);
   } else if (method == QStringLiteral("session/create")) {
-    sessionId_ = result.value("id").toString();
-    sessions_.prepend({sessionId_, result.value("title").toString(), result.value("status").toString()});
+    sessionId_ = object.value("id").toString();
+    sessions_.prepend({sessionId_, object.value("title").toString(), object.value("status").toString()});
     runTask();
   } else if (method == QStringLiteral("session/load")) {
     transcript_->clear();
-    for (const QJsonValue &value : result.value("messages").toArray()) {
+    for (const QJsonValue &value : object.value("messages").toArray()) {
       const QJsonObject message = value.toObject();
       appendTranscript(QStringLiteral("%1: %2\n").arg(message.value("role").toString(), message.value("content").toString()));
     }
   } else if (method == QStringLiteral("agent/run")) {
     setRunning(false);
+  } else if (method == QStringLiteral("config/save") || method == QStringLiteral("config/status")) {
+    setConfigured(object.value("runnable").toBool(), object.value("model").toString());
   }
 }
 
@@ -241,5 +241,5 @@ void MainWindow::handleApproval(const QString &id, const QJsonObject &params) {
   tools_.markApproval(params.value("callId").toString(), QStringLiteral("awaiting approval"));
   ApprovalDialog dialog(params, this);
   dialog.exec();
-  manager_->replyToApproval(id, dialog.decision());
+  if (manager_ != nullptr) manager_->replyToApproval(id, dialog.decision());
 }

@@ -23,6 +23,7 @@ Makefile
 *.cmake.user
 *.qtc.user
 *.pro.user
+desktop/build-*/
 
 # Demo workspaces and generated test/build artifacts
 demo/workspace/
