@@ -1,4 +1,9 @@
 import { coreDescriptor } from "../index.ts";
+import {
+  ModelConfigOperationError,
+  ModelConfigService,
+  parseSaveModelConfigInput,
+} from "../config/model-config.ts";
 import { DATABASE_VERSION } from "../persistence/database.ts";
 import { SessionStore, StoreNotFoundError } from "../persistence/session-store.ts";
 import {
@@ -11,6 +16,7 @@ import type { JsonRpcPeer } from "../protocol/rpc-peer.ts";
 
 export interface CoreHandlerDependencies {
   store: SessionStore;
+  configService: ModelConfigService;
   projectIdentityOptions?: ProjectIdentityOptions;
 }
 
@@ -44,6 +50,20 @@ function hasExactKeys(value: Record<string, unknown>, required: readonly string[
 function parseHello(value: unknown): Record<string, never> {
   if (!isRecord(value) || Object.keys(value).length !== 0) {
     throw new TypeError("core/hello params must be an empty object");
+  }
+  return {};
+}
+
+function parseConfigStatus(value: unknown): Record<string, never> {
+  if (!isRecord(value) || Object.keys(value).length !== 0) {
+    throw new TypeError("config/status params must be an empty object");
+  }
+  return {};
+}
+
+function parseConfigTest(value: unknown): Record<string, never> {
+  if (!isRecord(value) || Object.keys(value).length !== 0) {
+    throw new TypeError("config/test params must be an empty object");
   }
   return {};
 }
@@ -93,6 +113,18 @@ function storeFault(error: unknown): never {
   throw error;
 }
 
+function configFault(error: unknown): never {
+  if (error instanceof ModelConfigOperationError) {
+    if (error.kind === "not_configured") {
+      throw new RpcFault(RPC_ERROR_CODES.notConfigured, "Model configuration is not runnable");
+    }
+    if (error.kind === "cancelled") {
+      throw new RpcFault(RPC_ERROR_CODES.cancelled, "Model connection test cancelled");
+    }
+  }
+  throw new RpcFault(RPC_ERROR_CODES.configurationOperation, "Model configuration operation failed");
+}
+
 export function registerCoreHandlers(peer: JsonRpcPeer, dependencies: CoreHandlerDependencies): void {
   peer.register("core/hello", parseHello, () => ({
     coreVersion: coreDescriptor.version,
@@ -135,6 +167,30 @@ export function registerCoreHandlers(peer: JsonRpcPeer, dependencies: CoreHandle
       return dependencies.store.loadSession(sessionId);
     } catch (error) {
       return storeFault(error);
+    }
+  });
+
+  peer.register("config/status", parseConfigStatus, async () => {
+    try {
+      return await dependencies.configService.status();
+    } catch (error) {
+      return configFault(error);
+    }
+  });
+
+  peer.register("config/save", parseSaveModelConfigInput, async (input) => {
+    try {
+      return await dependencies.configService.save(input);
+    } catch (error) {
+      return configFault(error);
+    }
+  });
+
+  peer.register("config/test", parseConfigTest, async () => {
+    try {
+      return await dependencies.configService.testConnection(new AbortController().signal);
+    } catch (error) {
+      return configFault(error);
     }
   });
 }

@@ -97,6 +97,12 @@ function normalizeCredentialLabel(label: string): string | null {
   return trimmed.replace(/[\s_-]+/g, "").toLowerCase();
 }
 
+export function isCredentialDiagnosticLabel(label: string): boolean {
+  const normalized = normalizeCredentialLabel(label);
+  return normalized === "authorization"
+    || (normalized !== null && CREDENTIAL_LABELS.has(normalized));
+}
+
 function readAssignmentLabel(value: string, separator: number): AssignmentLabel | null {
   let labelEnd = separator;
   while (labelEnd > 0 && isHorizontalWhitespace(value.charAt(labelEnd - 1))) {

@@ -11,6 +11,7 @@ export const RPC_ERROR_CODES = {
   notFound: -32003,
   historyIntegrity: -32004,
   cancelled: -32005,
+  configurationOperation: -32006,
 } as const;
 
 export interface JsonRpcErrorObject {

@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join, normalize } from "node:path";
 import test from "node:test";
 
+import { ModelConfigService } from "../../src/config/model-config.ts";
 import { openDatabase } from "../../src/persistence/database.ts";
 import { SessionStore } from "../../src/persistence/session-store.ts";
 import { JsonRpcPeer } from "../../src/protocol/rpc-peer.ts";
@@ -51,7 +52,11 @@ test("real JsonRpcPeer calls receive the literal results of all five core handle
     randomUUID: () => "session-rpc-1",
   });
   const { client, server } = connectedPeers();
-  registerCoreHandlers(server, { store, projectIdentityOptions: { env: cleanEnvironment() } });
+  registerCoreHandlers(server, {
+    store,
+    configService: new ModelConfigService({ env: { AWACODE_DATA_DIR: dataRoot } }),
+    projectIdentityOptions: { env: cleanEnvironment() },
+  });
 
   try {
     assert.deepEqual(await client.request("core/hello", {}), {
@@ -92,7 +97,11 @@ test("exact parameter validators reject missing, extra, and mistyped fields thro
   const connection = await openDatabase({ env: { AWACODE_DATA_DIR: dataRoot } });
   const store = new SessionStore(connection.db);
   const { client, server } = connectedPeers();
-  registerCoreHandlers(server, { store, projectIdentityOptions: { env: cleanEnvironment() } });
+  registerCoreHandlers(server, {
+    store,
+    configService: new ModelConfigService({ env: { AWACODE_DATA_DIR: dataRoot } }),
+    projectIdentityOptions: { env: cleanEnvironment() },
+  });
 
   try {
     const invalidCalls: Array<[string, unknown]> = [
@@ -122,7 +131,11 @@ test("missing workspaces, projects, and sessions become application not-found fa
   const connection = await openDatabase({ env: { AWACODE_DATA_DIR: dataRoot } });
   const store = new SessionStore(connection.db);
   const { client, server } = connectedPeers();
-  registerCoreHandlers(server, { store, projectIdentityOptions: { env: cleanEnvironment() } });
+  registerCoreHandlers(server, {
+    store,
+    configService: new ModelConfigService({ env: { AWACODE_DATA_DIR: dataRoot } }),
+    projectIdentityOptions: { env: cleanEnvironment() },
+  });
 
   try {
     const calls: Array<[string, unknown, string, unknown]> = [
