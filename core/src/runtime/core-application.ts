@@ -13,6 +13,8 @@ import { OpenAIChatClient, OpenAIModelConnectionTester } from "../llm/openai-cha
 import type { ModelProvider } from "../llm/types.ts";
 import { MemoryStore } from "../memory/memory-store.ts";
 import { openDatabase, type DatabaseConnection } from "../persistence/database.ts";
+import { acquireDataRootLock } from "../persistence/data-root-lock.ts";
+import { resolveDataPaths } from "../persistence/data-paths.ts";
 import type { DataPathOptions } from "../persistence/data-paths.ts";
 import { SessionStore } from "../persistence/session-store.ts";
 import type { JsonRpcPeer } from "../protocol/rpc-peer.ts";
@@ -118,7 +120,14 @@ export async function createCoreApplication(
     ...(options.env === undefined ? {} : { env: options.env }),
     ...(options.platform === undefined ? {} : { platform: options.platform }),
   };
-  const connection = await openDatabase(pathOptions);
+  const rootLock = await acquireDataRootLock(resolveDataPaths(pathOptions).database);
+  let connection: DatabaseConnection;
+  try {
+    connection = await openDatabase(pathOptions);
+  } catch (error) {
+    rootLock.release();
+    throw error;
+  }
   try {
     const store = new SessionStore(connection.db);
     const memoryStore = new MemoryStore(pathOptions);
@@ -144,9 +153,23 @@ export async function createCoreApplication(
         ? {}
         : { projectIdentityOptions: options.projectIdentityOptions }),
     });
-    return { store, connection, close: () => connection.close() };
+    let closed = false;
+    return {
+      store,
+      connection,
+      close: () => {
+        if (closed) return;
+        closed = true;
+        try {
+          connection.close();
+        } finally {
+          rootLock.release();
+        }
+      },
+    };
   } catch (error) {
     connection.close();
+    rootLock.release();
     throw error;
   }
 }
