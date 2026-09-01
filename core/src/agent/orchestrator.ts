@@ -29,6 +29,7 @@ export type AgentNotification =
   | { method: "agent/phase"; params: EventBase & { phase: AgentPhase } }
   | { method: "stream/text"; params: EventBase & { messageId: string; phase: AgentPhase; delta: string; provisional: boolean } }
   | { method: "stream/commit"; params: EventBase & { messageId: string } }
+  | { method: "stream/reject"; params: EventBase & { messageId: string } }
   | { method: "tool/start"; params: EventBase & { callId: string; ordinal: number; name: string } }
   | { method: "memory/updated"; params: EventBase & { scope: "global" | "project"; operation: string; characters: number } }
   | {
@@ -332,6 +333,7 @@ export class AgentOrchestrator {
       }
       if (decision.status === "continue") {
         this.options.store.setAssistantCandidateStatus(candidate.message.id, "rejected");
+        await this.reject(candidate.message.id);
         await this.phase("execute");
         const remedialExecution = await this.executeUntilCandidate(input.sessionId, user.id, decision.reason);
         const remedial = remedialExecution.turn;
@@ -684,6 +686,10 @@ export class AgentOrchestrator {
 
   private async commit(messageId: string): Promise<void> {
     await this.emit("stream/commit", { messageId });
+  }
+
+  private async reject(messageId: string): Promise<void> {
+    await this.emit("stream/reject", { messageId });
   }
 
   private async toolEnd(

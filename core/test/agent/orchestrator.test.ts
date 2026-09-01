@@ -403,6 +403,8 @@ test("malformed Reflect retries once and continue permits one remedial Execute w
       && typeof message.payload === "object"
       && (message.payload as { text?: unknown }).text === "First candidate.");
     assert.equal((rejected?.payload as { candidateStatus?: unknown }).candidateStatus, "rejected");
+    assert.equal(notifications.some((event) => event.method === "stream/reject"
+      && event.params.messageId === rejected?.id), true);
   } finally {
     f.connection.close();
   }

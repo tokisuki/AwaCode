@@ -23,6 +23,7 @@ private slots:
   void crashKeepsRunDisabledUntilHelloRefreshesTheCurrentWorkspace();
   void manualSessionCreationDoesNotDispatchTheOldPrompt();
   void reloadMarksRejectedCandidates();
+  void liveRejectReplacesTheProvisionalMarker();
 };
 
 void MainWindowTest::disablesRunUntilConfigured() {
@@ -77,6 +78,15 @@ void MainWindowTest::reloadMarksRejectedCandidates() {
   }}});
   QVERIFY(window.transcriptText().contains(QStringLiteral("[rejected] superseded")));
   QVERIFY(window.transcriptText().contains(QStringLiteral("final")));
+}
+
+void MainWindowTest::liveRejectReplacesTheProvisionalMarker() {
+  MainWindow window;
+  window.receiveNotification("stream/text", QJsonObject{{"messageId", "candidate"}, {"delta", "superseded"}, {"provisional", true}});
+  QTRY_VERIFY_WITH_TIMEOUT(window.transcriptText().contains(QStringLiteral("[provisional] superseded")), 200);
+  window.receiveNotification("stream/reject", QJsonObject{{"messageId", "candidate"}});
+  QVERIFY(window.transcriptText().contains(QStringLiteral("[rejected] superseded")));
+  QVERIFY(!window.transcriptText().contains(QStringLiteral("[provisional] superseded")));
 }
 
 void MainWindowTest::keepsStreamBeforeLaterTranscriptEventsAndClearsCommittedStateForNextRun() {

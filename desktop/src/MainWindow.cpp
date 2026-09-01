@@ -149,6 +149,13 @@ void MainWindow::receiveNotification(const QString &method, const QJsonObject &p
       if (entry.messageId == messageId) entry.provisional = false;
     }
     renderTranscript();
+  } else if (method == QStringLiteral("stream/reject")) {
+    streamTimer_->stop();
+    const QString messageId = params.value("messageId").toString();
+    for (TranscriptEntry &entry : transcriptEntries_) {
+      if (entry.messageId == messageId) { entry.provisional = false; entry.rejected = true; }
+    }
+    renderTranscript();
   } else if (method == QStringLiteral("agent/phase")) {
     appendTranscript(QStringLiteral("\n[%1]\n").arg(params.value("phase").toString()));
   } else if (method == QStringLiteral("tool/start")) {
@@ -393,8 +400,8 @@ void MainWindow::appendTranscript(const QString &text) {
 void MainWindow::renderTranscript() {
   QString text;
   for (const TranscriptEntry &entry : transcriptEntries_) {
-    text += entry.provisional
-      ? QStringLiteral("[provisional] %1").arg(entry.text)
+    text += entry.rejected ? QStringLiteral("[rejected] %1").arg(entry.text)
+      : entry.provisional ? QStringLiteral("[provisional] %1").arg(entry.text)
       : entry.text;
   }
   transcript_->setPlainText(text);

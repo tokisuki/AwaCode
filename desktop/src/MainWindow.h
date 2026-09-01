@@ -75,6 +75,7 @@ private:
     QString text;
     QString messageId;
     bool provisional = true;
+    bool rejected = false;
   };
 
   AgentProcessManager *manager_ = nullptr;
