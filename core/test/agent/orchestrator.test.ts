@@ -831,7 +831,11 @@ test("provider context overflow triggers one persisted compression and retries t
   ];
   const provider: ModelProvider = {
     async stream(request) {
-      requests.push({ messages: structuredClone(request.messages), ...(request.tools === undefined ? {} : { tools: structuredClone(request.tools) }) });
+      requests.push({
+        messages: structuredClone(request.messages),
+        ...(request.tools === undefined ? {} : { tools: structuredClone(request.tools) }),
+        ...(request.maxOutputTokens === undefined ? {} : { maxOutputTokens: request.maxOutputTokens }),
+      });
       const next = script.shift();
       assert.ok(next);
       if (next instanceof Error) throw next;
@@ -852,6 +856,7 @@ test("provider context overflow triggers one persisted compression and retries t
     assert.equal(result.status, "completed");
     assert.equal(requests.length, 5);
     assert.match(requests[2]?.messages[0]?.content ?? "", /structured rolling summary/i);
+    assert.equal(requests[2]?.maxOutputTokens, 4_096);
     assert.equal(f.store.loadContextSnapshot(f.sessionId)?.summary, "Goal: finish the request.\nCurrent state: planned.");
     assert.ok(requests[3]?.messages.some((message) => message.role === "system" && message.content.includes("Conversation summary")));
   } finally {

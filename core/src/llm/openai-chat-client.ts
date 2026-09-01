@@ -176,7 +176,7 @@ export class OpenAIChatClient implements ModelProvider {
     const completion = await this.client.chat.completions.create({
       model: this.config.model!,
       messages: completionMessages(request),
-      max_tokens: this.config.maxOutputTokens,
+      max_tokens: request.maxOutputTokens ?? this.config.maxOutputTokens,
       stream: true,
       ...(request.tools === undefined ? {} : { tools: [...request.tools] as ChatCompletionTool[] }),
     }, { signal: request.signal });

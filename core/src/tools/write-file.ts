@@ -139,7 +139,7 @@ async function prepareWriteFile(input: WriteFileInput, context: ToolContext): Pr
     bytes,
     permission: {
       kind: "write",
-      title: `Create ${resolved.relativePath}`,
+      title: `Create ${resolved.relativePath} (${bytes.length} bytes)`,
       preview: {
         path: resolved.relativePath,
         replacementCount: 1,

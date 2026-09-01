@@ -215,6 +215,7 @@ export class AgentOrchestrator {
               : [{ role: "system" as const, content: `Previous rolling summary:\n${request.previousSummary}` }]),
             ...request.messages,
           ],
+          maxOutputTokens: request.maxOutputTokens,
           ...(request.signal === undefined ? {} : { signal: request.signal }),
         });
         if (response.toolCalls.length > 0) {

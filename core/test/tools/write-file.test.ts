@@ -104,6 +104,7 @@ test("write_file publishes a complete new file only after one-shot approval", as
     ]);
     assert.equal(requests.length, 1);
     assert.equal(requests[0]?.kind, "write");
+    assert.equal(requests[0]?.title, "Create created.txt (12 bytes)");
     if (requests[0]?.kind === "write") {
       assert.equal(requests[0].preview.path, "created.txt");
       assert.equal(requests[0].preview.before, "");

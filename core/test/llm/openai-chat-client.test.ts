@@ -114,6 +114,21 @@ test("streams text deltas and returns their complete assistant content", async (
   }
 });
 
+test("honors a narrower per-request output cap for context summarization", async () => {
+  const server = await scriptedServer((_request, response) => {
+    stream(response, [{ choices: [{ index: 0, delta: { content: "short" }, finish_reason: "stop" }] }]);
+  });
+  try {
+    await new OpenAIChatClient(config(server.baseUrl)).stream({
+      messages: [{ role: "user", content: "Summarize" }],
+      maxOutputTokens: 123,
+    });
+    assert.equal((server.requests[0]?.body as { max_tokens?: unknown }).max_tokens, 123);
+  } finally {
+    await server.close();
+  }
+});
+
 test("serializes system, assistant-tool, and tool-result history for a continuation", async () => {
   const server = await scriptedServer((_request, response) => {
     stream(response, [{ choices: [{ index: 0, delta: { content: "continued" }, finish_reason: "stop" }] }]);

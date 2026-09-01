@@ -51,6 +51,7 @@ export interface FunctionToolDefinition {
 export interface ModelStreamRequest {
   readonly messages: readonly ModelMessage[];
   readonly tools?: readonly FunctionToolDefinition[];
+  readonly maxOutputTokens?: number;
   readonly onTextDelta?: (delta: string) => void;
   readonly signal?: AbortSignal;
 }
