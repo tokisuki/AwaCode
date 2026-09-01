@@ -16,6 +16,7 @@ import { ToolRegistry, ToolRegistryError } from "../tools/registry.ts";
 
 export type AgentPhase = "plan" | "execute" | "reflect" | "closing";
 export type AgentTerminalStatus = "completed" | "cancelled" | "error";
+export type AgentStatusNotificationStatus = "busy" | "done" | "cancelled" | "error";
 
 interface EventBase {
   runId: string;
@@ -27,8 +28,20 @@ export type AgentNotification =
   | { method: "stream/text"; params: EventBase & { messageId: string; phase: AgentPhase; delta: string; provisional: boolean } }
   | { method: "stream/commit"; params: EventBase & { messageId: string } }
   | { method: "tool/start"; params: EventBase & { callId: string; ordinal: number; name: string } }
-  | { method: "tool/end"; params: EventBase & { callId: string; ordinal: number; name: string; status: ToolResult["status"] } }
-  | { method: "agent/status"; params: EventBase & { status: AgentTerminalStatus; reason: string } };
+  | {
+    method: "tool/end";
+    params: EventBase & {
+      callId: string;
+      ordinal: number;
+      name: string;
+      status: ToolResult["status"];
+      durationMs: number;
+      summary: string;
+      content: string;
+      metadata: Record<string, unknown>;
+    };
+  }
+  | { method: "agent/status"; params: EventBase & { status: AgentStatusNotificationStatus; reason: string } };
 
 export interface AgentRunInput {
   readonly sessionId: string;
@@ -197,6 +210,7 @@ export class AgentOrchestrator {
     }
     const controller = new AbortController();
     const runId = this.options.createRunId?.() ?? randomUUID();
+    this.notificationQueue = Promise.resolve();
     this.active = controller;
     this.activeRunId = runId;
     this.eventSeq = 0;
@@ -206,8 +220,10 @@ export class AgentOrchestrator {
     this.previousCanonicalCall = undefined;
     this.consecutiveCanonicalCalls = 0;
     let finalText = "";
+    let sessionLoaded = false;
     try {
       this.options.store.loadSession(input.sessionId);
+      sessionLoaded = true;
       prepareProviderHistory(this.options.store, input.sessionId);
       const user = this.options.store.insertMessage({
         sessionId: input.sessionId,
@@ -216,6 +232,7 @@ export class AgentOrchestrator {
         payload: { text: input.prompt, phase: "user" },
       });
       this.options.store.setSessionStatus(input.sessionId, "running");
+      await this.status("busy", "run_started");
 
       await this.phase("plan");
       const plan = await this.providerTurn(input.sessionId, user.id, "plan", [], PLAN_PROMPT, false);
@@ -236,7 +253,7 @@ export class AgentOrchestrator {
       if (execution.stopReason !== null) {
         const result = this.result(runId, finalText, "completed", execution.stopReason);
         this.options.store.setSessionStatus(input.sessionId, "completed");
-        await this.status(result.status, result.reason);
+        await this.status("done", result.reason);
         return result;
       }
 
@@ -285,7 +302,7 @@ export class AgentOrchestrator {
         if (remedialExecution.stopReason !== null) {
           const result = this.result(runId, finalText, "completed", remedialExecution.stopReason);
           this.options.store.setSessionStatus(input.sessionId, "completed");
-          await this.status(result.status, result.reason);
+          await this.status("done", result.reason);
           return result;
         }
         await this.commit(remedial.message.id);
@@ -294,23 +311,30 @@ export class AgentOrchestrator {
       }
       const result = this.result(runId, finalText, "completed", decision.reason);
       this.options.store.setSessionStatus(input.sessionId, "completed");
-      await this.status(result.status, result.reason);
+      await this.status("done", result.reason);
       return result;
     } catch (error) {
+      if (!sessionLoaded) {
+        throw error;
+      }
       this.options.store.interruptSessionState(input.sessionId);
       if (controller.signal.aborted) {
         const result = this.result(runId, finalText, "cancelled", "cancelled");
         this.options.store.setSessionStatus(input.sessionId, "cancelled");
-        await this.status(result.status, result.reason);
+        await this.status("cancelled", result.reason).catch(() => undefined);
         throw new AgentCancelledError(result);
       }
       this.options.store.setSessionStatus(input.sessionId, "error");
-      await this.status("error", error instanceof HistoryIntegrityError ? error.code : "agent_run_error");
+      await this.status("error", error instanceof HistoryIntegrityError ? error.code : "agent_run_error")
+        .catch(() => undefined);
       throw error;
     } finally {
-      await this.notificationQueue;
-      this.active = undefined;
-      this.activeRunId = undefined;
+      try {
+        await this.notificationQueue.catch(() => undefined);
+      } finally {
+        this.active = undefined;
+        this.activeRunId = undefined;
+      }
     }
   }
 
@@ -398,7 +422,7 @@ export class AgentOrchestrator {
       status: "failure",
       result,
     });
-    await this.emit("tool/end", { callId, ordinal, name, status: result.status });
+    await this.toolEnd(callId, ordinal, name, result);
   }
 
   private async closingTurn(
@@ -446,7 +470,7 @@ export class AgentOrchestrator {
         status: "failure",
         result,
       });
-      await this.emit("tool/end", { callId, ordinal, name, status: result.status });
+      await this.toolEnd(callId, ordinal, name, result);
       return result;
     }
     this.executedToolCalls += 1;
@@ -479,7 +503,7 @@ export class AgentOrchestrator {
     } else {
       result = await definition.execute(input, context);
     }
-    await this.emit("tool/end", { callId, ordinal, name, status: result.status });
+    await this.toolEnd(callId, ordinal, name, result);
     return result;
   }
 
@@ -519,7 +543,7 @@ export class AgentOrchestrator {
             phase,
             delta,
             provisional,
-          });
+          }).catch(() => undefined);
         },
       });
       await this.notificationQueue;
@@ -559,7 +583,25 @@ export class AgentOrchestrator {
     await this.emit("stream/commit", { messageId });
   }
 
-  private async status(status: AgentTerminalStatus, reason: string): Promise<void> {
+  private async toolEnd(
+    callId: string,
+    ordinal: number,
+    name: string,
+    result: ToolResult,
+  ): Promise<void> {
+    await this.emit("tool/end", {
+      callId,
+      ordinal,
+      name,
+      status: result.status,
+      durationMs: result.durationMs,
+      summary: result.summary,
+      content: result.content,
+      metadata: result.metadata,
+    });
+  }
+
+  private async status(status: AgentStatusNotificationStatus, reason: string): Promise<void> {
     await this.emit("agent/status", { status, reason });
   }
 

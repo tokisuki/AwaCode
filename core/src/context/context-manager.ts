@@ -143,7 +143,12 @@ export class ContextManager {
       summaryUptoSeq: existing?.summaryUptoSeq ?? 0,
     });
 
-    const blocks = input.history.map(entryBlock);
+    const summaryCutoff = existing?.summary === null || existing?.summary === undefined
+      ? 0
+      : existing.summaryUptoSeq;
+    const blocks = input.history
+      .filter((entry) => entry.seq > summaryCutoff || entry.messageId === input.currentUserMessageId)
+      .map(entryBlock);
     const requiredIndex = blocks.findIndex((block) => block.messageId === input.currentUserMessageId);
     if (requiredIndex === -1) {
       throw new ContextBudgetError();

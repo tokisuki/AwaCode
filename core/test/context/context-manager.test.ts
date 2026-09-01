@@ -160,6 +160,65 @@ test("context snapshots preserve summaries and refresh named source hooks withou
   }
 });
 
+test("a persisted summary excludes covered entries while retaining the required current user at its cutoff", async () => {
+  const { connection, store, session } = await fixture("summary-cutoff");
+  try {
+    store.saveContextSnapshot({
+      sessionId: session.id,
+      baseline: "baseline",
+      sourceSnapshot: {},
+      baselineSeq: 0,
+      summary: "covered history",
+      summaryUptoSeq: 2,
+    });
+    const manager = new ContextManager(store);
+    const built = await manager.build({
+      sessionId: session.id,
+      history: [
+        {
+          type: "message",
+          messageId: "covered-old",
+          seq: 1,
+          role: "user",
+          kind: "text",
+          payload: { text: "must not be repeated" },
+        },
+        {
+          type: "message",
+          messageId: "current-at-cutoff",
+          seq: 2,
+          role: "user",
+          kind: "text",
+          payload: { text: "required current" },
+        },
+        {
+          type: "message",
+          messageId: "after-summary",
+          seq: 3,
+          role: "assistant",
+          kind: "text",
+          payload: { text: "new answer" },
+        },
+      ],
+      currentUserMessageId: "current-at-cutoff",
+      systemText: "ignored new baseline",
+      tools: [],
+      contextLimit: 8_000,
+      maxOutputTokens: 1_000,
+    });
+
+    assert.deepEqual(built.selectedMessageIds, ["current-at-cutoff", "after-summary"]);
+    assert.deepEqual(built.messages, [
+      { role: "system", content: "baseline" },
+      { role: "system", content: "Conversation summary:\ncovered history" },
+      { role: "user", content: "required current" },
+      { role: "assistant", content: "new answer", toolCalls: [] },
+    ]);
+  } finally {
+    connection.close();
+  }
+});
+
 test("context construction fails clearly when the required current user message cannot fit", async () => {
   const { connection, store, session } = await fixture("over-budget");
   try {

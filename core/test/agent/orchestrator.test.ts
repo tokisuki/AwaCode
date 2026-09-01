@@ -182,8 +182,48 @@ test("Plan, serial tools, provisional Execute text, and valid Reflect complete f
     assert.deepEqual(notifications.map((event) => event.params.eventSeq),
       notifications.map((_, index) => index + 1));
     assert.equal(notifications.every((event) => event.params.runId === "run-happy"), true);
+    assert.deepEqual(notifications[0], {
+      method: "agent/status",
+      params: { runId: "run-happy", eventSeq: 1, status: "busy", reason: "run_started" },
+    });
+    const toolEnds = notifications.filter((event) => event.method === "tool/end");
+    assert.deepEqual(toolEnds.map((event) => ({
+      callId: event.params.callId,
+      ordinal: event.params.ordinal,
+      name: event.params.name,
+      status: event.params.status,
+      durationMs: event.params.durationMs,
+      summary: event.params.summary,
+      content: event.params.content,
+      metadata: event.params.metadata,
+    })), [
+      {
+        callId: "call-alpha",
+        ordinal: 0,
+        name: "alpha",
+        status: "success",
+        durationMs: 1,
+        summary: "alpha completed",
+        content: "A",
+        metadata: { name: "alpha" },
+      },
+      {
+        callId: "call-beta",
+        ordinal: 1,
+        name: "beta",
+        status: "success",
+        durationMs: 1,
+        summary: "beta completed",
+        content: "B",
+        metadata: { name: "beta" },
+      },
+    ]);
     assert.equal(notifications.some((event) => event.method === "stream/commit"
       && event.params.messageId === "durable-5"), true);
+    assert.deepEqual(notifications.at(-1), {
+      method: "agent/status",
+      params: { runId: "run-happy", eventSeq: notifications.length, status: "done", reason: "verified" },
+    });
 
     const loaded = f.store.loadSession(f.sessionId);
     assert.equal(loaded.session.status, "completed");
@@ -414,14 +454,19 @@ test("unexpected Plan tool calls are rejected but first settled into complete hi
   }
 });
 
-test("a notification failure after a tool block is durable settles that session instead of leaving pending work", async () => {
+test("a failed required notification settles the run without side effects and does not poison the next run", async () => {
   const f = await fixture("notification-failure");
+  const order: string[] = [];
   const registry = new ToolRegistry();
-  registry.register(scriptedTool("alpha", []));
+  registry.register(scriptedTool("alpha", order));
   const provider = new ScriptedProvider([
     response("Plan."),
     response("", [{ id: "notify-call", name: "alpha", arguments: "{\"value\":\"A\"}" }]),
+    response("Second plan."),
+    response("Second candidate."),
+    response('{"status":"complete","reason":"second run completed"}'),
   ]);
+  let failToolStart = true;
   const orchestrator = new AgentOrchestrator({
     store: f.store,
     provider,
@@ -431,7 +476,7 @@ test("a notification failure after a tool block is durable settles that session 
     contextLimit: 32_768,
     maxOutputTokens: 4_096,
     notify(notification) {
-      if (notification.method === "tool/start") {
+      if (failToolStart && notification.method === "tool/start") {
         throw new Error("fixture notification failure");
       }
     },
@@ -445,6 +490,99 @@ test("a notification failure after a tool block is durable settles that session 
       ["notify-call", "interrupted", true],
     ]);
     assert.equal(loaded.messages.filter((message) => message.status === "streaming").length, 0);
+    assert.deepEqual(order, []);
+    assert.equal(orchestrator.cancel(), false);
+
+    failToolStart = false;
+    const second = await orchestrator.run({ sessionId: f.sessionId, prompt: "Try again" });
+    assert.equal(second.status, "completed");
+    assert.equal(second.finalText, "Second candidate.");
+    assert.equal(orchestrator.cancel(), false);
+  } finally {
+    f.connection.close();
+  }
+});
+
+test("a failed fire-and-forget text notification is observed by the run without an unhandled rejection", async () => {
+  const f = await fixture("text-notification-failure");
+  let providerCalls = 0;
+  const provider: ModelProvider = {
+    async stream(request) {
+      providerCalls += 1;
+      const scripted = providerCalls === 1
+        ? response("first plan")
+        : providerCalls === 2
+          ? response("second plan")
+          : providerCalls === 3
+            ? response("second candidate")
+            : response('{"status":"complete","reason":"recovered"}');
+      request.onTextDelta?.(scripted.content);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      return scripted;
+    },
+  };
+  let failText = true;
+  const unhandled: unknown[] = [];
+  const onUnhandled = (error: unknown) => { unhandled.push(error); };
+  process.on("unhandledRejection", onUnhandled);
+  const orchestrator = new AgentOrchestrator({
+    store: f.store,
+    provider,
+    tools: new ToolRegistry(),
+    permissionClient: allowPermission,
+    workspace: f.workspace,
+    contextLimit: 32_768,
+    maxOutputTokens: 4_096,
+    notify(notification) {
+      if (failText && notification.method === "stream/text") {
+        throw new Error("fixture text notification failure");
+      }
+    },
+  });
+
+  try {
+    await assert.rejects(orchestrator.run({ sessionId: f.sessionId, prompt: "First" }), /text notification failure/);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(unhandled, []);
+    assert.equal(orchestrator.cancel(), false);
+    failText = false;
+    assert.equal((await orchestrator.run({ sessionId: f.sessionId, prompt: "Second" })).status, "completed");
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+    f.connection.close();
+  }
+});
+
+test("a session-load failure is not masked by cleanup for a session that was never opened", async () => {
+  const f = await fixture("load-failure");
+  const originalError = new Error("fixture original load failure");
+  let cleanupCalls = 0;
+  Object.defineProperty(f.store, "loadSession", {
+    configurable: true,
+    value() { throw originalError; },
+  });
+  Object.defineProperty(f.store, "interruptSessionState", {
+    configurable: true,
+    value() {
+      cleanupCalls += 1;
+      throw new Error("fixture cleanup failure");
+    },
+  });
+  const orchestrator = new AgentOrchestrator({
+    store: f.store,
+    provider: new ScriptedProvider([]),
+    tools: new ToolRegistry(),
+    permissionClient: allowPermission,
+    workspace: f.workspace,
+    contextLimit: 32_768,
+    maxOutputTokens: 4_096,
+  });
+
+  try {
+    await assert.rejects(orchestrator.run({ sessionId: f.sessionId, prompt: "Load" }),
+      (error: unknown) => error === originalError);
+    assert.equal(cleanupCalls, 0);
+    assert.equal(orchestrator.cancel(), false);
   } finally {
     f.connection.close();
   }
