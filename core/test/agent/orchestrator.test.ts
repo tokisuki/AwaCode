@@ -15,6 +15,8 @@ import type {
   ModelProvider,
   ModelStreamRequest,
 } from "../../src/llm/types.ts";
+import { ModelContextOverflowError } from "../../src/llm/types.ts";
+import { ContextCompressionError } from "../../src/context/context-manager.ts";
 import { openDatabase } from "../../src/persistence/database.ts";
 import { SessionStore } from "../../src/persistence/session-store.ts";
 import { RpcFault } from "../../src/protocol/json-rpc.ts";
@@ -813,6 +815,84 @@ test("agent RPC maps persisted incomplete tool history to history-integrity with
   } finally {
     client.close();
     server.close();
+    f.connection.close();
+  }
+});
+
+test("provider context overflow triggers one persisted compression and retries the original turn once", async () => {
+  const f = await fixture("overflow-retry");
+  const requests: ModelStreamRequest[] = [];
+  const script: Array<AssistantModelMessage | Error> = [
+    response("Plan."),
+    new ModelContextOverflowError(),
+    response("Goal: finish the request.\nCurrent state: planned."),
+    response("Candidate complete."),
+    response('{"status":"complete","reason":"verified"}'),
+  ];
+  const provider: ModelProvider = {
+    async stream(request) {
+      requests.push({ messages: structuredClone(request.messages), ...(request.tools === undefined ? {} : { tools: structuredClone(request.tools) }) });
+      const next = script.shift();
+      assert.ok(next);
+      if (next instanceof Error) throw next;
+      return next;
+    },
+  };
+  const orchestrator = new AgentOrchestrator({
+    store: f.store,
+    provider,
+    tools: new ToolRegistry(),
+    permissionClient: allowPermission,
+    workspace: f.workspace,
+    contextLimit: 32_768,
+    maxOutputTokens: 4_096,
+  });
+  try {
+    const result = await orchestrator.run({ sessionId: f.sessionId, prompt: "Do it" });
+    assert.equal(result.status, "completed");
+    assert.equal(requests.length, 5);
+    assert.match(requests[2]?.messages[0]?.content ?? "", /structured rolling summary/i);
+    assert.equal(f.store.loadContextSnapshot(f.sessionId)?.summary, "Goal: finish the request.\nCurrent state: planned.");
+    assert.ok(requests[3]?.messages.some((message) => message.role === "system" && message.content.includes("Conversation summary")));
+  } finally {
+    f.connection.close();
+  }
+});
+
+test("a second provider overflow after compression fails explicitly without a third original attempt", async () => {
+  const f = await fixture("overflow-twice");
+  let calls = 0;
+  const script: Array<AssistantModelMessage | Error> = [
+    response("Plan."),
+    new ModelContextOverflowError(),
+    response("compressed"),
+    new ModelContextOverflowError(),
+  ];
+  const orchestrator = new AgentOrchestrator({
+    store: f.store,
+    provider: {
+      async stream() {
+        calls += 1;
+        const next = script.shift();
+        assert.ok(next);
+        if (next instanceof Error) throw next;
+        return next;
+      },
+    },
+    tools: new ToolRegistry(),
+    permissionClient: allowPermission,
+    workspace: f.workspace,
+    contextLimit: 32_768,
+    maxOutputTokens: 4_096,
+  });
+  try {
+    await assert.rejects(
+      orchestrator.run({ sessionId: f.sessionId, prompt: "Do it" }),
+      (error: unknown) => error instanceof ContextCompressionError && error.code === "context_overflow_after_compression",
+    );
+    assert.equal(calls, 4);
+    assert.ok(f.store.loadSession(f.sessionId).messages.length >= 2);
+  } finally {
     f.connection.close();
   }
 });

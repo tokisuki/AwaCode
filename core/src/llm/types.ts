@@ -58,3 +58,14 @@ export interface ModelStreamRequest {
 export interface ModelProvider {
   stream(request: ModelStreamRequest): Promise<AssistantModelMessage>;
 }
+
+export class ModelContextOverflowError extends Error {
+  readonly code = "context_overflow" as const;
+  readonly diagnostic: unknown;
+
+  constructor(diagnostic: unknown = {}) {
+    super("Model context window overflowed.");
+    this.name = "ModelContextOverflowError";
+    this.diagnostic = diagnostic;
+  }
+}

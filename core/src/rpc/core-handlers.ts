@@ -21,6 +21,7 @@ import {
 } from "../agent/orchestrator.ts";
 import { HistoryIntegrityError } from "../session/history.ts";
 import type { MemoryStore } from "../memory/memory-store.ts";
+import { ContextBudgetError, ContextCompressionError } from "../context/context-manager.ts";
 
 export interface AgentControl {
   run(input: AgentRunInput): Promise<AgentRunResult>;
@@ -173,6 +174,18 @@ function agentFault(error: unknown): never {
   }
   if (error instanceof HistoryIntegrityError) {
     throw new RpcFault(RPC_ERROR_CODES.historyIntegrity, "Session history is incomplete");
+  }
+  if (error instanceof ContextCompressionError) {
+    throw new RpcFault(RPC_ERROR_CODES.contextLimit, "Model context could not be compressed to fit", {
+      reason: error.code,
+      suggestion: "Increase the context limit or start a new session.",
+    });
+  }
+  if (error instanceof ContextBudgetError) {
+    throw new RpcFault(RPC_ERROR_CODES.contextLimit, "Required model context does not fit", {
+      reason: error.code,
+      suggestion: "Increase the context limit or start a new session.",
+    });
   }
   if (error instanceof ModelConfigOperationError) {
     return configFault(error);

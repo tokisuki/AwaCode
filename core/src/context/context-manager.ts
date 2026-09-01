@@ -14,6 +14,18 @@ export class ContextBudgetError extends Error {
   }
 }
 
+export class ContextCompressionError extends Error {
+  readonly code: "context_compression_failed" | "context_overflow_after_compression";
+
+  constructor(code: ContextCompressionError["code"], options: ErrorOptions = {}) {
+    super(code === "context_compression_failed"
+      ? "Context compression failed; increase the context limit or start a new session."
+      : "The model context still overflowed after one compression retry; increase the context limit or start a new session.", options);
+    this.name = "ContextCompressionError";
+    this.code = code;
+  }
+}
+
 export interface ContextSourceSnapshotHook {
   readonly name: string;
   read(): unknown | Promise<unknown>;
@@ -21,6 +33,14 @@ export interface ContextSourceSnapshotHook {
 
 export interface ContextManagerOptions {
   readonly sourceSnapshotHooks?: readonly ContextSourceSnapshotHook[];
+  readonly summaryGenerator?: (request: SummaryRequest) => Promise<string>;
+}
+
+export interface SummaryRequest {
+  readonly previousSummary: string | null;
+  readonly messages: readonly ModelMessage[];
+  readonly maxOutputTokens: number;
+  readonly signal?: AbortSignal;
 }
 
 export interface BuildContextInput {
@@ -32,7 +52,8 @@ export interface BuildContextInput {
   readonly tools: readonly FunctionToolDefinition[];
   readonly contextLimit: number;
   readonly maxOutputTokens: number;
-  readonly memory?: MemoryTexts;
+  readonly memory?: MemoryTexts | null;
+  readonly signal?: AbortSignal;
 }
 
 export interface BuiltContext {
@@ -45,6 +66,7 @@ export interface BuiltContext {
 
 interface ModelBlock {
   readonly messageId: string;
+  readonly seq: number;
   readonly messages: readonly ModelMessage[];
   readonly tokens: number;
 }
@@ -101,6 +123,7 @@ function entryBlock(entry: ProviderHistoryEntry): ModelBlock {
   }
   return {
     messageId: entry.messageId,
+    seq: entry.seq,
     messages,
     tokens: estimateTextTokens(JSON.stringify(messages)),
   };
@@ -110,26 +133,67 @@ function fixedTokens(messages: readonly ModelMessage[], tools: readonly Function
   return estimateTextTokens(JSON.stringify(messages)) + estimateTextTokens(JSON.stringify(tools));
 }
 
+function memoryFromSnapshot(value: unknown): MemoryTexts | undefined {
+  if (typeof value !== "object" || value === null || !("memory" in value)) return undefined;
+  const memory = (value as { memory?: unknown }).memory;
+  if (
+    typeof memory !== "object"
+    || memory === null
+    || !("global" in memory)
+    || !("project" in memory)
+    || typeof memory.global !== "string"
+    || typeof memory.project !== "string"
+  ) return undefined;
+  return { global: memory.global, project: memory.project };
+}
+
 export class ContextManager {
   private readonly store: SessionStore;
   private readonly sourceSnapshotHooks: readonly ContextSourceSnapshotHook[];
+  private readonly summaryGenerator: ContextManagerOptions["summaryGenerator"];
 
   constructor(store: SessionStore, options: ContextManagerOptions = {}) {
     this.store = store;
     this.sourceSnapshotHooks = options.sourceSnapshotHooks ?? [];
+    this.summaryGenerator = options.summaryGenerator;
   }
 
   async build(input: BuildContextInput): Promise<BuiltContext> {
+    return this.buildInternal(input, true);
+  }
+
+  async compressForOverflow(input: BuildContextInput): Promise<boolean> {
+    if (this.summaryGenerator === undefined) {
+      return false;
+    }
+    const existing = this.store.loadContextSnapshot(input.sessionId);
+    const cutoff = existing?.summary === null || existing?.summary === undefined ? 0 : existing.summaryUptoSeq;
+    const candidates = input.history
+      .filter((entry) => entry.seq > cutoff && entry.messageId !== input.currentUserMessageId)
+      .map(entryBlock);
+    if (candidates.length === 0) {
+      return false;
+    }
+    const baseline = existing?.baseline ?? input.systemText;
+    const sourceSnapshot = existing?.sourceSnapshot ?? {};
+    await this.compressBlocks(input, existing?.summary ?? null, baseline, sourceSnapshot, candidates);
+    return true;
+  }
+
+  private async buildInternal(input: BuildContextInput, allowCompression: boolean): Promise<BuiltContext> {
     const usable = input.contextLimit - input.maxOutputTokens;
     const recentBudget = recentContextBudget(input.contextLimit, input.maxOutputTokens);
     const existing = this.store.loadContextSnapshot(input.sessionId);
     const baseline = existing?.baseline ?? input.systemText;
+    const effectiveMemory = input.memory === null
+      ? memoryFromSnapshot(existing?.sourceSnapshot)
+      : input.memory;
     const prefix: ModelMessage[] = [{ role: "system", content: baseline }];
-    if (input.memory?.global.length) {
-      prefix.push({ role: "system", content: `Global memory:\n${input.memory.global}` });
+    if (effectiveMemory?.global.length) {
+      prefix.push({ role: "system", content: `Global memory:\n${effectiveMemory.global}` });
     }
-    if (input.memory?.project.length) {
-      prefix.push({ role: "system", content: `Project memory (takes priority over global memory):\n${input.memory.project}` });
+    if (effectiveMemory?.project.length) {
+      prefix.push({ role: "system", content: `Project memory (takes priority over global memory):\n${effectiveMemory.project}` });
     }
     if (existing?.summary !== null && existing?.summary !== undefined && existing.summary.length > 0) {
       prefix.push({ role: "system", content: `Conversation summary:\n${existing.summary}` });
@@ -139,16 +203,30 @@ export class ContextManager {
       : [{ role: "system", content: input.transientSystemText }];
     const sourceSnapshot: Record<string, unknown> = {};
     for (const hook of this.sourceSnapshotHooks) {
-      sourceSnapshot[hook.name] = await hook.read();
+      try {
+        sourceSnapshot[hook.name] = await hook.read();
+      } catch {
+        const previous = typeof existing?.sourceSnapshot === "object" && existing.sourceSnapshot !== null
+          ? existing.sourceSnapshot as Record<string, unknown>
+          : {};
+        if (Object.hasOwn(previous, hook.name)) {
+          sourceSnapshot[hook.name] = previous[hook.name];
+        }
+      }
     }
-    const persistedSource = this.sourceSnapshotHooks.length === 0
-      ? input.memory === undefined
-        ? existing?.sourceSnapshot ?? {}
+    const persistedSource = input.memory === null
+      ? existing?.sourceSnapshot ?? {}
+      : input.memory === undefined
+        ? this.sourceSnapshotHooks.length === 0 ? existing?.sourceSnapshot ?? {} : sourceSnapshot
         : {
-            globalMemorySha256: createHash("sha256").update(input.memory.global).digest("hex"),
-            projectMemorySha256: createHash("sha256").update(input.memory.project).digest("hex"),
-          }
-      : sourceSnapshot;
+            ...(this.sourceSnapshotHooks.length === 0 ? {} : sourceSnapshot),
+            memory: {
+              global: input.memory.global,
+              project: input.memory.project,
+              globalSha256: createHash("sha256").update(input.memory.global).digest("hex"),
+              projectSha256: createHash("sha256").update(input.memory.project).digest("hex"),
+            },
+          };
     this.store.saveContextSnapshot({
       sessionId: input.sessionId,
       baseline,
@@ -189,6 +267,17 @@ export class ContextManager {
       }
     }
     const selectedBlocks = blocks.filter((_, index) => selected.has(index));
+    const evictedBlocks = blocks.filter((block, index) => !selected.has(index) && block.messageId !== input.currentUserMessageId);
+    if (allowCompression && evictedBlocks.length > 0 && this.summaryGenerator !== undefined) {
+      await this.compressBlocks(
+        input,
+        existing?.summary ?? null,
+        baseline,
+        persistedSource,
+        evictedBlocks,
+      );
+      return this.buildInternal(input, false);
+    }
     const messages = [...prefix, ...selectedBlocks.flatMap((block) => block.messages), ...suffix];
     return {
       messages,
@@ -197,5 +286,41 @@ export class ContextManager {
       estimatedTokens: fixedTokens(messages, input.tools),
       sourceSnapshot: persistedSource as Readonly<Record<string, unknown>>,
     };
+  }
+
+  private async compressBlocks(
+    input: BuildContextInput,
+    previousSummary: string | null,
+    baseline: string,
+    sourceSnapshot: unknown,
+    blocks: readonly ModelBlock[],
+  ): Promise<void> {
+    try {
+      const messages = blocks.flatMap((block) => block.messages).map((message): ModelMessage =>
+        message.role === "tool"
+          ? { ...message, content: [...message.content].slice(0, 2_000).join("") }
+          : message);
+      const summary = (await this.summaryGenerator!({
+        previousSummary,
+        messages,
+        maxOutputTokens: Math.min(input.maxOutputTokens, 4_096),
+        ...(input.signal === undefined ? {} : { signal: input.signal }),
+      })).trim();
+      if (summary.length === 0) {
+        throw new Error("empty summary");
+      }
+      const summaryUptoSeq = Math.max(...blocks.map((block) => block.seq));
+      this.store.saveContextSnapshot({
+        sessionId: input.sessionId,
+        baseline,
+        sourceSnapshot,
+        baselineSeq: summaryUptoSeq,
+        summary,
+        summaryUptoSeq,
+      });
+    } catch (error) {
+      if (error instanceof ContextCompressionError) throw error;
+      throw new ContextCompressionError("context_compression_failed", { cause: error });
+    }
   }
 }

@@ -12,6 +12,7 @@ import { SessionStore } from "../../src/persistence/session-store.ts";
 import { JsonRpcPeer } from "../../src/protocol/rpc-peer.ts";
 import { RpcFault } from "../../src/protocol/json-rpc.ts";
 import { registerCoreHandlers } from "../../src/rpc/core-handlers.ts";
+import { ContextBudgetError, ContextCompressionError } from "../../src/context/context-manager.ts";
 
 const temporaryDirectories: string[] = [];
 
@@ -160,6 +161,57 @@ test("missing workspaces, projects, and sessions become application not-found fa
           && assert.deepEqual(error.data, data) === undefined,
       );
     }
+  } finally {
+    client.close();
+    server.close();
+    connection.close();
+  }
+});
+
+test("context compression exhaustion becomes an explicit RPC error", async () => {
+  const dataRoot = await temporaryDirectory("context-overflow-data");
+  const connection = await openDatabase({ env: { AWACODE_DATA_DIR: dataRoot } });
+  const store = new SessionStore(connection.db);
+  const { client, server } = connectedPeers();
+  registerCoreHandlers(server, {
+    store,
+    configService: new ModelConfigService({ env: { AWACODE_DATA_DIR: dataRoot } }),
+    agent: {
+      async run() { throw new ContextCompressionError("context_overflow_after_compression"); },
+      cancel() { return false; },
+    },
+  });
+  try {
+    await assert.rejects(client.request("agent/run", { sessionId: "session", prompt: "continue" }),
+      (error: unknown) => error instanceof RpcFault
+        && error.code === -32007
+        && error.message.includes("context")
+        && error.data !== undefined);
+  } finally {
+    client.close();
+    server.close();
+    connection.close();
+  }
+});
+
+test("required context that cannot fit becomes the same explicit RPC boundary", async () => {
+  const dataRoot = await temporaryDirectory("required-context-data");
+  const connection = await openDatabase({ env: { AWACODE_DATA_DIR: dataRoot } });
+  const store = new SessionStore(connection.db);
+  const { client, server } = connectedPeers();
+  registerCoreHandlers(server, {
+    store,
+    configService: new ModelConfigService({ env: { AWACODE_DATA_DIR: dataRoot } }),
+    agent: {
+      async run() { throw new ContextBudgetError(); },
+      cancel() { return false; },
+    },
+  });
+  try {
+    await assert.rejects(client.request("agent/run", { sessionId: "session", prompt: "continue" }),
+      (error: unknown) => error instanceof RpcFault
+        && error.code === -32007
+        && (error.data as { reason?: unknown }).reason === "required_context_too_large");
   } finally {
     client.close();
     server.close();

@@ -6,6 +6,7 @@ import test from "node:test";
 
 import {
   ContextBudgetError,
+  ContextCompressionError,
   ContextManager,
   estimateTextTokens,
   recentContextBudget,
@@ -296,6 +297,152 @@ test("global memory precedes project memory so project instructions have priorit
       { role: "system", content: "baseline" },
       { role: "system", content: "Global memory:\nUse tabs." },
       { role: "system", content: "Project memory (takes priority over global memory):\nUse spaces in this project." },
+    ]);
+  } finally {
+    connection.close();
+  }
+});
+
+test("rolling compression persists a replacement summary and never deletes SQLite messages", async () => {
+  const { connection, store, session } = await fixture("rolling-summary");
+  try {
+    const old = store.insertMessage({ sessionId: session.id, role: "user", kind: "text", payload: { text: "x".repeat(12_000) } });
+    const current = store.insertMessage({ sessionId: session.id, role: "user", kind: "text", payload: { text: "current request" } });
+    const summaryRequests: Array<{ previousSummary: string | null; messages: readonly unknown[] }> = [];
+    const manager = new ContextManager(store, {
+      summaryGenerator: async (request) => {
+        summaryRequests.push(request);
+        return "Goal: retain the old requirement.\nNext: handle the current request.";
+      },
+    });
+    const built = await manager.build({
+      sessionId: session.id,
+      history: [old, current].map((message) => ({
+        type: "message" as const,
+        messageId: message.id,
+        seq: message.seq,
+        role: message.role as "user",
+        kind: message.kind,
+        payload: message.payload,
+      })),
+      currentUserMessageId: current.id,
+      systemText: "baseline",
+      tools: [],
+      contextLimit: 2_100,
+      maxOutputTokens: 100,
+    });
+
+    assert.equal(summaryRequests.length, 1);
+    assert.equal(summaryRequests[0]?.previousSummary, null);
+    assert.equal(store.loadContextSnapshot(session.id)?.summaryUptoSeq, old.seq);
+    assert.equal(store.loadContextSnapshot(session.id)?.summary, "Goal: retain the old requirement.\nNext: handle the current request.");
+    assert.equal(store.loadSession(session.id).messages.length, 2);
+    assert.deepEqual(built.selectedMessageIds, [current.id]);
+    assert.ok(built.messages.some((message) => message.role === "system" && message.content.includes("retain the old requirement")));
+  } finally {
+    connection.close();
+  }
+});
+
+test("rolling compression replaces the old summary, truncates tool output, and advances its cutoff", async () => {
+  const { connection, store, session } = await fixture("rolling-replacement");
+  try {
+    store.saveContextSnapshot({
+      sessionId: session.id,
+      baseline: "baseline",
+      sourceSnapshot: {},
+      baselineSeq: 1,
+      summary: "previous summary",
+      summaryUptoSeq: 1,
+    });
+    let request: { previousSummary: string | null; messages: readonly { role: string; content: string | null }[] } | undefined;
+    const manager = new ContextManager(store, {
+      summaryGenerator: async (value) => {
+        request = value as typeof request;
+        return "replacement summary";
+      },
+    });
+    await manager.build({
+      sessionId: session.id,
+      history: [
+        {
+          type: "assistant_tool_block",
+          messageId: "old-tool",
+          seq: 2,
+          kind: "tool_calls",
+          payload: { text: "old tool" },
+          toolCalls: [{ callId: "call", ordinal: 0, toolName: "read_file", inputText: "{}" }],
+          toolResults: [{
+            callId: "call",
+            ordinal: 0,
+            status: "success",
+            kind: "normal",
+            result: { content: "z".repeat(20_000) },
+            errorText: null,
+          }],
+        },
+        { type: "message", messageId: "current", seq: 3, role: "user", kind: "text", payload: { text: "now" } },
+      ],
+      currentUserMessageId: "current",
+      systemText: "ignored",
+      tools: [],
+      contextLimit: 2_100,
+      maxOutputTokens: 100,
+    });
+
+    assert.equal(request?.previousSummary, "previous summary");
+    const toolResult = request?.messages.find((message) => message.role === "tool");
+    assert.ok(toolResult);
+    assert.ok((toolResult.content?.length ?? 0) <= 2_000);
+    assert.deepEqual(store.loadContextSnapshot(session.id)?.summaryUptoSeq, 2);
+    assert.equal(store.loadContextSnapshot(session.id)?.summary, "replacement summary");
+  } finally {
+    connection.close();
+  }
+});
+
+test("summary generation failure is explicit instead of silently dropping old history", async () => {
+  const { connection, store, session } = await fixture("summary-failure");
+  try {
+    const manager = new ContextManager(store, {
+      summaryGenerator: async () => { throw new Error("fixture summary failure"); },
+    });
+    await assert.rejects(manager.build({
+      sessionId: session.id,
+      history: [
+        { type: "message", messageId: "old", seq: 1, role: "user", kind: "text", payload: { text: "x".repeat(12_000) } },
+        { type: "message", messageId: "current", seq: 2, role: "user", kind: "text", payload: { text: "now" } },
+      ],
+      currentUserMessageId: "current",
+      systemText: "baseline",
+      tools: [],
+      contextLimit: 2_100,
+      maxOutputTokens: 100,
+    }), (error: unknown) => error instanceof ContextCompressionError && error.code === "context_compression_failed");
+    assert.equal(store.loadContextSnapshot(session.id)?.summary, null);
+  } finally {
+    connection.close();
+  }
+});
+
+test("a temporary memory read failure preserves the last successful source snapshot", async () => {
+  const { connection, store, session } = await fixture("memory-source-fallback");
+  try {
+    const manager = new ContextManager(store);
+    const input = {
+      sessionId: session.id,
+      history: [{ type: "message" as const, messageId: "current", seq: 1, role: "user" as const, kind: "text", payload: { text: "next" } }],
+      currentUserMessageId: "current",
+      systemText: "baseline",
+      tools: [],
+      contextLimit: 8_000,
+      maxOutputTokens: 1_000,
+    };
+    await manager.build({ ...input, memory: { global: "stable global", project: "stable project" } });
+    const recovered = await manager.build({ ...input, memory: null });
+    assert.deepEqual(recovered.messages.slice(1, 3), [
+      { role: "system", content: "Global memory:\nstable global" },
+      { role: "system", content: "Project memory (takes priority over global memory):\nstable project" },
     ]);
   } finally {
     connection.close();

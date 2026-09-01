@@ -9,6 +9,7 @@ import {
   OpenAIChatClient,
   OpenAIModelConnectionTester,
 } from "../../src/llm/openai-chat-client.ts";
+import { ModelContextOverflowError } from "../../src/llm/types.ts";
 
 interface CapturedRequest {
   readonly url: string | undefined;
@@ -390,6 +391,23 @@ test("returns a redacted model failure without response headers or credential fr
       assert.match(diagnostic, /\[REDACTED\]/);
       return true;
     });
+  } finally {
+    await server.close();
+  }
+});
+
+test("classifies a provider context-length response for ContextManager compression without transport retry", async () => {
+  let attempts = 0;
+  const server = await scriptedServer((_request, response) => {
+    attempts += 1;
+    response.writeHead(400, { "content-type": "application/json" });
+    response.end(JSON.stringify({ error: { code: "context_length_exceeded", message: "maximum context length exceeded" } }));
+  });
+  try {
+    await assert.rejects(new OpenAIChatClient(config(server.baseUrl)).stream({
+      messages: [{ role: "user", content: "oversized" }],
+    }), ModelContextOverflowError);
+    assert.equal(attempts, 1);
   } finally {
     await server.close();
   }

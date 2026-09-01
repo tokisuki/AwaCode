@@ -12,6 +12,7 @@ import { redactDiagnostic } from "../config/diagnostic-redactor.ts";
 import type { ModelConnectionTester } from "../config/model-config.ts";
 import { canRetryModelError, retryDelayMilliseconds } from "./retry.ts";
 import type { AssistantModelMessage, FunctionToolCall, ModelProvider, ModelStreamRequest } from "./types.ts";
+import { ModelContextOverflowError } from "./types.ts";
 
 function completionMessages(request: ModelStreamRequest): ChatCompletionMessageParam[] {
   return request.messages.map((message) => {
@@ -99,6 +100,23 @@ function diagnosticFor(error: unknown, apiKey: string): unknown {
   return redactDiagnostic(candidate, [apiKey]);
 }
 
+function isContextOverflowResponse(error: unknown): boolean {
+  if (typeof error !== "object" || error === null || !("status" in error) || error.status !== 400) {
+    return false;
+  }
+  const payload = "error" in error && typeof error.error === "object" && error.error !== null
+    ? error.error as Record<string, unknown>
+    : {};
+  const code = typeof payload.code === "string" ? payload.code.toLowerCase() : "";
+  const message = [
+    error instanceof Error ? error.message : "",
+    typeof payload.message === "string" ? payload.message : "",
+  ].join(" ").toLowerCase();
+  return code === "context_length_exceeded"
+    || code === "context_window_exceeded"
+    || /(?:maximum )?context (?:length|window).*(?:exceed|overflow)|too many tokens/u.test(message);
+}
+
 export class OpenAIChatClient implements ModelProvider {
   private readonly client: OpenAI;
   private readonly config: EffectiveModelConfig;
@@ -134,6 +152,9 @@ export class OpenAIChatClient implements ModelProvider {
         }
         if (error instanceof MalformedStreamError) {
           throw new ModelRequestError("malformed_stream", "Model stream was malformed", {});
+        }
+        if (isContextOverflowResponse(error)) {
+          throw new ModelContextOverflowError(diagnosticFor(error, this.config.apiKey!));
         }
         attempts += 1;
         if (!canRetryModelError(error, attempts, emittedOutput)) {

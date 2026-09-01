@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
 
-import { ContextManager } from "../context/context-manager.ts";
+import { ContextCompressionError, ContextManager, type BuildContextInput } from "../context/context-manager.ts";
 import type {
   AssistantModelMessage,
   FunctionToolDefinition,
   ModelProvider,
 } from "../llm/types.ts";
+import { ModelContextOverflowError } from "../llm/types.ts";
 import type { MessageRecord, SessionStore, SessionStatus } from "../persistence/session-store.ts";
 import type { MemoryStore } from "../memory/memory-store.ts";
 import type { WorkspaceGuard } from "../security/workspace-guard.ts";
@@ -118,6 +119,12 @@ const REFLECT_CORRECTION_PROMPT = 'The previous Reflect output was invalid or ma
 const MAX_EXECUTE_TURNS = 12;
 const MAX_TOOL_EXECUTIONS = 24;
 const DEFAULT_SYSTEM_PROMPT = "You are AwaCode, a careful coding agent. Call memory_write only when the current user explicitly asks to remember, update, or forget information. Never infer or automatically write memory. Default unspecified memory scope to project; use global only for explicit cross-project preferences.";
+const SUMMARY_PROMPT = "Generate a structured rolling summary of the conversation. Cover: goal; constraints and decisions; completed work; current state; blockers; next steps; relevant files. Replace, do not merely append to, any previous summary. Do not call tools.";
+
+function isContextOverflow(error: unknown): boolean {
+  return error instanceof ModelContextOverflowError
+    || (typeof error === "object" && error !== null && "code" in error && error.code === "context_overflow");
+}
 
 function toolDefinitions(registry: ToolRegistry): FunctionToolDefinition[] {
   return registry.list().map((tool) => ({
@@ -197,7 +204,25 @@ export class AgentOrchestrator {
 
   constructor(options: AgentOrchestratorOptions) {
     this.options = options;
-    this.contextManager = options.contextManager ?? new ContextManager(options.store);
+    this.contextManager = options.contextManager ?? new ContextManager(options.store, {
+      summaryGenerator: async (request) => {
+        this.modelTurns += 1;
+        const response = await this.options.provider.stream({
+          messages: [
+            { role: "system", content: SUMMARY_PROMPT },
+            ...(request.previousSummary === null
+              ? []
+              : [{ role: "system" as const, content: `Previous rolling summary:\n${request.previousSummary}` }]),
+            ...request.messages,
+          ],
+          ...(request.signal === undefined ? {} : { signal: request.signal }),
+        });
+        if (response.toolCalls.length > 0) {
+          throw new Error("Summary generation returned tool calls.");
+        }
+        return response.content;
+      },
+    });
   }
 
   cancel(): boolean {
@@ -534,8 +559,15 @@ export class AgentOrchestrator {
     provisional: boolean,
   ): Promise<StreamedTurn> {
     const history = validateProviderHistory(this.options.store, sessionId);
-    const memory = await this.options.memory?.store.read(this.options.memory.projectId);
-    const built = await this.contextManager.build({
+    let memory;
+    if (this.options.memory !== undefined) {
+      try {
+        memory = await this.options.memory.store.read(this.options.memory.projectId);
+      } catch {
+        memory = null;
+      }
+    }
+    const buildInput: BuildContextInput = {
       sessionId,
       history,
       currentUserMessageId,
@@ -545,29 +577,49 @@ export class AgentOrchestrator {
       contextLimit: this.options.contextLimit,
       maxOutputTokens: this.options.maxOutputTokens,
       ...(memory === undefined ? {} : { memory }),
-    });
+      signal: this.active!.signal,
+    };
+    let built = await this.contextManager.build(buildInput);
     const message = this.options.store.createStreamingAssistantMessage({
       sessionId,
       kind: phase,
       payload: { text: "", phase },
     });
+    let compressedRetry = false;
     try {
-      this.modelTurns += 1;
-      const response = await this.options.provider.stream({
-        messages: built.messages,
-        ...(tools.length === 0 ? {} : { tools }),
-        signal: this.active!.signal,
-        onTextDelta: (delta) => {
-          void this.emit("stream/text", {
-            messageId: message.id,
-            phase,
-            delta,
-            provisional,
-          }).catch(() => undefined);
-        },
-      });
-      await this.notificationQueue;
-      return { message, response };
+      while (true) {
+        try {
+          this.modelTurns += 1;
+          const response = await this.options.provider.stream({
+            messages: built.messages,
+            ...(tools.length === 0 ? {} : { tools }),
+            signal: this.active!.signal,
+            onTextDelta: (delta) => {
+              void this.emit("stream/text", {
+                messageId: message.id,
+                phase,
+                delta,
+                provisional,
+              }).catch(() => undefined);
+            },
+          });
+          await this.notificationQueue;
+          return { message, response };
+        } catch (error) {
+          if (!isContextOverflow(error)) {
+            throw error;
+          }
+          if (compressedRetry) {
+            throw new ContextCompressionError("context_overflow_after_compression", { cause: error });
+          }
+          const compressed = await this.contextManager.compressForOverflow(buildInput);
+          if (!compressed) {
+            throw new ContextCompressionError("context_overflow_after_compression", { cause: error });
+          }
+          compressedRetry = true;
+          built = await this.contextManager.build(buildInput);
+        }
+      }
     } catch (error) {
       this.options.store.interruptStreamingAssistantMessage(message.id);
       throw error;
