@@ -23,14 +23,15 @@ function isDeepSeekModel(model: string): boolean {
 function completionMessages(request: ModelStreamRequest, replayReasoningContent: boolean): ChatCompletionMessageParam[] {
   return request.messages.map((message) => {
     if (message.role === "assistant") {
+      const toolCalls = message.toolCalls.map((call) => ({
+        id: call.id,
+        type: "function" as const,
+        function: { name: call.name, arguments: call.arguments },
+      }));
       const assistant: ReasoningAssistantMessage = {
         role: "assistant",
         content: message.content,
-        tool_calls: message.toolCalls.map((call) => ({
-          id: call.id,
-          type: "function",
-          function: { name: call.name, arguments: call.arguments },
-        })),
+        ...(toolCalls.length === 0 ? {} : { tool_calls: toolCalls }),
       };
       if (replayReasoningContent) {
         assistant.reasoning_content = message.reasoningContent ?? "";

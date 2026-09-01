@@ -112,7 +112,6 @@ test("captures DeepSeek reasoning_content and replays it on tool-bearing request
       role: "assistant",
       content: "Plan.",
       reasoning_content: "inspect carefully",
-      tool_calls: [],
     });
   } finally {
     await server.close();
