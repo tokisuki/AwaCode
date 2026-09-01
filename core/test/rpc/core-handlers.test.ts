@@ -6,6 +6,7 @@ import { join, normalize } from "node:path";
 import test from "node:test";
 
 import { ModelConfigService } from "../../src/config/model-config.ts";
+import { MemoryStore } from "../../src/memory/memory-store.ts";
 import { openDatabase } from "../../src/persistence/database.ts";
 import { SessionStore } from "../../src/persistence/session-store.ts";
 import { JsonRpcPeer } from "../../src/protocol/rpc-peer.ts";
@@ -40,7 +41,7 @@ test.after(async () => {
   await Promise.all(temporaryDirectories.map((directory) => rm(directory, { recursive: true, force: true })));
 });
 
-test("real JsonRpcPeer calls receive the literal results of all five core handlers", async () => {
+test("real JsonRpcPeer calls receive the literal results of core and memory handlers", async () => {
   const dataRoot = await temporaryDirectory("data");
   const workspace = await temporaryDirectory("workspace");
   const normalizedWorkspace = normalize(await realpath(workspace));
@@ -52,8 +53,10 @@ test("real JsonRpcPeer calls receive the literal results of all five core handle
     randomUUID: () => "session-rpc-1",
   });
   const { client, server } = connectedPeers();
+  const memoryStore = new MemoryStore({ env: { AWACODE_DATA_DIR: dataRoot } });
   registerCoreHandlers(server, {
     store,
+    memoryStore,
     configService: new ModelConfigService({ env: { AWACODE_DATA_DIR: dataRoot } }),
     projectIdentityOptions: { env: cleanEnvironment() },
   });
@@ -85,6 +88,7 @@ test("real JsonRpcPeer calls receive the literal results of all five core handle
       messages: [],
       toolCalls: [],
     });
+    assert.deepEqual(await client.request("memory/read", { projectId }), { global: "", project: "" });
   } finally {
     client.close();
     server.close();
@@ -99,6 +103,7 @@ test("exact parameter validators reject missing, extra, and mistyped fields thro
   const { client, server } = connectedPeers();
   registerCoreHandlers(server, {
     store,
+    memoryStore: new MemoryStore({ env: { AWACODE_DATA_DIR: dataRoot } }),
     configService: new ModelConfigService({ env: { AWACODE_DATA_DIR: dataRoot } }),
     projectIdentityOptions: { env: cleanEnvironment() },
   });
@@ -111,6 +116,7 @@ test("exact parameter validators reject missing, extra, and mistyped fields thro
       ["session/list", { projectId: "missing", extra: true }],
       ["session/create", { projectId: "missing", title: null }],
       ["session/load", []],
+      ["memory/read", { projectId: "missing", extra: true }],
     ];
     for (const [method, params] of invalidCalls) {
       await assert.rejects(

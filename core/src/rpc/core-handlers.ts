@@ -20,6 +20,7 @@ import {
   type AgentRunResult,
 } from "../agent/orchestrator.ts";
 import { HistoryIntegrityError } from "../session/history.ts";
+import type { MemoryStore } from "../memory/memory-store.ts";
 
 export interface AgentControl {
   run(input: AgentRunInput): Promise<AgentRunResult>;
@@ -29,6 +30,7 @@ export interface AgentControl {
 export interface CoreHandlerDependencies {
   store: SessionStore;
   configService: ModelConfigService;
+  memoryStore?: MemoryStore;
   projectIdentityOptions?: ProjectIdentityOptions;
   agent?: AgentControl;
   startup?: {
@@ -222,6 +224,17 @@ export function registerCoreHandlers(peer: JsonRpcPeer, dependencies: CoreHandle
       return storeFault(error);
     }
   });
+
+  if (dependencies.memoryStore !== undefined) {
+    peer.register("memory/read", parseProject, async ({ projectId }) => {
+      try {
+        dependencies.store.listSessions(projectId);
+        return await dependencies.memoryStore!.read(projectId);
+      } catch (error) {
+        return storeFault(error);
+      }
+    });
+  }
 
   peer.register("config/status", parseConfigStatus, async () => {
     try {

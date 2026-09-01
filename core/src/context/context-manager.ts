@@ -1,4 +1,7 @@
+import { createHash } from "node:crypto";
+
 import type { FunctionToolDefinition, ModelMessage } from "../llm/types.ts";
+import type { MemoryTexts } from "../memory/memory-store.ts";
 import type { SessionStore } from "../persistence/session-store.ts";
 import type { ProviderHistoryEntry } from "../session/history.ts";
 
@@ -29,6 +32,7 @@ export interface BuildContextInput {
   readonly tools: readonly FunctionToolDefinition[];
   readonly contextLimit: number;
   readonly maxOutputTokens: number;
+  readonly memory?: MemoryTexts;
 }
 
 export interface BuiltContext {
@@ -121,6 +125,12 @@ export class ContextManager {
     const existing = this.store.loadContextSnapshot(input.sessionId);
     const baseline = existing?.baseline ?? input.systemText;
     const prefix: ModelMessage[] = [{ role: "system", content: baseline }];
+    if (input.memory?.global.length) {
+      prefix.push({ role: "system", content: `Global memory:\n${input.memory.global}` });
+    }
+    if (input.memory?.project.length) {
+      prefix.push({ role: "system", content: `Project memory (takes priority over global memory):\n${input.memory.project}` });
+    }
     if (existing?.summary !== null && existing?.summary !== undefined && existing.summary.length > 0) {
       prefix.push({ role: "system", content: `Conversation summary:\n${existing.summary}` });
     }
@@ -132,7 +142,12 @@ export class ContextManager {
       sourceSnapshot[hook.name] = await hook.read();
     }
     const persistedSource = this.sourceSnapshotHooks.length === 0
-      ? existing?.sourceSnapshot ?? {}
+      ? input.memory === undefined
+        ? existing?.sourceSnapshot ?? {}
+        : {
+            globalMemorySha256: createHash("sha256").update(input.memory.global).digest("hex"),
+            projectMemorySha256: createHash("sha256").update(input.memory.project).digest("hex"),
+          }
       : sourceSnapshot;
     this.store.saveContextSnapshot({
       sessionId: input.sessionId,

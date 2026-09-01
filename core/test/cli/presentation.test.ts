@@ -15,6 +15,7 @@ test("phase, stream, tool, and status notifications have compact terminal output
     summary: "Read demo.txt",
   }), "[tool 1] read_file success: Read demo.txt\n");
   assert.equal(formatCoreNotification("agent/status", { status: "done", reason: "verified" }), "\n[status] done: verified\n");
+  assert.equal(formatCoreNotification("memory/updated", { scope: "project", operation: "append" }), "[memory] project append\n");
 });
 
 test("loaded sessions show persisted messages and tool terminal states", () => {

@@ -21,6 +21,7 @@ const EVENT_METHODS = [
   "stream/commit",
   "tool/start",
   "tool/end",
+  "memory/updated",
   "agent/status",
 ] as const;
 

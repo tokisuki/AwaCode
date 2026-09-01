@@ -7,6 +7,7 @@ import type {
   ModelProvider,
 } from "../llm/types.ts";
 import type { MessageRecord, SessionStore, SessionStatus } from "../persistence/session-store.ts";
+import type { MemoryStore } from "../memory/memory-store.ts";
 import type { WorkspaceGuard } from "../security/workspace-guard.ts";
 import { HistoryIntegrityError, prepareProviderHistory, validateProviderHistory } from "../session/history.ts";
 import { transitionToolCall } from "../session/tool-call-state.ts";
@@ -28,6 +29,7 @@ export type AgentNotification =
   | { method: "stream/text"; params: EventBase & { messageId: string; phase: AgentPhase; delta: string; provisional: boolean } }
   | { method: "stream/commit"; params: EventBase & { messageId: string } }
   | { method: "tool/start"; params: EventBase & { callId: string; ordinal: number; name: string } }
+  | { method: "memory/updated"; params: EventBase & { scope: "global" | "project"; operation: string; characters: number } }
   | {
     method: "tool/end";
     params: EventBase & {
@@ -67,6 +69,7 @@ export interface AgentOrchestratorOptions {
   readonly maxOutputTokens: number;
   readonly systemPrompt?: string;
   readonly contextManager?: ContextManager;
+  readonly memory?: { store: MemoryStore; projectId: string };
   readonly createRunId?: () => string;
   readonly now?: () => number;
   readonly notify?: (notification: AgentNotification) => void | Promise<void>;
@@ -114,6 +117,7 @@ const REFLECT_PROMPT = 'Review the candidate. Return exactly {"status":"complete
 const REFLECT_CORRECTION_PROMPT = 'The previous Reflect output was invalid or malformed. Return only the exact JSON object {"status":"complete"|"continue","reason":string}. Do not call tools.';
 const MAX_EXECUTE_TURNS = 12;
 const MAX_TOOL_EXECUTIONS = 24;
+const DEFAULT_SYSTEM_PROMPT = "You are AwaCode, a careful coding agent. Call memory_write only when the current user explicitly asks to remember, update, or forget information. Never infer or automatically write memory. Default unspecified memory scope to project; use global only for explicit cross-project preferences.";
 
 function toolDefinitions(registry: ToolRegistry): FunctionToolDefinition[] {
   return registry.list().map((tool) => ({
@@ -485,6 +489,7 @@ export class AgentOrchestrator {
           permissionClient: this.options.permissionClient,
         },
       }),
+      ...(this.options.memory === undefined ? {} : { memoryRuntime: this.options.memory }),
     };
     let result: ToolResult;
     if (definition.approval === "none") {
@@ -504,6 +509,19 @@ export class AgentOrchestrator {
       result = await definition.execute(input, context);
     }
     await this.toolEnd(callId, ordinal, name, result);
+    if (
+      name === "memory_write"
+      && result.status === "success"
+      && (result.metadata.scope === "global" || result.metadata.scope === "project")
+      && typeof result.metadata.operation === "string"
+      && typeof result.metadata.characters === "number"
+    ) {
+      await this.emit("memory/updated", {
+        scope: result.metadata.scope,
+        operation: result.metadata.operation,
+        characters: result.metadata.characters,
+      });
+    }
     return result;
   }
 
@@ -516,15 +534,17 @@ export class AgentOrchestrator {
     provisional: boolean,
   ): Promise<StreamedTurn> {
     const history = validateProviderHistory(this.options.store, sessionId);
+    const memory = await this.options.memory?.store.read(this.options.memory.projectId);
     const built = await this.contextManager.build({
       sessionId,
       history,
       currentUserMessageId,
-      systemText: this.options.systemPrompt ?? "You are AwaCode, a careful coding agent.",
+      systemText: this.options.systemPrompt ?? DEFAULT_SYSTEM_PROMPT,
       transientSystemText: instruction,
       tools,
       contextLimit: this.options.contextLimit,
       maxOutputTokens: this.options.maxOutputTokens,
+      ...(memory === undefined ? {} : { memory }),
     });
     const message = this.options.store.createStreamingAssistantMessage({
       sessionId,

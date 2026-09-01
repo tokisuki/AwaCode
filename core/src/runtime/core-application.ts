@@ -11,6 +11,7 @@ import {
 } from "../config/model-config.ts";
 import { OpenAIChatClient, OpenAIModelConnectionTester } from "../llm/openai-chat-client.ts";
 import type { ModelProvider } from "../llm/types.ts";
+import { MemoryStore } from "../memory/memory-store.ts";
 import { openDatabase, type DatabaseConnection } from "../persistence/database.ts";
 import type { DataPathOptions } from "../persistence/data-paths.ts";
 import { SessionStore } from "../persistence/session-store.ts";
@@ -27,6 +28,7 @@ import { ToolRegistry } from "../tools/registry.ts";
 import { runCommandTool } from "../tools/run-command.ts";
 import { searchTextTool } from "../tools/search-text.ts";
 import { writeFileTool } from "../tools/write-file.ts";
+import { memoryWriteTool } from "../tools/memory-write.ts";
 
 export type ModelProviderFactory = (config: EffectiveModelConfig) => ModelProvider;
 
@@ -46,6 +48,7 @@ class PerSessionAgent implements AgentControl {
   private readonly configService: ModelConfigService;
   private readonly peer: JsonRpcPeer;
   private readonly providerFactory: ModelProviderFactory;
+  private readonly memoryStore: MemoryStore;
   private active: AgentOrchestrator | undefined;
   private busy = false;
 
@@ -54,11 +57,13 @@ class PerSessionAgent implements AgentControl {
     configService: ModelConfigService,
     peer: JsonRpcPeer,
     providerFactory: ModelProviderFactory,
+    memoryStore: MemoryStore,
   ) {
     this.store = store;
     this.configService = configService;
     this.peer = peer;
     this.providerFactory = providerFactory;
+    this.memoryStore = memoryStore;
   }
 
   async run(input: AgentRunInput): Promise<AgentRunResult> {
@@ -80,6 +85,7 @@ class PerSessionAgent implements AgentControl {
       tools.register(runCommandTool);
       tools.register(searchTextTool);
       tools.register(writeFileTool);
+      tools.register(memoryWriteTool);
       const orchestrator = new AgentOrchestrator({
         store: this.store,
         provider: this.providerFactory(config),
@@ -89,6 +95,7 @@ class PerSessionAgent implements AgentControl {
         contextLimit: config.contextLimit,
         maxOutputTokens: config.maxOutputTokens,
         notify: (notification) => this.peer.notify(notification.method, notification.params),
+        memory: { store: this.memoryStore, projectId: project.id },
       });
       this.active = orchestrator;
       return await orchestrator.run(input);
@@ -114,6 +121,7 @@ export async function createCoreApplication(
   const connection = await openDatabase(pathOptions);
   try {
     const store = new SessionStore(connection.db);
+    const memoryStore = new MemoryStore(pathOptions);
     const recovered = recoverInterruptedState(store);
     const configService = new ModelConfigService({
       ...pathOptions,
@@ -124,10 +132,12 @@ export async function createCoreApplication(
       configService,
       peer,
       options.providerFactory ?? ((config) => new OpenAIChatClient(config)),
+      memoryStore,
     );
     registerCoreHandlers(peer, {
       store,
       configService,
+      memoryStore,
       agent,
       startup: { interruptedCount: recovered.interruptedCount },
       ...(options.projectIdentityOptions === undefined

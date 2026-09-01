@@ -27,6 +27,8 @@ export function formatCoreNotification(method: string, paramsValue: unknown): st
       return `[tool ${ordinal(params.ordinal)}] ${text(params.name)} ${text(params.status)}: ${text(params.summary, "")}\n`;
     case "agent/status":
       return `\n[status] ${text(params.status)}: ${text(params.reason, "")}\n`;
+    case "memory/updated":
+      return `[memory] ${text(params.scope)} ${text(params.operation)}\n`;
     default:
       return "";
   }

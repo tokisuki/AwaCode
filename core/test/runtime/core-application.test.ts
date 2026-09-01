@@ -135,6 +135,7 @@ test("startup recovers durable state and composes a configured per-session agent
     assert.deepEqual(executeRequest?.tools?.map((tool) => tool.function.name).sort(), [
       "edit_file",
       "list_files",
+      "memory_write",
       "read_file",
       "run_command",
       "search_text",
@@ -171,6 +172,57 @@ test("an incomplete model configuration rejects agent/run without constructing a
       && "code" in error
       && error.code === -32002);
     assert.equal(providerFactories, 0);
+  } finally {
+    application.close();
+    client.close();
+    server.close();
+  }
+});
+
+test("explicit memory survives into a new session in global-then-project order while ordinary chat does not rewrite it", async () => {
+  const dataRoot = await temporaryDirectory("memory-data");
+  const workspace = await temporaryDirectory("memory-workspace");
+  const env = {
+    AWACODE_DATA_DIR: dataRoot,
+    AWACODE_BASE_URL: "http://127.0.0.1:43123/v1",
+    AWACODE_MODEL: "fixture-model",
+    AWACODE_API_KEY: "fixture-key-not-secret",
+    AWACODE_CONTEXT_LIMIT: "32768",
+    AWACODE_MAX_OUTPUT_TOKENS: "4096",
+  };
+  const provider = new ScriptedProvider([
+    response("Plan explicit memory."),
+    response("", [
+      { id: "remember-global", name: "memory_write", arguments: '{"scope":"global","new_text":"Prefer concise replies."}' },
+      { id: "remember-project", name: "memory_write", arguments: '{"scope":"project","new_text":"This project uses Node 24."}' },
+    ]),
+    response("Remembered."),
+    response('{"status":"complete","reason":"memory saved"}'),
+    response("Plan ordinary work."),
+    response("No memory changes."),
+    response('{"status":"complete","reason":"done"}'),
+  ]);
+  const { client, server } = connectedPeers();
+  const memoryEvents: unknown[] = [];
+  client.register("memory/updated", (value) => value, (value) => { memoryEvents.push(value); });
+  const application = await createCoreApplication(server, { env, providerFactory: () => provider });
+  try {
+    const selected = await client.request("workspace/set", { workspace }) as { projectId: string };
+    const first = await client.request("session/create", { projectId: selected.projectId, title: "Remember" }) as { id: string };
+    await client.request("agent/run", { sessionId: first.id, prompt: "Remember these global and project facts." });
+    const remembered = { global: "Prefer concise replies.", project: "This project uses Node 24." };
+    assert.deepEqual(await client.request("memory/read", { projectId: selected.projectId }), remembered);
+    assert.deepEqual(memoryEvents.map((event) => (event as { scope: string }).scope), ["global", "project"]);
+
+    const second = await client.request("session/create", { projectId: selected.projectId, title: "New session" }) as { id: string };
+    await client.request("agent/run", { sessionId: second.id, prompt: "Say hello without remembering anything." });
+    const newSessionRequest = provider.requests[4]!;
+    assert.equal(newSessionRequest.messages[0]?.role, "system");
+    assert.deepEqual(newSessionRequest.messages.slice(1, 3), [
+      { role: "system", content: "Global memory:\nPrefer concise replies." },
+      { role: "system", content: "Project memory (takes priority over global memory):\nThis project uses Node 24." },
+    ]);
+    assert.deepEqual(await client.request("memory/read", { projectId: selected.projectId }), remembered);
   } finally {
     application.close();
     client.close();

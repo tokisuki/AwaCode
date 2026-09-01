@@ -269,3 +269,35 @@ test("transient phase instructions count against the same context budget as base
     connection.close();
   }
 });
+
+test("global memory precedes project memory so project instructions have priority", async () => {
+  const { connection, store, session } = await fixture("memory-order");
+  try {
+    const manager = new ContextManager(store);
+    const built = await manager.build({
+      sessionId: session.id,
+      history: [{
+        type: "message",
+        messageId: "current",
+        seq: 1,
+        role: "user",
+        kind: "text",
+        payload: { text: "continue" },
+      }],
+      currentUserMessageId: "current",
+      systemText: "baseline",
+      memory: { global: "Use tabs.", project: "Use spaces in this project." },
+      tools: [],
+      contextLimit: 8_000,
+      maxOutputTokens: 1_000,
+    });
+
+    assert.deepEqual(built.messages.slice(0, 3), [
+      { role: "system", content: "baseline" },
+      { role: "system", content: "Global memory:\nUse tabs." },
+      { role: "system", content: "Project memory (takes priority over global memory):\nUse spaces in this project." },
+    ]);
+  } finally {
+    connection.close();
+  }
+});

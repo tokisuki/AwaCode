@@ -1,6 +1,7 @@
 import type { WorkspaceGuard } from "../security/workspace-guard.ts";
 import type { SessionStore } from "../persistence/session-store.ts";
 import type { PermissionClient } from "./permission.ts";
+import type { MemoryStore } from "../memory/memory-store.ts";
 
 export type ApprovalKind = "none" | "write" | "command";
 
@@ -18,6 +19,10 @@ export interface ToolContext {
     callId: string;
     store: SessionStore;
     permissionClient: PermissionClient;
+  };
+  memoryRuntime?: {
+    store: MemoryStore;
+    projectId: string;
   };
 }
 
