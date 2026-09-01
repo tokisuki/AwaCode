@@ -1,6 +1,8 @@
 #include <QtTest>
 
 #include <QLineEdit>
+#include <QDialogButtonBox>
+#include <QPushButton>
 
 #include "ApprovalDialog.h"
 #include "SettingsDialog.h"
@@ -11,6 +13,7 @@ class DialogsTest final : public QObject {
 private slots:
   void settingsUseCoreCredentialDto();
   void statusPrefillsNonSecretSettingsAndPreservesCredential();
+  void saveRemainsOpenUntilResponseIsPresented();
   void approvalDefaultsToDeny();
 };
 
@@ -32,6 +35,22 @@ void DialogsTest::settingsUseCoreCredentialDto() {
   QCOMPARE(settings.value("credential").toObject().value("apiKey").toString(), QStringLiteral("not-a-real-key"));
   QVERIFY(!settings.contains("apiKey"));
   QVERIFY(!settings.contains("limits"));
+}
+
+void DialogsTest::saveRemainsOpenUntilResponseIsPresented() {
+  SettingsDialog dialog;
+  dialog.show();
+  auto *buttons = dialog.findChild<QDialogButtonBox *>();
+  auto *save = buttons->button(QDialogButtonBox::Save);
+  QSignalSpy requested(&dialog, &SettingsDialog::saveRequested);
+  QTest::mouseClick(save, Qt::LeftButton);
+  QCOMPARE(requested.count(), 1);
+  QVERIFY(dialog.isVisible());
+  QVERIFY(!save->isEnabled());
+  dialog.showSaveResult(QStringLiteral("Configuration saved"));
+  QVERIFY(dialog.isVisible());
+  QVERIFY(save->isEnabled());
+  QCOMPARE(dialog.statusText(), QStringLiteral("Configuration saved"));
 }
 
 void DialogsTest::statusPrefillsNonSecretSettingsAndPreservesCredential() {

@@ -59,6 +59,7 @@ MainWindow::MainWindow(AgentProcessManager *manager, QWidget *parent) : QMainWin
   layout->addWidget(splitter, 1);
 
   taskInput_ = new QPlainTextEdit(root);
+  taskInput_->setObjectName(QStringLiteral("taskInput"));
   taskInput_->setPlaceholderText(QStringLiteral("Describe the coding task…"));
   layout->addWidget(taskInput_);
   auto *bottom = new QHBoxLayout;
@@ -127,10 +128,12 @@ void MainWindow::receiveNotification(const QString &method, const QJsonObject &p
     if (!streamTimer_->isActive()) streamTimer_->start();
   } else if (method == QStringLiteral("stream/commit")) {
     streamTimer_->stop();
-    renderTranscript();
-    StreamMessage &message = streamMessages_[params.value("messageId").toString()];
-    message.provisional = false;
-    message.committed = true;
+    const QString messageId = params.value("messageId").toString();
+    if (streamMessages_.contains(messageId)) {
+      const StreamMessage message = streamMessages_.take(messageId);
+      streamMessageOrder_.removeAll(messageId);
+      transcriptBase_.append(message.text);
+    }
     renderTranscript();
   } else if (method == QStringLiteral("agent/phase")) {
     appendTranscript(QStringLiteral("\n[%1]\n").arg(params.value("phase").toString()));
@@ -180,6 +183,7 @@ void MainWindow::runTask() {
     createSession();
     return;
   }
+  foldStreamMessagesIntoBase();
   tools_.clear();
   appendTranscript(QStringLiteral("\nYou: %1\n").arg(prompt));
   sendRequest(QStringLiteral("agent/run"), {{"sessionId", sessionId_}, {"prompt", prompt}});
@@ -240,7 +244,10 @@ void MainWindow::receiveResponse(const QString &method, const QJsonValue &result
     setRunning(false);
   } else if (method == QStringLiteral("config/save") || method == QStringLiteral("config/status")) {
     setConfigured(object.value("runnable").toBool(), object.value("model").toString());
-    if (settingsDialog_ != nullptr) settingsDialog_->applyStatus(object);
+    if (settingsDialog_ != nullptr) {
+      settingsDialog_->applyStatus(object);
+      if (method == QStringLiteral("config/save")) settingsDialog_->showSaveResult(QStringLiteral("Configuration saved"));
+    }
   } else if (method == QStringLiteral("config/test")) {
     if (settingsDialog_ != nullptr) settingsDialog_->setStatusText(object.value("message").toString());
   }
@@ -256,7 +263,8 @@ void MainWindow::receiveError(const QString &method, const QJsonObject &error) {
   appendTranscript(QStringLiteral("\n[Core error: %1]\n").arg(message));
   if (method == QStringLiteral("agent/run") || method == QStringLiteral("agent/cancel")) setRunning(false);
   if ((method == QStringLiteral("config/save") || method == QStringLiteral("config/test") || method == QStringLiteral("config/status")) && settingsDialog_ != nullptr) {
-    settingsDialog_->setStatusText(message);
+    if (method == QStringLiteral("config/save")) settingsDialog_->showSaveResult(message);
+    else settingsDialog_->setStatusText(message);
   }
 }
 
@@ -289,7 +297,23 @@ void MainWindow::setRunning(bool running) {
   taskInput_->setEnabled(!running_);
 }
 
-void MainWindow::appendTranscript(const QString &text) { transcriptBase_.append(text); renderTranscript(); }
+void MainWindow::appendTranscript(const QString &text) {
+  foldStreamMessagesIntoBase();
+  transcriptBase_.append(text);
+  renderTranscript();
+}
+
+void MainWindow::foldStreamMessagesIntoBase() {
+  streamTimer_->stop();
+  for (const QString &id : streamMessageOrder_) {
+    const StreamMessage message = streamMessages_.value(id);
+    transcriptBase_.append(message.provisional && !message.committed
+      ? QStringLiteral("[provisional] %1").arg(message.text)
+      : message.text);
+  }
+  streamMessages_.clear();
+  streamMessageOrder_.clear();
+}
 
 void MainWindow::renderTranscript() {
   QString text = transcriptBase_;

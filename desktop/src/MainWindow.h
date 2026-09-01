@@ -54,6 +54,7 @@ private:
   void loadSession(const QString &sessionId);
   void handleApproval(const QString &id, const QJsonObject &params);
   void renderTranscript();
+  void foldStreamMessagesIntoBase();
   QString payloadText(const QJsonObject &message) const;
 
   struct StreamMessage {

@@ -27,15 +27,24 @@ SettingsDialog::SettingsDialog(QWidget *parent) : QDialog(parent) {
   layout->addRow(QStringLiteral("Max output"), maxOutput_);
   layout->addRow(QStringLiteral("API key"), apiKey_);
   layout->addRow(status_);
-  auto *buttons = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel, this);
-  auto *test = buttons->addButton(QStringLiteral("Test connection"), QDialogButtonBox::ActionRole);
-  connect(test, &QPushButton::clicked, this, &SettingsDialog::testRequested);
-  connect(buttons, &QDialogButtonBox::accepted, this, [this] { emit saveRequested(settings()); accept(); });
-  connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
-  layout->addRow(buttons);
+  buttons_ = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel, this);
+  testButton_ = buttons_->addButton(QStringLiteral("Test connection"), QDialogButtonBox::ActionRole);
+  connect(testButton_, &QPushButton::clicked, this, &SettingsDialog::testRequested);
+  connect(buttons_, &QDialogButtonBox::accepted, this, [this] {
+    buttons_->setEnabled(false);
+    emit saveRequested(settings());
+  });
+  connect(buttons_, &QDialogButtonBox::rejected, this, &QDialog::reject);
+  layout->addRow(buttons_);
 }
 
 void SettingsDialog::setStatusText(const QString &text) { status_->setText(text); }
+QString SettingsDialog::statusText() const { return status_->text(); }
+
+void SettingsDialog::showSaveResult(const QString &text) {
+  buttons_->setEnabled(true);
+  setStatusText(text);
+}
 
 void SettingsDialog::applyStatus(const QJsonObject &status) {
   baseUrl_->setText(status.value("baseUrl").toString());

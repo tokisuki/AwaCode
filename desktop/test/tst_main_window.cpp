@@ -2,6 +2,7 @@
 
 #include <QJsonArray>
 #include <QListView>
+#include <QPlainTextEdit>
 #include <QPushButton>
 
 #include "MainWindow.h"
@@ -15,6 +16,7 @@ private slots:
   void hydratesPayloadMessagesAndToolCalls();
   void disablesConflictingControlsWhileRunning();
   void displaysRpcErrorsAndRestoresRunState();
+  void keepsStreamBeforeLaterTranscriptEventsAndClearsCommittedStateForNextRun();
   void marksInterruptedContentAfterCoreCrash();
   void marksUnexpectedEofRestartable();
 };
@@ -24,6 +26,27 @@ void MainWindowTest::disablesRunUntilConfigured() {
   QVERIFY(!window.runButton()->isEnabled());
   window.setConfigured(true, QStringLiteral("demo-model"));
   QVERIFY(window.runButton()->isEnabled());
+}
+
+void MainWindowTest::keepsStreamBeforeLaterTranscriptEventsAndClearsCommittedStateForNextRun() {
+  MainWindow window;
+  window.receiveNotification("stream/text", QJsonObject{{"messageId", "first"}, {"delta", "first answer"}, {"provisional", true}});
+  QTRY_VERIFY_WITH_TIMEOUT(window.transcriptText().contains(QStringLiteral("first answer")), 200);
+  window.receiveNotification("agent/phase", QJsonObject{{"phase", "reflect"}});
+  QVERIFY(window.transcriptText().indexOf(QStringLiteral("first answer")) < window.transcriptText().indexOf(QStringLiteral("[reflect]")));
+  window.receiveNotification("stream/commit", QJsonObject{{"messageId", "first"}});
+  window.setConfigured(true);
+  auto *taskInput = window.findChild<QPlainTextEdit *>(QStringLiteral("taskInput"));
+  QVERIFY(taskInput != nullptr);
+  taskInput->setPlainText(QStringLiteral("second task"));
+  window.receiveResponse("session/create", QJsonObject{{"id", "second-session"}});
+  QVERIFY(window.transcriptText().indexOf(QStringLiteral("first answer")) < window.transcriptText().indexOf(QStringLiteral("You: second task")));
+  window.receiveNotification("stream/text", QJsonObject{{"messageId", "second"}, {"delta", "second answer"}, {"provisional", true}});
+  QTRY_VERIFY_WITH_TIMEOUT(window.transcriptText().contains(QStringLiteral("second answer")), 200);
+  QCOMPARE(window.transcriptText().count(QStringLiteral("first answer")), 1);
+  QVERIFY(window.transcriptText().indexOf(QStringLiteral("first answer")) < window.transcriptText().indexOf(QStringLiteral("second answer")));
+  window.receiveError("agent/run", QJsonObject{{"message", "later error"}});
+  QVERIFY(window.transcriptText().indexOf(QStringLiteral("second answer")) < window.transcriptText().indexOf(QStringLiteral("later error")));
 }
 
 void MainWindowTest::batchesMultipleProvisionalDeltasOnceAndCommitsThem() {
