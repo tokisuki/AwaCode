@@ -132,3 +132,14 @@ test("rejects a workspace that is not an existing directory", async () => {
   const parent = await temporaryDirectory("missing");
   await assert.rejects(resolveProjectIdentity(join(parent, "does-not-exist")), /existing directory/);
 });
+
+test("treats a relative local origin as local and falls back without failing workspace resolution", async () => {
+  const repository = await initializeRepository("relative-origin");
+  await git(repository, "remote", "add", "origin", "../shared/repository.git");
+  const real = normalize(await realpath(repository));
+  const identity = await resolveProjectIdentity(repository);
+  const expectedPath = process.platform === "win32" ? real.toLowerCase() : real;
+  assert.equal(identity.kind, "path");
+  assert.equal(identity.value, expectedPath);
+  assert.equal(identity.remote, undefined);
+});

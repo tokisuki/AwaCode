@@ -193,7 +193,16 @@ export class ContextManager {
     if (candidates.length === 0) {
       return false;
     }
-    const baseline = existing?.baseline ?? input.systemText;
+    const systemContextSha256 = createHash("sha256").update(input.systemText).digest("hex");
+    const existingSource = typeof existing?.sourceSnapshot === "object" && existing.sourceSnapshot !== null
+      ? existing.sourceSnapshot as Record<string, unknown>
+      : {};
+    const previousSystem = typeof existingSource.systemContext === "object" && existingSource.systemContext !== null
+      ? existingSource.systemContext as { sha256?: unknown }
+      : undefined;
+    const baseline = existing === null || previousSystem?.sha256 !== systemContextSha256
+      ? input.systemText
+      : existing.baseline;
     const sourceSnapshot = existing?.sourceSnapshot ?? {};
     await this.compressBlocks(input, existing?.summary ?? null, baseline, sourceSnapshot, candidates);
     return true;
@@ -203,7 +212,16 @@ export class ContextManager {
     const usable = input.contextLimit - input.maxOutputTokens;
     const recentBudget = recentContextBudget(input.contextLimit, input.maxOutputTokens);
     const existing = this.store.loadContextSnapshot(input.sessionId);
-    const baseline = existing?.baseline ?? input.systemText;
+    const systemContextSha256 = createHash("sha256").update(input.systemText).digest("hex");
+    const existingSource = typeof existing?.sourceSnapshot === "object" && existing.sourceSnapshot !== null
+      ? existing.sourceSnapshot as Record<string, unknown>
+      : {};
+    const previousSystem = typeof existingSource.systemContext === "object" && existingSource.systemContext !== null
+      ? existingSource.systemContext as { sha256?: unknown }
+      : undefined;
+    const baseline = existing === null || previousSystem?.sha256 !== systemContextSha256
+      ? input.systemText
+      : existing.baseline;
     const effectiveMemory = input.memory === null
       ? memoryFromSnapshot(existing?.sourceSnapshot)
       : input.memory;
@@ -233,7 +251,7 @@ export class ContextManager {
         }
       }
     }
-    const persistedSource = input.memory === null
+    const contentSource = input.memory === null
       ? existing?.sourceSnapshot ?? {}
       : input.memory === undefined
         ? this.sourceSnapshotHooks.length === 0 ? existing?.sourceSnapshot ?? {} : sourceSnapshot
@@ -246,6 +264,10 @@ export class ContextManager {
               projectSha256: createHash("sha256").update(input.memory.project).digest("hex"),
             },
           };
+    const persistedSource = {
+      ...(typeof contentSource === "object" && contentSource !== null ? contentSource as Record<string, unknown> : {}),
+      systemContext: { sha256: systemContextSha256 },
+    };
     this.store.saveContextSnapshot({
       sessionId: input.sessionId,
       baseline,

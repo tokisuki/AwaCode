@@ -56,7 +56,7 @@ function normalizedRemotePath(pathname: string): string {
 
 export function normalizeGitRemote(value: string): string {
   const remote = value.trim();
-  if (/^[a-z]:[\\/]/i.test(remote) || /^(?:\\\\|\/\/)/.test(remote) || /^file:/i.test(remote)) {
+  if (/^[a-z]:[\\/]/i.test(remote) || /^(?:\\\\|\/\/|\/|\.\.?[\\/])/.test(remote) || /^file:/i.test(remote)) {
     throw new LocalGitRemoteError(remote);
   }
   if (/^[a-z][a-z\d+.-]*:\/\//i.test(remote)) {
@@ -89,7 +89,7 @@ export function normalizeGitRemote(value: string): string {
     return `${host}/${path}`;
   }
 
-  throw new TypeError("Git remote must use an scp or URL form");
+  throw new LocalGitRemoteError(remote);
 }
 
 async function gitOutput(

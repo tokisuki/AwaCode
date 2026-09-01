@@ -110,7 +110,7 @@ test("context selection keeps newest whole tool blocks and the current user mess
   }
 });
 
-test("context snapshots preserve summaries and refresh named source hooks without generating a summary", async () => {
+test("context snapshots refresh a changed system baseline and persist its source hash across restart", async () => {
   const { connection, store, session } = await fixture("snapshot");
   try {
     store.saveContextSnapshot({
@@ -137,25 +137,38 @@ test("context snapshots preserve summaries and refresh named source hooks withou
       sessionId: session.id,
       history,
       currentUserMessageId: "current",
-      systemText: "new baseline is ignored",
+      systemText: "current workspace and runtime",
       tools: [],
       contextLimit: 8_000,
       maxOutputTokens: 1_000,
     });
 
     assert.deepEqual(built.messages.slice(0, 2), [
-      { role: "system", content: "persisted baseline" },
+      { role: "system", content: "current workspace and runtime" },
       { role: "system", content: "Conversation summary:\nearlier work" },
     ]);
     assert.deepEqual(store.loadContextSnapshot(session.id), {
       sessionId: session.id,
-      baseline: "persisted baseline",
-      sourceSnapshot: { project: { revision: 2 } },
+      baseline: "current workspace and runtime",
+      sourceSnapshot: {
+        project: { revision: 2 },
+        systemContext: {
+          sha256: "dbbb2daa9ae4fe6dbbd1aa51c6c93db833ac3c058de5322febee5d13c85bfa1b",
+        },
+      },
       baselineSeq: 1,
       summary: "earlier work",
       summaryUptoSeq: 4,
       updatedAt: "2026-09-01T00:00:00.000Z",
     });
+    const restarted = new ContextManager(store, {
+      sourceSnapshotHooks: [{ name: "project", read: () => { throw new Error("offline"); } }],
+    });
+    const rebuilt = await restarted.build({
+      sessionId: session.id, history, currentUserMessageId: "current",
+      systemText: "current workspace and runtime", tools: [], contextLimit: 8_000, maxOutputTokens: 1_000,
+    });
+    assert.equal(rebuilt.messages[0]?.content, "current workspace and runtime");
   } finally {
     connection.close();
   }
@@ -202,7 +215,7 @@ test("a persisted summary excludes covered entries while retaining the required 
         },
       ],
       currentUserMessageId: "current-at-cutoff",
-      systemText: "ignored new baseline",
+      systemText: "baseline",
       tools: [],
       contextLimit: 8_000,
       maxOutputTokens: 1_000,

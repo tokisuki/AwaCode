@@ -131,6 +131,16 @@ test("startup recovers durable state and composes a configured per-session agent
     };
     assert.equal(result.status, "completed");
     assert.equal(result.finalText, "Done.");
+    const systemContext = provider.requests[0]?.messages[0]?.content ?? "";
+    assert.match(systemContext, /AwaCode/);
+    assert.match(systemContext, new RegExp(workspace.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"));
+    assert.match(systemContext, new RegExp(`Node ${process.versions.node.replaceAll(".", "\\.")}`));
+    const persisted = await client.request("session/load", { sessionId: created.id }) as {
+      session: { model: unknown };
+    };
+    assert.deepEqual(persisted.session.model, {
+      model: "fixture-model", contextLimit: 32768, maxOutputTokens: 4096,
+    });
     const executeRequest = provider.requests.find((request) => request.tools !== undefined);
     assert.deepEqual(executeRequest?.tools?.map((tool) => tool.function.name).sort(), [
       "edit_file",

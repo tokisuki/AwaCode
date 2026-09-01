@@ -128,6 +128,8 @@ export interface FinalizeStreamingAssistantMessageInput {
   payload: unknown;
 }
 
+export type CandidateStatus = "pending" | "accepted" | "rejected";
+
 export interface FinalizeStreamingAssistantWithToolCallsInput {
   messageId: string;
   payload: unknown;
@@ -446,6 +448,27 @@ export class SessionStore {
       throw new StoreNotFoundError("session", sessionId);
     }
     return this.getSession(sessionId);
+  }
+
+  bindSessionModel(sessionId: string, model: unknown): SessionRecord {
+    const now = this.currentDate().toISOString();
+    const updated = this.db.prepare(`
+      UPDATE sessions SET model_json = ?, updated_at = ? WHERE id = ?
+    `).run(stringifyJson(model), now, sessionId);
+    if (updated.changes !== 1) throw new StoreNotFoundError("session", sessionId);
+    return this.getSession(sessionId);
+  }
+
+  setAssistantCandidateStatus(messageId: string, status: CandidateStatus): MessageRecord {
+    const message = this.getMessage(messageId);
+    if (message.role !== "assistant" || message.status !== "complete" || typeof message.payload !== "object" || message.payload === null || Array.isArray(message.payload)) {
+      throw new TypeError("candidate status requires a complete assistant object payload");
+    }
+    const now = this.currentDate().toISOString();
+    const updated = this.db.prepare(`UPDATE messages SET payload_json = ?, updated_at = ? WHERE id = ? AND role = 'assistant' AND status = 'complete'`)
+      .run(stringifyJson({ ...(message.payload as Record<string, unknown>), candidateStatus: status }), now, messageId);
+    if (updated.changes !== 1) throw new StoreNotFoundError("session", messageId);
+    return this.getMessage(messageId);
   }
 
   createStreamingAssistantMessage(input: CreateStreamingAssistantMessageInput): MessageRecord {

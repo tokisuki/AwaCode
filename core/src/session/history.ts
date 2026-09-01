@@ -62,6 +62,13 @@ function integrity(detail: string): never {
   throw new HistoryIntegrityError(detail);
 }
 
+function isRejectedCandidate(message: MessageRecord): boolean {
+  return typeof message.payload === "object"
+    && message.payload !== null
+    && !Array.isArray(message.payload)
+    && (message.payload as { candidateStatus?: unknown }).candidateStatus === "rejected";
+}
+
 function validateTerminalCall(call: ToolCallRecord): void {
   if (!isTerminalToolCallStatus(call.status)) {
     integrity(`tool call ${call.callId} is nonterminal`);
@@ -159,6 +166,9 @@ export function validateProviderHistory(store: SessionStore, sessionId: string):
         integrity(`orphan or duplicate tool-result message ${message.id}`);
       }
       if (message.role === "internal") {
+        continue;
+      }
+      if (message.role === "assistant" && isRejectedCandidate(message)) {
         continue;
       }
       const calls = callsByMessage.get(message.id) ?? [];

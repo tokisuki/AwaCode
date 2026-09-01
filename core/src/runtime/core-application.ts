@@ -10,6 +10,7 @@ import {
   type EffectiveModelConfig,
 } from "../config/model-config.ts";
 import { OpenAIChatClient, OpenAIModelConnectionTester } from "../llm/openai-chat-client.ts";
+import { buildWorkspaceSystemContext } from "../context/system-context.ts";
 import type { ModelProvider } from "../llm/types.ts";
 import { MemoryStore } from "../memory/memory-store.ts";
 import { openDatabase, type DatabaseConnection } from "../persistence/database.ts";
@@ -96,6 +97,12 @@ class PerSessionAgent implements AgentControl {
         workspace,
         contextLimit: config.contextLimit,
         maxOutputTokens: config.maxOutputTokens,
+        systemPrompt: buildWorkspaceSystemContext(project),
+        modelMetadata: {
+          model: config.model!,
+          contextLimit: config.contextLimit,
+          maxOutputTokens: config.maxOutputTokens,
+        },
         notify: (notification) => this.peer.notify(notification.method, notification.params),
         memory: { store: this.memoryStore, projectId: project.id },
       });

@@ -135,6 +135,23 @@ test("provider history emits a valid multi-call block in order and excludes inte
   }
 });
 
+test("provider history excludes a persisted rejected candidate after restart", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "awacode-history-rejected-"));
+  temporaryDirectories.push(directory);
+  const connection = await openDatabase({ env: { AWACODE_DATA_DIR: directory } });
+  const store = new SessionStore(connection.db, { randomUUID: (() => {
+    const ids = ["rejected-session", "rejected-candidate", "accepted-candidate"];
+    return () => ids.shift() as string;
+  })() });
+  try {
+    store.upsertProject(identity("rejected-project", directory));
+    const session = store.createSession("rejected-project", "Rejected candidate");
+    store.insertMessage({ sessionId: session.id, role: "assistant", kind: "text", payload: { text: "old", candidateStatus: "rejected" } });
+    store.insertMessage({ sessionId: session.id, role: "assistant", kind: "text", payload: { text: "new", candidateStatus: "accepted" } });
+    assert.deepEqual(validateProviderHistory(store, session.id).map((entry) => entry.messageId), ["accepted-candidate"]);
+  } finally { connection.close(); }
+});
+
 async function validHistoryFixture(label: string) {
   const root = await dataRoot(label);
   const connection = await openDatabase({ env: { AWACODE_DATA_DIR: root } });

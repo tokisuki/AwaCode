@@ -8,6 +8,7 @@ import { ModelConfigService } from "../../src/config/model-config.ts";
 import {
   AgentOrchestrator,
   AgentCancelledError,
+  type AgentOrchestratorOptions,
   type AgentNotification,
 } from "../../src/agent/orchestrator.ts";
 import type {
@@ -386,15 +387,73 @@ test("malformed Reflect retries once and continue permits one remedial Execute w
     assert.equal(provider.requests.filter((request) =>
       request.messages.at(-1)?.role === "system"
       && (request.messages.at(-1)!.content as string).includes("Review the candidate")).length, 1);
+    const remedialRequest = provider.requests[4]!;
+    assert.match(remedialRequest.messages.at(-1)!.content as string, /tests still fail/);
+    assert.match(remedialRequest.messages.at(-1)!.content as string, /untrusted review text/i);
+    assert.equal(remedialRequest.messages.some((message) => message.role === "assistant" && message.content === "First candidate."), false);
     const loaded = f.store.loadSession(f.sessionId);
     assert.equal(loaded.messages.filter((message) => message.role === "internal" && message.kind === "reflect").length, 2);
     const commits = notifications.filter((event) => event.method === "stream/commit");
     assert.equal(commits.length, 1);
     const committed = loaded.messages.find((message) => message.id === commits[0]!.params.messageId);
-    assert.deepEqual(committed?.payload, { text: "Remedial candidate.", phase: "execute" });
+    assert.deepEqual(committed?.payload, {
+      text: "Remedial candidate.", phase: "execute", candidateStatus: "accepted", runId: "run-reflect-retry",
+    });
+    const rejected = loaded.messages.find((message) => message.payload !== null
+      && typeof message.payload === "object"
+      && (message.payload as { text?: unknown }).text === "First candidate.");
+    assert.equal((rejected?.payload as { candidateStatus?: unknown }).candidateStatus, "rejected");
   } finally {
     f.connection.close();
   }
+});
+
+test("Reflect continue after the twelfth Execute request closes without a thirteenth remedial Execute", async () => {
+  const f = await fixture("remedial-turn-bound");
+  const registry = new ToolRegistry();
+  registry.register(scriptedTool("alpha", []));
+  const script = [response("Plan.")];
+  for (let index = 1; index <= 11; index += 1) {
+    script.push(response("", [{ id: `bounded-${index}`, name: "alpha", arguments: `{"value":"${index}"}` }]));
+  }
+  script.push(response("Twelfth-turn candidate."));
+  script.push(response('{"status":"continue","reason":"one more change is needed"}'));
+  script.push(response("Stopped at the Execute limit; remedial work was not started."));
+  const provider = new ScriptedProvider(script);
+  const orchestrator = new AgentOrchestrator({
+    store: f.store, provider, tools: registry, permissionClient: allowPermission, workspace: f.workspace,
+    contextLimit: 32_768, maxOutputTokens: 4_096,
+  });
+  try {
+    const result = await orchestrator.run({ sessionId: f.sessionId, prompt: "Bound remediation" });
+    assert.equal(result.reason, "execute_turn_limit");
+    assert.equal(result.finalText, "Stopped at the Execute limit; remedial work was not started.");
+    assert.equal(provider.requests.length, 15);
+    assert.equal(provider.requests.at(-1)!.tools, undefined);
+    assert.match(provider.requests.at(-1)!.messages.at(-1)!.content as string, /execute_turn_limit/);
+  } finally { f.connection.close(); }
+});
+
+test("a run atomically binds non-secret model metadata to its session and persisted messages", async () => {
+  const f = await fixture("model-binding");
+  const provider = new ScriptedProvider([
+    response("Plan."), response("Candidate."), response('{"status":"complete","reason":"done"}'),
+  ]);
+  const options: AgentOrchestratorOptions & { modelMetadata: { model: string; contextLimit: number; maxOutputTokens: number } } = {
+    store: f.store, provider, tools: new ToolRegistry(), permissionClient: allowPermission, workspace: f.workspace,
+    contextLimit: 32_768, maxOutputTokens: 4_096, createRunId: () => "run-model-binding",
+    modelMetadata: { model: "fixture-model", contextLimit: 32_768, maxOutputTokens: 4_096 },
+  };
+  const orchestrator = new AgentOrchestrator(options);
+  try {
+    await orchestrator.run({ sessionId: f.sessionId, prompt: "Bind model" });
+    const loaded = f.store.loadSession(f.sessionId);
+    assert.deepEqual(loaded.session.model, options.modelMetadata);
+    assert.equal(loaded.messages.every((message) => {
+      const payload = message.payload as { runId?: unknown; model?: unknown };
+      return message.role === "internal" || (payload.runId === "run-model-binding" && payload.model === "fixture-model");
+    }), true);
+  } finally { f.connection.close(); }
 });
 
 test("a second malformed Reflect response ends explicitly after exactly one retry", async () => {
