@@ -45,6 +45,7 @@ signals:
 private slots:
   void chooseWorkspace();
   void createSession();
+  void deleteSelectedSession();
   void runTask();
   void selectSession(const QModelIndex &index);
   void flushBufferedText();
@@ -109,6 +110,7 @@ private:
   QLineEdit *workspaceField_ = nullptr;
   QPushButton *chooseWorkspace_ = nullptr;
   QPushButton *newSession_ = nullptr;
+  QPushButton *deleteSession_ = nullptr;
   QPushButton *settingsButton_ = nullptr;
   QListView *sessionView_ = nullptr;
   QPlainTextEdit *transcript_ = nullptr;

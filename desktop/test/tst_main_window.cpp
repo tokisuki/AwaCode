@@ -2,8 +2,10 @@
 
 #include <QJsonArray>
 #include <QListView>
+#include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QTimer>
 
 #include "MainWindow.h"
 
@@ -29,6 +31,9 @@ private slots:
   void helloSurvivesWorkspaceSelectionOnTheSameConnection();
   void newestCreateIntentWinsWithinOneWorkspaceEpoch();
   void creatingSessionInvalidatesOlderLoadsAndClearsTheOldProjection();
+  void deletingCurrentSessionClearsItsProjectionAndDropsStaleLoads();
+  void deletingASelectedUnloadedSessionStillRemovesIt();
+  void deleteButtonConfirmsTheSelectedSessionTitle();
 };
 
 void MainWindowTest::disablesRunUntilConfigured() {
@@ -161,6 +166,80 @@ void MainWindowTest::creatingSessionInvalidatesOlderLoadsAndClearsTheOldProjecti
     {"messages", QJsonArray{QJsonObject{{"role", "assistant"}, {"payload", QJsonObject{{"text", "late A"}}}}}},
   }, epoch, lateLoad, QStringLiteral("A"));
   QVERIFY(window.transcriptText().isEmpty());
+}
+
+void MainWindowTest::deletingCurrentSessionClearsItsProjectionAndDropsStaleLoads() {
+  MainWindow window;
+  window.setConfigured(true);
+  const quint64 epoch = window.beginWorkspaceSelection(QStringLiteral("C:/work"));
+  window.receiveResponseForEpoch("workspace/set", QJsonObject{{"workspace", "C:/work"}, {"projectId", "p"}}, epoch);
+  window.receiveResponseForEpoch("session/list", QJsonArray{
+    QJsonObject{{"id", "A"}, {"title", "Session A"}, {"status", "completed"}},
+    QJsonObject{{"id", "B"}, {"title", "Session B"}, {"status", "idle"}},
+  }, epoch);
+  auto *view = window.findChild<QListView *>(QStringLiteral("sessionList"));
+  view->setCurrentIndex(view->model()->index(0, 0));
+  const quint64 shownLoad = window.beginRequestGeneration(QStringLiteral("session/load"), QStringLiteral("A"));
+  window.receiveResponseForGeneration("session/load", QJsonObject{
+    {"messages", QJsonArray{QJsonObject{{"role", "assistant"}, {"payload", QJsonObject{{"text", "session A"}}}}}},
+    {"toolCalls", QJsonArray{QJsonObject{{"callId", "a-call"}, {"toolName", "read_file"}, {"status", "success"}}}},
+  }, epoch, shownLoad, QStringLiteral("A"));
+
+  const quint64 lateLoad = window.beginRequestGeneration(QStringLiteral("session/load"), QStringLiteral("A"));
+  const quint64 deletion = window.beginRequestGeneration(QStringLiteral("session/delete"), QStringLiteral("A"));
+  window.receiveResponseForGeneration("session/delete",
+    QJsonObject{{"sessionId", "A"}, {"deleted", true}}, epoch, deletion, QStringLiteral("A"));
+
+  QCOMPARE(view->model()->rowCount(), 1);
+  QCOMPARE(view->model()->index(0, 0).data().toString(), QStringLiteral("Session B"));
+  QVERIFY(window.transcriptText().isEmpty());
+  QVERIFY(window.toolTimelineText(0).isEmpty());
+  window.receiveResponseForGeneration("session/load", QJsonObject{
+    {"messages", QJsonArray{QJsonObject{{"role", "assistant"}, {"payload", QJsonObject{{"text", "stale A"}}}}}},
+  }, epoch, lateLoad, QStringLiteral("A"));
+  QVERIFY(window.transcriptText().isEmpty());
+}
+
+void MainWindowTest::deleteButtonConfirmsTheSelectedSessionTitle() {
+  MainWindow window;
+  const quint64 epoch = window.beginWorkspaceSelection(QStringLiteral("C:/work"));
+  window.receiveResponseForEpoch("workspace/set", QJsonObject{{"workspace", "C:/work"}, {"projectId", "p"}}, epoch);
+  window.receiveResponseForEpoch("session/list", QJsonArray{
+    QJsonObject{{"id", "A"}, {"title", "Session A"}, {"status", "completed"}},
+  }, epoch);
+  auto *view = window.findChild<QListView *>(QStringLiteral("sessionList"));
+  view->setCurrentIndex(view->model()->index(0, 0));
+  auto *deleteButton = window.findChild<QPushButton *>(QStringLiteral("deleteSession"));
+  QVERIFY(deleteButton != nullptr);
+  QVERIFY(deleteButton->isEnabled());
+
+  QString confirmationText;
+  QTimer::singleShot(0, [&confirmationText] {
+    for (QWidget *widget : QApplication::topLevelWidgets()) {
+      if (auto *box = qobject_cast<QMessageBox *>(widget)) {
+        confirmationText = box->text();
+        box->done(QMessageBox::Yes);
+      }
+    }
+  });
+  QTest::mouseClick(deleteButton, Qt::LeftButton);
+  QVERIFY(confirmationText.contains(QStringLiteral("Session A")));
+}
+
+void MainWindowTest::deletingASelectedUnloadedSessionStillRemovesIt() {
+  MainWindow window;
+  const quint64 epoch = window.beginWorkspaceSelection(QStringLiteral("C:/work"));
+  window.receiveResponseForEpoch("workspace/set", QJsonObject{{"workspace", "C:/work"}, {"projectId", "p"}}, epoch);
+  window.receiveResponseForEpoch("session/list", QJsonArray{
+    QJsonObject{{"id", "A"}, {"title", "Session A"}, {"status", "idle"}},
+  }, epoch);
+  auto *view = window.findChild<QListView *>(QStringLiteral("sessionList"));
+  view->setCurrentIndex(view->model()->index(0, 0));
+
+  const quint64 deletion = window.beginRequestGeneration(QStringLiteral("session/delete"), QStringLiteral("A"));
+  window.receiveResponseForGeneration("session/delete",
+    QJsonObject{{"sessionId", "A"}, {"deleted", true}}, epoch, deletion, QStringLiteral("A"));
+  QCOMPARE(view->model()->rowCount(), 0);
 }
 
 void MainWindowTest::reloadMarksRejectedCandidates() {

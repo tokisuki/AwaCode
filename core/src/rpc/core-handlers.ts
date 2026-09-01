@@ -257,6 +257,14 @@ export function registerCoreHandlers(peer: JsonRpcPeer, dependencies: CoreHandle
     }
   });
 
+  peer.register("session/delete", parseSession, ({ sessionId }) => {
+    try {
+      return dependencies.store.deleteSession(sessionId);
+    } catch (error) {
+      return storeFault(error);
+    }
+  });
+
   if (dependencies.memoryStore !== undefined) {
     peer.register("memory/read", parseProject, async ({ projectId }) => {
       try {

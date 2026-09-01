@@ -305,6 +305,14 @@ export class SessionStore {
     return this.getSession(id);
   }
 
+  deleteSession(sessionId: string): { sessionId: string; deleted: true } {
+    const deleted = this.db.prepare("DELETE FROM sessions WHERE id = ?").run(sessionId);
+    if (deleted.changes !== 1) {
+      throw new StoreNotFoundError("session", sessionId);
+    }
+    return { sessionId, deleted: true };
+  }
+
   listSessions(projectId: string): SessionRecord[] {
     this.requireProject(projectId);
     return (this.db.prepare(`

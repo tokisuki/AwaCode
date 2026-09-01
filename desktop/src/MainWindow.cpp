@@ -6,6 +6,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QListView>
+#include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QSplitter>
 #include <QTimer>
@@ -42,12 +43,17 @@ MainWindow::MainWindow(AgentProcessManager *manager, QWidget *parent) : QMainWin
   auto *splitter = new QSplitter(root);
   auto *left = new QWidget(splitter);
   auto *leftLayout = new QVBoxLayout(left);
+  auto *sessionActions = new QHBoxLayout;
   newSession_ = new QPushButton(QStringLiteral("New session"), left);
   newSession_->setObjectName(QStringLiteral("newSession"));
+  deleteSession_ = new QPushButton(QStringLiteral("Delete"), left);
+  deleteSession_->setObjectName(QStringLiteral("deleteSession"));
   sessionView_ = new QListView(left);
   sessionView_->setObjectName(QStringLiteral("sessionList"));
   sessionView_->setModel(&sessions_);
-  leftLayout->addWidget(newSession_);
+  sessionActions->addWidget(newSession_);
+  sessionActions->addWidget(deleteSession_);
+  leftLayout->addLayout(sessionActions);
   leftLayout->addWidget(sessionView_);
   transcript_ = new QPlainTextEdit(splitter);
   transcript_->setReadOnly(true);
@@ -87,7 +93,9 @@ MainWindow::MainWindow(AgentProcessManager *manager, QWidget *parent) : QMainWin
   connect(streamTimer_, &QTimer::timeout, this, &MainWindow::flushBufferedText);
   connect(chooseWorkspace_, &QPushButton::clicked, this, &MainWindow::chooseWorkspace);
   connect(newSession_, &QPushButton::clicked, this, &MainWindow::createSession);
+  connect(deleteSession_, &QPushButton::clicked, this, &MainWindow::deleteSelectedSession);
   connect(sessionView_, &QListView::clicked, this, &MainWindow::selectSession);
+  connect(sessionView_->selectionModel(), &QItemSelectionModel::currentChanged, this, [this] { updateControls(); });
   connect(run_, &QPushButton::clicked, this, &MainWindow::runTask);
   connect(cancel_, &QPushButton::clicked, this, [this] { if (manager_) manager_->cancel(); });
   connect(settingsButton_, &QPushButton::clicked, this, &MainWindow::showSettings);
@@ -226,6 +234,24 @@ void MainWindow::createSession() {
   updateControls();
 }
 
+void MainWindow::deleteSelectedSession() {
+  if (!coreAlive_ || running_ || dispatchPending_) return;
+  const QModelIndex index = sessionView_->currentIndex();
+  if (!index.isValid()) return;
+  const SessionSummary session = sessions_.at(index.row());
+  const QMessageBox::StandardButton decision = QMessageBox::question(
+    this,
+    QStringLiteral("Delete session"),
+    QStringLiteral("Permanently delete \"%1\" and all of its conversation history?").arg(session.title),
+    QMessageBox::Yes | QMessageBox::No,
+    QMessageBox::No);
+  if (decision != QMessageBox::Yes) return;
+  dispatchPending_ = true;
+  const QString id = sendRequest(QStringLiteral("session/delete"), {{"sessionId", session.id}});
+  if (id.isEmpty()) dispatchPending_ = false;
+  updateControls();
+}
+
 void MainWindow::runTask() {
   const QString prompt = taskInput_->toPlainText().trimmed();
   if (prompt.isEmpty() || !configured_ || !coreAlive_ || projectId_.isEmpty() || running_ || dispatchPending_) return;
@@ -291,6 +317,11 @@ quint64 MainWindow::beginRequestGeneration(const QString &method, const QString 
     sessionSelectionTarget_ = target;
     return ++sessionSelectionGeneration_;
   }
+  if (method == QStringLiteral("session/delete")) {
+    sessionSelectionMethod_ = method;
+    sessionSelectionTarget_ = target;
+    return ++sessionSelectionGeneration_;
+  }
   if (method == QStringLiteral("session/create")) {
     sessionSelectionMethod_ = method;
     sessionSelectionTarget_ = target;
@@ -319,6 +350,10 @@ bool MainWindow::isCurrentRequest(const PendingRequest &pending) const {
       && sessionSelectionMethod_ == pending.method
       && pending.target == sessionSelectionTarget_
       && pending.target == sessionId_;
+  if (pending.method == QStringLiteral("session/delete"))
+    return pending.generation == sessionSelectionGeneration_
+      && sessionSelectionMethod_ == pending.method
+      && pending.target == sessionSelectionTarget_;
   if (pending.method == QStringLiteral("session/create"))
     return pending.generation == sessionSelectionGeneration_
       && sessionSelectionMethod_ == pending.method
@@ -370,6 +405,21 @@ void MainWindow::processResponse(const QString &method, const QJsonValue &result
       }
     }
     tools_.hydrate(object.value("toolCalls").toArray());
+  } else if (method == QStringLiteral("session/delete")) {
+    const QString deletedSessionId = object.value("sessionId").toString();
+    sessions_.removeById(deletedSessionId);
+    if (deletedSessionId == sessionId_) {
+      sessionId_.clear();
+      ++sessionSelectionGeneration_;
+      sessionSelectionMethod_.clear();
+      sessionSelectionTarget_.clear();
+      sessionView_->clearSelection();
+      transcriptEntries_.clear();
+      tools_.clear();
+      renderTranscript();
+    }
+    dispatchPending_ = false;
+    updateControls();
   } else if (method == QStringLiteral("agent/run")) {
     currentRunRequestId_.clear();
     setRunning(false);
@@ -420,7 +470,7 @@ QString MainWindow::sendRequest(const QString &method, const QJsonObject &params
   QString target;
   if (method == QStringLiteral("session/list") || method == QStringLiteral("session/create"))
     target = params.value(QStringLiteral("projectId")).toString();
-  else if (method == QStringLiteral("session/load"))
+  else if (method == QStringLiteral("session/load") || method == QStringLiteral("session/delete"))
     target = params.value(QStringLiteral("sessionId")).toString();
   const quint64 generation = beginRequestGeneration(method, target);
   const QString id = manager_->request(method, params);
@@ -456,6 +506,7 @@ void MainWindow::updateControls() {
   workspaceField_->setEnabled(idle);
   chooseWorkspace_->setEnabled(idle);
   newSession_->setEnabled(idle && !projectId_.isEmpty());
+  deleteSession_->setEnabled(idle && !projectId_.isEmpty() && sessionView_->currentIndex().isValid());
   sessionView_->setEnabled(idle && !projectId_.isEmpty());
   settingsButton_->setEnabled(idle);
   taskInput_->setEnabled(idle);

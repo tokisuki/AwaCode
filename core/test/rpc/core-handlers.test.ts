@@ -93,6 +93,11 @@ test("real JsonRpcPeer calls receive the literal results of core and memory hand
       messages: [],
       toolCalls: [],
     });
+    assert.deepEqual(await client.request("session/delete", { sessionId: "session-rpc-1" }), {
+      sessionId: "session-rpc-1",
+      deleted: true,
+    });
+    assert.deepEqual(await client.request("session/list", { projectId }), []);
     assert.deepEqual(await client.request("memory/read", { projectId }), { global: "", project: "" });
   } finally {
     client.close();
@@ -121,6 +126,7 @@ test("exact parameter validators reject missing, extra, and mistyped fields thro
       ["session/list", { projectId: "missing", extra: true }],
       ["session/create", { projectId: "missing", title: null }],
       ["session/load", []],
+      ["session/delete", { sessionId: "missing", extra: true }],
       ["memory/read", { projectId: "missing", extra: true }],
     ];
     for (const [method, params] of invalidCalls) {
@@ -154,6 +160,7 @@ test("missing workspaces, projects, and sessions become application not-found fa
       ["session/list", { projectId: "missing-project" }, "Project not found", { projectId: "missing-project" }],
       ["session/create", { projectId: "missing-project" }, "Project not found", { projectId: "missing-project" }],
       ["session/load", { sessionId: "missing-session" }, "Session not found", { sessionId: "missing-session" }],
+      ["session/delete", { sessionId: "missing-session" }, "Session not found", { sessionId: "missing-session" }],
     ];
     for (const [method, params, message, data] of calls) {
       await assert.rejects(

@@ -30,4 +30,15 @@ void SessionListModel::prepend(SessionSummary session) {
   endInsertRows();
 }
 
+bool SessionListModel::removeById(const QString &sessionId) {
+  for (int row = 0; row < sessions_.size(); ++row) {
+    if (sessions_.at(row).id != sessionId) continue;
+    beginRemoveRows({}, row, row);
+    sessions_.removeAt(row);
+    endRemoveRows();
+    return true;
+  }
+  return false;
+}
+
 SessionSummary SessionListModel::at(int row) const { return sessions_.value(row); }

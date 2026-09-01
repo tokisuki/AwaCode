@@ -190,6 +190,46 @@ test("loads messages and tool calls in protocol order after two stores allocate 
   }
 });
 
+test("deleting a session cascades its durable history while preserving the project", async () => {
+  const root = await dataRoot("delete-session");
+  const connection = await openDatabase({ env: { AWACODE_DATA_DIR: root } });
+  const ids = ["session-delete", "message-user", "message-tools"];
+  const store = new SessionStore(connection.db, { randomUUID: () => ids.shift() as string });
+  try {
+    store.upsertProject(identity("project-delete", "D:\\repo"));
+    store.createSession("project-delete", "Disposable");
+    store.insertMessage({
+      sessionId: "session-delete",
+      role: "user",
+      kind: "text",
+      payload: { text: "remove me" },
+    });
+    store.insertAssistantMessageWithToolCalls({
+      sessionId: "session-delete",
+      payload: { text: "tool block" },
+      toolCalls: [{ callId: "call-delete", ordinal: 0, toolName: "read_file", inputText: "{}" }],
+    });
+    store.saveContextSnapshot({
+      sessionId: "session-delete",
+      baseline: "system",
+      sourceSnapshot: {},
+      baselineSeq: 0,
+      summary: "summary",
+      summaryUptoSeq: 1,
+    });
+
+    assert.deepEqual(store.deleteSession("session-delete"), { sessionId: "session-delete", deleted: true });
+    assert.equal(store.listSessions("project-delete").length, 0);
+    for (const table of ["sessions", "messages", "tool_calls", "context_snapshots"]) {
+      assert.equal(connection.db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get()?.count, 0);
+    }
+    assert.equal(connection.db.prepare("SELECT COUNT(*) AS count FROM projects").get()?.count, 1);
+    assert.throws(() => store.deleteSession("session-delete"), StoreNotFoundError);
+  } finally {
+    connection.close();
+  }
+});
+
 function cleanEnvironment(): NodeJS.ProcessEnv {
   return Object.fromEntries(Object.entries(process.env).filter(([name]) =>
     !/(?:TOKEN|SECRET|PASSWORD|API_KEY|ACCESS_KEY|PRIVATE_KEY|OPENAI|ANTHROPIC|AZURE|AWS)/i.test(name)));

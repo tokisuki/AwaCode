@@ -19,6 +19,7 @@ public:
   QVariant data(const QModelIndex &index, int role) const override;
   void setSessions(QList<SessionSummary> sessions);
   void prepend(SessionSummary session);
+  bool removeById(const QString &sessionId);
   SessionSummary at(int row) const;
 
 private:
