@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -45,10 +45,39 @@ test("search_text validates its exact bounded input contract", () => {
     { query: "" },
     { query: "x", extra: true },
     { query: "[", is_regex: true },
+    { query: "(a+)+$", is_regex: true },
+    { query: "(a|aa)+$", is_regex: true },
+    { query: "(.*)*", is_regex: true },
     { query: "x", is_regex: "yes" },
   ]) {
     assert.throws(() => searchTextTool.validate(invalid), ToolValidationError);
   }
+});
+
+test("search_text caps a file that grows after its size check", async () => {
+  const { root, context } = await fixture("post-stat-growth");
+  const path = join(root, "growing.txt");
+  await writeFile(path, "needle", "utf8");
+  let growthBarrierCalls = 0;
+
+  const result = await searchTextTool.execute(
+    searchTextTool.validate({ query: "needle" }),
+    {
+      ...context,
+      async accessBarrier(event) {
+        if ((event.kind as string) === "file_sized") {
+          growthBarrierCalls += 1;
+          await appendFile(path, Buffer.alloc(1024 * 1024, 0x78));
+        }
+      },
+    },
+  );
+
+  assert.equal(growthBarrierCalls, 1);
+  assert.equal(result.status, "success");
+  assert.equal(result.content, "");
+  assert.equal(result.metadata.filesSearched, 0);
+  assert.equal(result.metadata.oversizedFileCount, 1);
 });
 
 test("search_text reports ordered line matches while skipping generated, binary, and oversized files", async () => {

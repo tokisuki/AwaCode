@@ -30,6 +30,92 @@ function throwIfAborted(signal: AbortSignal): void {
   }
 }
 
+interface RegexFrame {
+  hasAlternation: boolean;
+  hasQuantifier: boolean;
+  unboundedQuantifiers: number;
+}
+
+interface RegexAtom {
+  kind: "plain" | "group";
+  hasAlternation: boolean;
+  hasQuantifier: boolean;
+}
+
+function isSafeRegexPattern(pattern: string): boolean {
+  const frames: RegexFrame[] = [{ hasAlternation: false, hasQuantifier: false, unboundedQuantifiers: 0 }];
+  const groupAtoms: RegexAtom[] = [];
+  let atom: RegexAtom | undefined;
+  let inClass = false;
+  for (let index = 0; index < pattern.length; index += 1) {
+    const character = pattern[index]!;
+    if (character === "\\") {
+      const escaped = pattern[index + 1];
+      if (escaped === undefined || /^[1-9]$/u.test(escaped)) return false;
+      index += 1;
+      atom = { kind: "plain", hasAlternation: false, hasQuantifier: false };
+      continue;
+    }
+    if (inClass) {
+      if (character === "]") {
+        inClass = false;
+        atom = { kind: "plain", hasAlternation: false, hasQuantifier: false };
+      }
+      continue;
+    }
+    if (character === "[") {
+      inClass = true;
+      atom = undefined;
+      continue;
+    }
+    if (character === "(") {
+      if (pattern[index + 1] === "?" && pattern[index + 2] !== ":") return false;
+      if (pattern[index + 1] === "?" && pattern[index + 2] === ":") index += 2;
+      frames.push({ hasAlternation: false, hasQuantifier: false, unboundedQuantifiers: 0 });
+      groupAtoms.push({ kind: "group", hasAlternation: false, hasQuantifier: false });
+      atom = undefined;
+      continue;
+    }
+    if (character === ")") {
+      const frame = frames.pop();
+      const group = groupAtoms.pop();
+      if (frame === undefined || group === undefined || frames.length === 0) return false;
+      atom = { kind: "group", hasAlternation: frame.hasAlternation, hasQuantifier: frame.hasQuantifier };
+      continue;
+    }
+    if (character === "|") {
+      const frame = frames.at(-1)!;
+      frame.hasAlternation = true;
+      frame.unboundedQuantifiers = 0;
+      atom = undefined;
+      continue;
+    }
+    if (character === "*" || character === "+" || character === "?" || character === "{") {
+      if (atom === undefined) return false;
+      let unbounded = character === "*" || character === "+";
+      if (character === "{") {
+        const close = pattern.indexOf("}", index + 1);
+        if (close === -1) return false;
+        const range = pattern.slice(index + 1, close);
+        unbounded = /^\d+,$/u.test(range);
+        index = close;
+      }
+      if (atom.kind === "group" && (atom.hasAlternation || atom.hasQuantifier)) return false;
+      const frame = frames.at(-1)!;
+      frame.hasQuantifier = true;
+      if (unbounded && ++frame.unboundedQuantifiers > 1) return false;
+      atom = { kind: "plain", hasAlternation: false, hasQuantifier: true };
+      continue;
+    }
+    if (character === "^" || character === "$") {
+      atom = undefined;
+      continue;
+    }
+    atom = { kind: "plain", hasAlternation: false, hasQuantifier: false };
+  }
+  return !inClass && frames.length === 1 && groupAtoms.length === 0;
+}
+
 function validateSearchTextInput(value: unknown): SearchTextInput {
   const input = assertExactPlainObject(value, ["query", "path", "is_regex"], ["query"]);
   const path = Object.hasOwn(input, "path") ? input.path : ".";
@@ -51,6 +137,9 @@ function validateSearchTextInput(value: unknown): SearchTextInput {
     } catch {
       throw new ToolValidationError();
     }
+    if (!isSafeRegexPattern(input.query)) {
+      throw new ToolValidationError();
+    }
   }
   return { query: input.query, path, isRegex };
 }
@@ -63,12 +152,23 @@ function lineMatcher(input: SearchTextInput): (line: string) => boolean {
   return (line) => expression.test(line);
 }
 
-async function readSearchableText(handle: FileHandle): Promise<string | null> {
+async function readSearchableText(handle: FileHandle, afterStat: () => Promise<void>): Promise<string | null> {
   const stats = await handle.stat();
   if (stats.size > MAX_FILE_BYTES) {
     return null;
   }
-  const bytes = await handle.readFile();
+  await afterStat();
+  const bounded = Buffer.allocUnsafe(MAX_FILE_BYTES + 1);
+  let bytesRead = 0;
+  while (bytesRead < bounded.length) {
+    const chunk = await handle.read(bounded, bytesRead, bounded.length - bytesRead, bytesRead);
+    if (chunk.bytesRead === 0) break;
+    bytesRead += chunk.bytesRead;
+  }
+  if (bytesRead > MAX_FILE_BYTES) {
+    return null;
+  }
+  const bytes = bounded.subarray(0, bytesRead);
   if (bytes.includes(0)) {
     throw new UnsupportedSearchFileError();
   }
@@ -123,7 +223,10 @@ export const searchTextTool: ToolDefinition<SearchTextInput> = {
           },
         );
         handle = opened.handle;
-        const text = await readSearchableText(handle);
+        const text = await readSearchableText(handle, async () => {
+          await context.accessBarrier?.({ kind: "file_sized", path: opened.resolved.relativePath });
+          throwIfAborted(context.signal);
+        });
         if (text === null) {
           oversizedFileCount += 1;
           return true;

@@ -6,7 +6,7 @@ import type { MemoryStore } from "../memory/memory-store.ts";
 export type ApprovalKind = "none" | "write" | "command";
 
 export interface ToolAccessEvent {
-  kind: "file_resolved" | "file_opened" | "directory_resolved" | "directory_opened";
+  kind: "file_resolved" | "file_opened" | "file_sized" | "directory_resolved" | "directory_opened";
   path: string;
 }
 
