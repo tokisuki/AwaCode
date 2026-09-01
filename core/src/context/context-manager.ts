@@ -199,11 +199,16 @@ export class ContextManager {
     const cutoff = existing?.summary === null || existing?.summary === undefined ? 0 : existing.summaryUptoSeq;
     const protectedIds = new Set([input.currentUserMessageId, ...(input.protectedMessageIds ?? [])]);
     const effectiveHistory = this.withStoredSystemUpdates(input);
+    const protectedEntries = effectiveHistory.filter((entry) => protectedIds.has(entry.messageId));
+    if (protectedEntries.length !== protectedIds.size) {
+      throw new ContextBudgetError();
+    }
+    const protectedBarrierSeq = Math.min(...protectedEntries.map((entry) => entry.seq));
     const candidates = effectiveHistory
-      .filter((entry) => entry.seq > cutoff && !protectedIds.has(entry.messageId))
+      .filter((entry) => entry.seq > cutoff && entry.seq < protectedBarrierSeq)
       .map(entryBlock);
     if (candidates.length === 0) {
-      return false;
+      throw new ContextBudgetError();
     }
     const baseline = existing?.baseline ?? input.systemText;
     const sourceSnapshot = existing?.sourceSnapshot ?? {};
@@ -334,7 +339,16 @@ export class ContextManager {
     const selectedBlocks = blocks.filter((_, index) => selected.has(index));
     const evictedBlocks = blocks.filter((block, index) => !selected.has(index) && !protectedIds.has(block.messageId));
     if (allowCompression && evictedBlocks.length > 0 && this.summaryGenerator !== undefined) {
-      const maxEvictedSeq = Math.max(...evictedBlocks.map((block) => block.seq));
+      const protectedBarrierSeq = Math.min(...requiredIndices.map((index) => blocks[index]!.seq));
+      const compressiblePrefix: ModelBlock[] = [];
+      for (const [index, block] of blocks.entries()) {
+        if (block.seq >= protectedBarrierSeq || selected.has(index)) break;
+        compressiblePrefix.push(block);
+      }
+      if (compressiblePrefix.length === 0) {
+        throw new ContextBudgetError();
+      }
+      const maxEvictedSeq = compressiblePrefix.at(-1)!.seq;
       const systemUpdateBlocks = effectiveHistory
         .filter((entry) => entry.seq > summaryCutoff && entry.seq <= maxEvictedSeq && systemContextUpdate(entry) !== null)
         .map(entryBlock);
@@ -343,9 +357,12 @@ export class ContextManager {
         existing?.summary ?? null,
         baseline,
         persistedSource,
-        [...evictedBlocks, ...systemUpdateBlocks].sort((left, right) => left.seq - right.seq),
+        [...compressiblePrefix, ...systemUpdateBlocks].sort((left, right) => left.seq - right.seq),
       );
       return this.buildInternal(input, false);
+    }
+    if (!allowCompression && evictedBlocks.length > 0 && this.summaryGenerator !== undefined) {
+      throw new ContextBudgetError();
     }
     const messages = [...prefix, ...selectedBlocks.flatMap((block) => block.messages), ...suffix];
     return {

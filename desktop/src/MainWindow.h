@@ -94,11 +94,10 @@ private:
   quint64 workspaceEpoch_ = 0;
   quint64 connectionGeneration_ = 1;
   quint64 sessionListGeneration_ = 0;
-  quint64 sessionLoadGeneration_ = 0;
-  quint64 sessionCreateGeneration_ = 0;
+  quint64 sessionSelectionGeneration_ = 0;
   QString sessionListTarget_;
-  QString sessionLoadTarget_;
-  QString sessionCreateTarget_;
+  QString sessionSelectionMethod_;
+  QString sessionSelectionTarget_;
   QString workspace_;
   QString projectId_;
   QString sessionId_;

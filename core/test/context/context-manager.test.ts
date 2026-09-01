@@ -305,8 +305,8 @@ test("transient phase instructions count against the same context budget as base
 test("multiple protected messages stay out of rolling summaries and remain visible together", async () => {
   const { connection, store, session } = await fixture("protected-candidate");
   try {
-    const candidate = store.insertMessage({ sessionId: session.id, role: "assistant", kind: "text", payload: { text: "candidate must be rejected later" } });
     store.insertMessage({ sessionId: session.id, role: "assistant", kind: "text", payload: { text: "x".repeat(9_000) } });
+    const candidate = store.insertMessage({ sessionId: session.id, role: "assistant", kind: "text", payload: { text: "candidate must be rejected later" } });
     const current = store.insertMessage({ sessionId: session.id, role: "user", kind: "text", payload: { text: "review candidate" } });
     const history = validateProviderHistory(store, session.id);
     const summarized: string[] = [];
@@ -353,6 +353,74 @@ test("jointly oversized protected messages fail instead of summarizing either on
       tools: [], contextLimit: 8_000, maxOutputTokens: 1_000,
     }), ContextBudgetError);
     assert.equal(summaryCalls, 0);
+  } finally { connection.close(); }
+});
+
+test("compression never advances its cutoff across a protected history block", async () => {
+  const { connection, store, session } = await fixture("protected-cutoff-barrier");
+  try {
+    const original = store.insertMessage({
+      sessionId: session.id, role: "user", kind: "text", payload: { text: "original user request" },
+    });
+    store.insertMessage({
+      sessionId: session.id, role: "assistant", kind: "plan", payload: { text: "p".repeat(9_000) },
+    });
+    const candidate = store.insertMessage({
+      sessionId: session.id, role: "assistant", kind: "text",
+      payload: { text: "pending candidate", candidateStatus: "pending" },
+    });
+    let summaryCalls = 0;
+    const manager = new ContextManager(store, { summaryGenerator: async () => {
+      summaryCalls += 1;
+      return "illegal summary";
+    } });
+    await assert.rejects(manager.build({
+      sessionId: session.id,
+      history: validateProviderHistory(store, session.id),
+      currentUserMessageId: original.id,
+      protectedMessageIds: [original.id, candidate.id],
+      systemText: "system", tools: [], contextLimit: 8_000, maxOutputTokens: 1_000,
+    }), ContextBudgetError);
+    assert.equal(summaryCalls, 0);
+    assert.equal(store.loadContextSnapshot(session.id)?.summaryUptoSeq, 0);
+  } finally { connection.close(); }
+});
+
+test("a rejected candidate leaves its original user directly visible or legally summarized", async () => {
+  const { connection, store, session } = await fixture("protected-cutoff-lifecycle");
+  try {
+    const original = store.insertMessage({
+      sessionId: session.id, role: "user", kind: "text", payload: { text: "original lifecycle request" },
+    });
+    store.insertMessage({
+      sessionId: session.id, role: "assistant", kind: "plan", payload: { text: "plan details" },
+    });
+    const candidate = store.insertMessage({
+      sessionId: session.id, role: "assistant", kind: "text",
+      payload: { text: "pending lifecycle candidate", candidateStatus: "pending" },
+    });
+    const manager = new ContextManager(store, { summaryGenerator: async ({ messages }) =>
+      `summary:${JSON.stringify(messages)}` });
+    await manager.build({
+      sessionId: session.id, history: validateProviderHistory(store, session.id),
+      currentUserMessageId: original.id, protectedMessageIds: [original.id, candidate.id],
+      systemText: "system", tools: [], contextLimit: 32_768, maxOutputTokens: 1_000,
+    });
+    store.setAssistantCandidateStatus(candidate.id, "rejected");
+    store.insertMessage({
+      sessionId: session.id, role: "assistant", kind: "text", payload: { text: "x".repeat(9_000) },
+    });
+    const nextUser = store.insertMessage({
+      sessionId: session.id, role: "user", kind: "text", payload: { text: "next request" },
+    });
+    const built = await manager.build({
+      sessionId: session.id, history: validateProviderHistory(store, session.id),
+      currentUserMessageId: nextUser.id, systemText: "system", tools: [],
+      contextLimit: 8_000, maxOutputTokens: 1_000,
+    });
+    const originalDirect = built.selectedMessageIds.includes(original.id);
+    const originalSummarized = store.loadContextSnapshot(session.id)?.summary?.includes("original lifecycle request") === true;
+    assert.equal(originalDirect || originalSummarized, true);
   } finally { connection.close(); }
 });
 

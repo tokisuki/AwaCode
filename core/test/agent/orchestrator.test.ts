@@ -939,6 +939,7 @@ test("agent RPC maps persisted incomplete tool history to history-integrity with
 
 test("provider context overflow triggers one persisted compression and retries the original turn once", async () => {
   const f = await fixture("overflow-retry");
+  f.store.insertMessage({ sessionId: f.sessionId, role: "assistant", kind: "text", payload: { text: "older context" } });
   const requests: ModelStreamRequest[] = [];
   const script: Array<AssistantModelMessage | Error> = [
     response("Plan."),
@@ -984,6 +985,7 @@ test("provider context overflow triggers one persisted compression and retries t
 
 test("a second provider overflow after compression fails explicitly without a third original attempt", async () => {
   const f = await fixture("overflow-twice");
+  f.store.insertMessage({ sessionId: f.sessionId, role: "assistant", kind: "text", payload: { text: "older context" } });
   let calls = 0;
   const script: Array<AssistantModelMessage | Error> = [
     response("Plan."),

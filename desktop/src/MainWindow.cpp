@@ -286,12 +286,15 @@ quint64 MainWindow::beginRequestGeneration(const QString &method, const QString 
     return ++sessionListGeneration_;
   }
   if (method == QStringLiteral("session/load")) {
-    sessionLoadTarget_ = target;
-    return ++sessionLoadGeneration_;
+    sessionId_ = target;
+    sessionSelectionMethod_ = method;
+    sessionSelectionTarget_ = target;
+    return ++sessionSelectionGeneration_;
   }
   if (method == QStringLiteral("session/create")) {
-    sessionCreateTarget_ = target;
-    return ++sessionCreateGeneration_;
+    sessionSelectionMethod_ = method;
+    sessionSelectionTarget_ = target;
+    return ++sessionSelectionGeneration_;
   }
   return method == QStringLiteral("core/hello") ? connectionGeneration_ : 0;
 }
@@ -312,9 +315,14 @@ bool MainWindow::isCurrentRequest(const PendingRequest &pending) const {
   if (pending.method == QStringLiteral("session/list"))
     return pending.generation == sessionListGeneration_ && pending.target == sessionListTarget_;
   if (pending.method == QStringLiteral("session/load"))
-    return pending.generation == sessionLoadGeneration_ && pending.target == sessionLoadTarget_;
+    return pending.generation == sessionSelectionGeneration_
+      && sessionSelectionMethod_ == pending.method
+      && pending.target == sessionSelectionTarget_
+      && pending.target == sessionId_;
   if (pending.method == QStringLiteral("session/create"))
-    return pending.generation == sessionCreateGeneration_ && pending.target == sessionCreateTarget_;
+    return pending.generation == sessionSelectionGeneration_
+      && sessionSelectionMethod_ == pending.method
+      && pending.target == sessionSelectionTarget_;
   return true;
 }
 
@@ -339,7 +347,13 @@ void MainWindow::processResponse(const QString &method, const QJsonValue &result
     sessions_.setSessions(sessions);
   } else if (method == QStringLiteral("session/create")) {
     sessionId_ = object.value("id").toString();
+    ++sessionSelectionGeneration_;
+    sessionSelectionMethod_.clear();
+    sessionSelectionTarget_ = sessionId_;
     sessions_.prepend({sessionId_, object.value("title").toString(), object.value("status").toString()});
+    transcriptEntries_.clear();
+    tools_.clear();
+    renderTranscript();
     dispatchPending_ = false;
     updateControls();
     if (intent == RequestIntent::CreateForRun && !prompt.isEmpty()) dispatchRun(prompt);

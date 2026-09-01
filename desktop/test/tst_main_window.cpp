@@ -28,6 +28,7 @@ private slots:
   void newestSessionListWinsWithinOneWorkspaceEpoch();
   void helloSurvivesWorkspaceSelectionOnTheSameConnection();
   void newestCreateIntentWinsWithinOneWorkspaceEpoch();
+  void creatingSessionInvalidatesOlderLoadsAndClearsTheOldProjection();
 };
 
 void MainWindowTest::disablesRunUntilConfigured() {
@@ -137,6 +138,31 @@ void MainWindowTest::newestCreateIntentWinsWithinOneWorkspaceEpoch() {
   QVERIFY(!window.transcriptText().contains(QStringLiteral("You: old run prompt")));
 }
 
+void MainWindowTest::creatingSessionInvalidatesOlderLoadsAndClearsTheOldProjection() {
+  MainWindow window;
+  const quint64 epoch = window.beginWorkspaceSelection(QStringLiteral("C:/work"));
+  const quint64 shownLoad = window.beginRequestGeneration(QStringLiteral("session/load"), QStringLiteral("A"));
+  window.receiveResponseForGeneration("session/load", QJsonObject{
+    {"messages", QJsonArray{QJsonObject{{"role", "assistant"}, {"payload", QJsonObject{{"text", "session A"}}}}}},
+    {"toolCalls", QJsonArray{QJsonObject{{"callId", "a-call"}, {"toolName", "read_file"}, {"status", "success"}}}},
+  }, epoch, shownLoad, QStringLiteral("A"));
+  QVERIFY(window.transcriptText().contains(QStringLiteral("session A")));
+  QVERIFY(!window.toolTimelineText(0).isEmpty());
+
+  const quint64 lateLoad = window.beginRequestGeneration(QStringLiteral("session/load"), QStringLiteral("A"));
+  const quint64 createB = window.beginRequestGeneration(QStringLiteral("session/create"), QStringLiteral("p"));
+  window.receiveResponseForGeneration("session/create",
+    QJsonObject{{"id", "B"}, {"title", "Session B"}, {"status", "idle"}},
+    epoch, createB, QStringLiteral("p"), false);
+  QVERIFY(window.transcriptText().isEmpty());
+  QVERIFY(window.toolTimelineText(0).isEmpty());
+
+  window.receiveResponseForGeneration("session/load", QJsonObject{
+    {"messages", QJsonArray{QJsonObject{{"role", "assistant"}, {"payload", QJsonObject{{"text", "late A"}}}}}},
+  }, epoch, lateLoad, QStringLiteral("A"));
+  QVERIFY(window.transcriptText().isEmpty());
+}
+
 void MainWindowTest::reloadMarksRejectedCandidates() {
   MainWindow window;
   window.receiveResponse("session/load", QJsonObject{{"messages", QJsonArray{
@@ -173,8 +199,8 @@ void MainWindowTest::keepsStreamBeforeLaterTranscriptEventsAndClearsCommittedSta
   QVERIFY(!window.transcriptText().contains(QStringLiteral("You: second task")));
   window.receiveNotification("stream/text", QJsonObject{{"messageId", "second"}, {"delta", "second answer"}, {"provisional", true}});
   QTRY_VERIFY_WITH_TIMEOUT(window.transcriptText().contains(QStringLiteral("second answer")), 200);
-  QCOMPARE(window.transcriptText().count(QStringLiteral("first answer")), 1);
-  QVERIFY(window.transcriptText().indexOf(QStringLiteral("first answer")) < window.transcriptText().indexOf(QStringLiteral("second answer")));
+  QCOMPARE(window.transcriptText().count(QStringLiteral("first answer")), 0);
+  QVERIFY(window.transcriptText().contains(QStringLiteral("second answer")));
   window.receiveError("agent/run", QJsonObject{{"message", "later error"}});
   QVERIFY(window.transcriptText().indexOf(QStringLiteral("second answer")) < window.transcriptText().indexOf(QStringLiteral("later error")));
 }
