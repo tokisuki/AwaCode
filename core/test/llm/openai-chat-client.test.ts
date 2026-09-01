@@ -1,0 +1,382 @@
+import assert from "node:assert/strict";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { once } from "node:events";
+import test from "node:test";
+
+import type { EffectiveModelConfig } from "../../src/config/model-config.ts";
+import {
+  ModelRequestError,
+  OpenAIChatClient,
+  OpenAIModelConnectionTester,
+} from "../../src/llm/openai-chat-client.ts";
+
+interface CapturedRequest {
+  readonly url: string | undefined;
+  readonly authorization: string | undefined;
+  readonly body: unknown;
+}
+
+interface ScriptedServer {
+  readonly baseUrl: string;
+  readonly requests: CapturedRequest[];
+  close(): Promise<void>;
+}
+
+async function scriptedServer(
+  respond: (request: IncomingMessage, response: ServerResponse, body: unknown) => void | Promise<void>,
+): Promise<ScriptedServer> {
+  const requests: CapturedRequest[] = [];
+  const server = createServer(async (request, response) => {
+    const buffers: Buffer[] = [];
+    for await (const chunk of request) {
+      buffers.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+    const body = JSON.parse(Buffer.concat(buffers).toString("utf8")) as unknown;
+    requests.push({
+      url: request.url,
+      authorization: typeof request.headers.authorization === "string" ? request.headers.authorization : undefined,
+      body,
+    });
+    await respond(request, response, body);
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("Fixture server has no TCP address");
+  }
+  return {
+    baseUrl: `http://127.0.0.1:${address.port}/v1`,
+    requests,
+    close: async () => {
+      server.close();
+      await once(server, "close");
+    },
+  };
+}
+
+function stream(response: ServerResponse, chunks: readonly Record<string, unknown>[]): void {
+  response.writeHead(200, { "content-type": "text/event-stream" });
+  for (const chunk of chunks) {
+    response.write(`data: ${JSON.stringify(chunk)}\n\n`);
+  }
+  response.end("data: [DONE]\n\n");
+}
+
+function config(baseUrl: string): EffectiveModelConfig {
+  return {
+    runnable: true,
+    baseUrl,
+    model: "fixture-model",
+    contextLimit: 32768,
+    maxOutputTokens: 4096,
+    apiKey: "fixture-openai-key",
+    sources: {
+      baseUrl: "file",
+      model: "file",
+      contextLimit: "file",
+      maxOutputTokens: "file",
+      apiKey: "file",
+    },
+    issues: [],
+  };
+}
+
+test("streams text deltas and returns their complete assistant content", async () => {
+  const server = await scriptedServer((_request, response) => {
+    stream(response, [
+      { choices: [{ index: 0, delta: { role: "assistant", content: "你好" } }] },
+      { choices: [{ index: 0, delta: { content: "，世界" }, finish_reason: "stop" }] },
+    ]);
+  });
+  try {
+    const deltas: string[] = [];
+    const result = await new OpenAIChatClient(config(server.baseUrl)).stream({
+      messages: [{ role: "user", content: "Say hello" }],
+      onTextDelta(delta) {
+        deltas.push(delta);
+      },
+    });
+
+    assert.deepEqual(deltas, ["你好", "，世界"]);
+    assert.deepEqual(result, {
+      role: "assistant",
+      content: "你好，世界",
+      toolCalls: [],
+      finishReason: "stop",
+    });
+    assert.equal(server.requests.length, 1);
+    assert.equal(server.requests[0]?.url, "/v1/chat/completions");
+    assert.equal(server.requests[0]?.authorization, "Bearer fixture-openai-key");
+  } finally {
+    await server.close();
+  }
+});
+
+test("assembles fragmented function tool calls in their stream index order", async () => {
+  const server = await scriptedServer((_request, response) => {
+    stream(response, [
+      {
+        choices: [{
+          index: 0,
+          delta: {
+            tool_calls: [
+              { index: 1, id: "call_", type: "function", function: { name: "sec", arguments: "{\"b\":" } },
+              { index: 0, id: "call_", type: "function", function: { name: "fir", arguments: "{\"a\":" } },
+            ],
+          },
+        }],
+      },
+      {
+        choices: [{
+          index: 0,
+          delta: {
+            tool_calls: [
+              { index: 0, id: "first", function: { name: "st", arguments: "1}" } },
+              { index: 1, id: "second", function: { name: "ond", arguments: "2}" } },
+            ],
+          },
+          finish_reason: "tool_calls",
+        }],
+      },
+    ]);
+  });
+  try {
+    const result = await new OpenAIChatClient(config(server.baseUrl)).stream({
+      messages: [{ role: "user", content: "Use both tools" }],
+      tools: [
+        { type: "function", function: { name: "first", description: "first", parameters: { type: "object" } } },
+        { type: "function", function: { name: "second", description: "second", parameters: { type: "object" } } },
+      ],
+    });
+
+    assert.deepEqual(result, {
+      role: "assistant",
+      content: "",
+      toolCalls: [
+        { id: "call_first", name: "first", arguments: "{\"a\":1}" },
+        { id: "call_second", name: "second", arguments: "{\"b\":2}" },
+      ],
+      finishReason: "tool_calls",
+    });
+  } finally {
+    await server.close();
+  }
+});
+
+test("rejects a completed stream with incomplete function call arguments", async () => {
+  const server = await scriptedServer((_request, response) => {
+    stream(response, [{
+      choices: [{
+        index: 0,
+        delta: {
+          tool_calls: [{
+            index: 0,
+            id: "call_broken",
+            type: "function",
+            function: { name: "broken", arguments: "{" },
+          }],
+        },
+        finish_reason: "tool_calls",
+      }],
+    }]);
+  });
+  try {
+    await assert.rejects(new OpenAIChatClient(config(server.baseUrl)).stream({
+      messages: [{ role: "user", content: "Malformed call" }],
+    }), (error: unknown) => error instanceof ModelRequestError && error.code === "malformed_stream");
+  } finally {
+    await server.close();
+  }
+});
+
+test("rejects a stream that ends without a completion finish reason", async () => {
+  const server = await scriptedServer((_request, response) => {
+    stream(response, [{ choices: [{ index: 0, delta: { content: "unfinished" } }] }]);
+  });
+  try {
+    await assert.rejects(new OpenAIChatClient(config(server.baseUrl)).stream({
+      messages: [{ role: "user", content: "Incomplete answer" }],
+    }), (error: unknown) => error instanceof ModelRequestError && error.code === "malformed_stream");
+  } finally {
+    await server.close();
+  }
+});
+
+test("cancels an in-flight streaming request through its AbortSignal", async () => {
+  let entered!: () => void;
+  const requestEntered = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const server = await scriptedServer(async (request, response) => {
+    entered();
+    await Promise.race([
+      once(request, "close"),
+      new Promise<void>((resolve) => setTimeout(resolve, 200)),
+    ]);
+    response.end();
+  });
+  try {
+    const controller = new AbortController();
+    const pending = new OpenAIChatClient(config(server.baseUrl)).stream({
+      messages: [{ role: "user", content: "Wait" }],
+      signal: controller.signal,
+    });
+    await requestEntered;
+    controller.abort();
+
+    const outcome = await Promise.race([
+      pending.then(() => "completed", (error: unknown) => error),
+      new Promise<"timed-out">((resolve) => setTimeout(() => resolve("timed-out"), 80)),
+    ]);
+    assert.equal(outcome instanceof ModelRequestError && outcome.code === "cancelled", true);
+  } finally {
+    await server.close();
+  }
+});
+
+test("retries a rate-limited request and honors its Retry-After delay", async () => {
+  let attempts = 0;
+  const server = await scriptedServer((_request, response) => {
+    attempts += 1;
+    if (attempts === 1) {
+      response.writeHead(429, { "content-type": "application/json", "retry-after": "2" });
+      response.end(JSON.stringify({ error: { message: "rate limited" } }));
+      return;
+    }
+    stream(response, [{ choices: [{ index: 0, delta: { content: "recovered" }, finish_reason: "stop" }] }]);
+  });
+  try {
+    const delays: number[] = [];
+    const result = await new OpenAIChatClient(config(server.baseUrl), {
+      sleep: async (milliseconds) => {
+        delays.push(milliseconds);
+      },
+    }).stream({ messages: [{ role: "user", content: "Retry me" }] });
+
+    assert.equal(result.content, "recovered");
+    assert.equal(attempts, 2);
+    assert.deepEqual(delays, [2000]);
+  } finally {
+    await server.close();
+  }
+});
+
+test("stops after three total retryable attempts", async () => {
+  let attempts = 0;
+  const server = await scriptedServer((_request, response) => {
+    attempts += 1;
+    response.writeHead(503, { "content-type": "application/json" });
+    response.end(JSON.stringify({ error: { message: "temporarily unavailable" } }));
+  });
+  try {
+    const delays: number[] = [];
+    await assert.rejects(new OpenAIChatClient(config(server.baseUrl), {
+      sleep: async (milliseconds) => {
+        delays.push(milliseconds);
+      },
+    }).stream({ messages: [{ role: "user", content: "Bound retry" }] }), ModelRequestError);
+    assert.equal(attempts, 3);
+    assert.deepEqual(delays, [250, 500]);
+  } finally {
+    await server.close();
+  }
+});
+
+test("does not retry an authentication failure", async () => {
+  let attempts = 0;
+  const server = await scriptedServer((_request, response) => {
+    attempts += 1;
+    response.writeHead(401, { "content-type": "application/json" });
+    response.end(JSON.stringify({ error: { message: "invalid credential" } }));
+  });
+  try {
+    await assert.rejects(new OpenAIChatClient(config(server.baseUrl)).stream({
+      messages: [{ role: "user", content: "Do not retry" }],
+    }));
+    assert.equal(attempts, 1);
+  } finally {
+    await server.close();
+  }
+});
+
+test("does not retry after a partially emitted stream fails", async () => {
+  let attempts = 0;
+  const server = await scriptedServer((_request, response) => {
+    attempts += 1;
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: "partial" } }] })}\n\n`);
+    setTimeout(() => response.destroy(new Error("fixture stream break")), 20);
+  });
+  try {
+    const deltas: string[] = [];
+    await assert.rejects(new OpenAIChatClient(config(server.baseUrl), {
+      sleep: async () => {
+        throw new Error("must not sleep after partial output");
+      },
+    }).stream({
+      messages: [{ role: "user", content: "Partial failure" }],
+      onTextDelta(delta) {
+        deltas.push(delta);
+      },
+    }));
+    assert.deepEqual(deltas, ["partial"]);
+    assert.equal(attempts, 1);
+  } finally {
+    await server.close();
+  }
+});
+
+test("returns a redacted model failure without response headers or credential fragments", async () => {
+  const server = await scriptedServer((_request, response) => {
+    response.writeHead(500, { "content-type": "application/json", authorization: "Bearer fixture-openai-key" });
+    response.end(JSON.stringify({
+      error: {
+        message: "upstream rejected Bearer fixture-openai-key",
+        details: { api_key: "fixture-openai-key" },
+      },
+    }));
+  });
+  try {
+    await assert.rejects(new OpenAIChatClient(config(server.baseUrl)).stream({
+      messages: [{ role: "user", content: "Sanitize failure" }],
+    }), (error: unknown) => {
+      assert.equal(error instanceof ModelRequestError, true);
+      if (!(error instanceof ModelRequestError)) {
+        return false;
+      }
+      assert.equal(error.code, "request_failed");
+      assert.equal(error.message, "Model request failed");
+      const diagnostic = JSON.stringify(error.diagnostic);
+      assert.equal(diagnostic.includes("fixture-openai-key"), false);
+      assert.equal(diagnostic.toLowerCase().includes("authorization"), false);
+      assert.match(diagnostic, /\[REDACTED\]/);
+      return true;
+    });
+  } finally {
+    await server.close();
+  }
+});
+
+test("connection tester sends one explicit minimal request through the provider", async () => {
+  const server = await scriptedServer((_request, response) => {
+    stream(response, [{ choices: [{ index: 0, delta: { content: "OK" }, finish_reason: "stop" }] }]);
+  });
+  try {
+    const result = await new OpenAIModelConnectionTester().test(
+      config(server.baseUrl),
+      new AbortController().signal,
+    );
+
+    assert.deepEqual(result, { message: "Model connection succeeded" });
+    assert.equal(server.requests.length, 1);
+    assert.deepEqual(server.requests[0]?.body, {
+      model: "fixture-model",
+      messages: [{ role: "user", content: "Reply with exactly OK." }],
+      max_tokens: 1,
+      stream: true,
+    });
+  } finally {
+    await server.close();
+  }
+});
