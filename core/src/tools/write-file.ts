@@ -1,10 +1,10 @@
 import { Buffer } from "node:buffer";
 import { createHash, randomUUID } from "node:crypto";
-import { link, lstat, open, stat, unlink, type FileHandle } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { link, lstat, open, realpath, unlink, type FileHandle } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
 
 import type { SessionStore } from "../persistence/session-store.ts";
-import { WorkspaceGuardError } from "../security/workspace-guard.ts";
+import { isPathWithinWorkspace, WorkspaceGuardError } from "../security/workspace-guard.ts";
 import {
   assertExactPlainObject,
   ToolExecutionError,
@@ -46,10 +46,13 @@ export interface ExecuteWriteFileOptions {
   permissionClient: PermissionClient;
   context: ToolContext;
   createTemporaryName?: () => string;
+  barrier?: (event: WriteFileBarrierEvent) => Promise<void>;
 }
 
+export type WriteFileBarrierEvent = "before_temp_create" | "before_publish" | "before_link" | "after_publish";
+
 class WriteFileError extends Error {
-  readonly code: "target_exists" | "parent_changed" | "temporary_file_changed" | "atomic_publish_failed" | "interrupted";
+  readonly code: "target_exists" | "parent_changed" | "temporary_file_changed" | "published_file_changed" | "atomic_publish_failed" | "interrupted";
   constructor(code: WriteFileError["code"]) {
     super("Workspace file could not be created.");
     this.name = "WriteFileError";
@@ -88,7 +91,15 @@ async function requireMissing(path: string): Promise<void> {
 }
 
 async function directoryIdentity(path: string): Promise<FileIdentity> {
-  const value = await stat(path, { bigint: true });
+  const value = await lstat(path, { bigint: true });
+  if (!value.isDirectory() || value.dev === 0n || value.ino === 0n) {
+    throw new WriteFileError("parent_changed");
+  }
+  return { dev: value.dev, ino: value.ino };
+}
+
+async function openedDirectoryIdentity(handle: FileHandle): Promise<FileIdentity> {
+  const value = await handle.stat({ bigint: true });
   if (!value.isDirectory() || value.dev === 0n || value.ino === 0n) {
     throw new WriteFileError("parent_changed");
   }
@@ -114,6 +125,94 @@ async function removeOwnedTemporary(path: string, identity: FileIdentity | undef
     }
   } catch {
     // Cleanup is best effort and never targets an unverified path entry.
+  }
+}
+
+function samePath(left: string, right: string): boolean {
+  const normalizedLeft = resolve(left);
+  const normalizedRight = resolve(right);
+  return process.platform === "win32"
+    ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
+    : normalizedLeft === normalizedRight;
+}
+
+async function revalidateParent(
+  prepared: PreparedWriteFile,
+  context: ToolContext,
+  parentHandle: FileHandle,
+): Promise<void> {
+  try {
+    const resolvedTarget = await context.workspace.resolveNewFile(prepared.input.path);
+    const parentPath = dirname(prepared.absolutePath);
+    if (!samePath(resolvedTarget.absolutePath, prepared.absolutePath)) {
+      throw new WriteFileError("parent_changed");
+    }
+    const pathIdentity = await directoryIdentity(parentPath);
+    const handleIdentity = await openedDirectoryIdentity(parentHandle);
+    if (!sameIdentity(prepared.parentIdentity, pathIdentity) || !sameIdentity(prepared.parentIdentity, handleIdentity)) {
+      throw new WriteFileError("parent_changed");
+    }
+  } catch (error) {
+    if (error instanceof WriteFileError) throw error;
+    throw new WriteFileError("parent_changed");
+  }
+}
+
+async function digestOpenedFile(handle: FileHandle, expectedBytes: number): Promise<string> {
+  const hash = createHash("sha256");
+  const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, expectedBytes + 1));
+  let offset = 0;
+  while (offset <= expectedBytes) {
+    const remaining = expectedBytes + 1 - offset;
+    if (remaining === 0) break;
+    const chunk = await handle.read(buffer, 0, Math.min(buffer.length, remaining), offset);
+    if (chunk.bytesRead === 0) break;
+    hash.update(buffer.subarray(0, chunk.bytesRead));
+    offset += chunk.bytesRead;
+  }
+  if (offset !== expectedBytes) {
+    throw new WriteFileError("temporary_file_changed");
+  }
+  return hash.digest("hex");
+}
+
+async function validateTemporaryFile(
+  prepared: PreparedWriteFile,
+  temporaryPath: string,
+  handle: FileHandle,
+  identity: FileIdentity,
+  context: ToolContext,
+): Promise<void> {
+  try {
+    const pathStats = await lstat(temporaryPath, { bigint: true });
+    const pathIdentity = { dev: pathStats.dev, ino: pathStats.ino };
+    const handleIdentity = await ownedIdentity(handle);
+    const physicalPath = await realpath(temporaryPath);
+    if (
+      !pathStats.isFile()
+      || !sameIdentity(identity, pathIdentity)
+      || !sameIdentity(identity, handleIdentity)
+      || !isPathWithinWorkspace(context.workspace.rootPath, physicalPath)
+      || !samePath(dirname(physicalPath), dirname(prepared.absolutePath))
+      || await digestOpenedFile(handle, prepared.bytes.length) !== prepared.digest
+    ) {
+      throw new WriteFileError("temporary_file_changed");
+    }
+  } catch (error) {
+    if (error instanceof WriteFileError) throw error;
+    throw new WriteFileError("temporary_file_changed");
+  }
+}
+
+async function validatePublishedFile(path: string, identity: FileIdentity): Promise<void> {
+  try {
+    const value = await lstat(path, { bigint: true });
+    if (!value.isFile() || !sameIdentity(identity, { dev: value.dev, ino: value.ino })) {
+      throw new WriteFileError("published_file_changed");
+    }
+  } catch (error) {
+    if (error instanceof WriteFileError) throw error;
+    throw new WriteFileError("published_file_changed");
   }
 }
 
@@ -154,22 +253,26 @@ async function prepareWriteFile(input: WriteFileInput, context: ToolContext): Pr
 async function applyPreparedWrite(
   prepared: PreparedWriteFile,
   context: ToolContext,
-  createTemporaryName: () => string,
+  options: Pick<ExecuteWriteFileOptions, "createTemporaryName" | "barrier">,
 ): Promise<void> {
   throwIfAborted(context.signal);
   const revalidated = await context.workspace.resolveNewFile(prepared.input.path);
-  if (revalidated.absolutePath !== prepared.absolutePath) {
+  if (!samePath(revalidated.absolutePath, prepared.absolutePath)) {
     throw new WriteFileError("parent_changed");
   }
   await requireMissing(prepared.absolutePath);
-  if (!sameIdentity(prepared.parentIdentity, await directoryIdentity(dirname(prepared.absolutePath)))) {
-    throw new WriteFileError("parent_changed");
-  }
-
-  const temporaryPath = join(dirname(prepared.absolutePath), `.awacode-write-${createTemporaryName()}.tmp`);
+  const parentPath = dirname(prepared.absolutePath);
+  const temporaryPath = join(parentPath, `.awacode-write-${(options.createTemporaryName ?? randomUUID)()}.tmp`);
+  let parentHandle: FileHandle | undefined;
   let handle: FileHandle | undefined;
+  let verifyHandle: FileHandle | undefined;
   let identity: FileIdentity | undefined;
   try {
+    parentHandle = await open(parentPath, "r");
+    await revalidateParent(prepared, context, parentHandle);
+    await options.barrier?.("before_temp_create");
+    await revalidateParent(prepared, context, parentHandle);
+    throwIfAborted(context.signal);
     handle = await open(temporaryPath, "wx");
     identity = await ownedIdentity(handle);
     throwIfAborted(context.signal);
@@ -178,16 +281,23 @@ async function applyPreparedWrite(
     await handle.close();
     handle = undefined;
 
-    const verify = await open(temporaryPath, "r");
-    try {
-      const verifyIdentity = await ownedIdentity(verify);
-      const verifyBytes = await verify.readFile();
-      if (!sameIdentity(identity, verifyIdentity) || createHash("sha256").update(verifyBytes).digest("hex") !== prepared.digest) {
-        throw new WriteFileError("temporary_file_changed");
-      }
-    } finally {
-      await verify.close().catch(() => undefined);
+    verifyHandle = await open(temporaryPath, "r");
+    await validateTemporaryFile(prepared, temporaryPath, verifyHandle, identity, context);
+    if (options.barrier !== undefined) {
+      // Windows may deny a directory rename while a child file handle is open. The
+      // injected race seam releases only the verification handle so tests can
+      // reproduce the pathname swap; production has no barrier and retains it.
+      await verifyHandle.close();
+      verifyHandle = undefined;
+      await options.barrier("before_publish");
     }
+    await revalidateParent(prepared, context, parentHandle);
+    verifyHandle ??= await open(temporaryPath, "r");
+    await validateTemporaryFile(prepared, temporaryPath, verifyHandle, identity, context);
+    throwIfAborted(context.signal);
+    await options.barrier?.("before_link");
+    await revalidateParent(prepared, context, parentHandle);
+    await validateTemporaryFile(prepared, temporaryPath, verifyHandle, identity, context);
     throwIfAborted(context.signal);
     try {
       await link(temporaryPath, prepared.absolutePath);
@@ -197,11 +307,21 @@ async function applyPreparedWrite(
       }
       throw new WriteFileError("atomic_publish_failed");
     }
+    await options.barrier?.("after_publish");
+    try {
+      await revalidateParent(prepared, context, parentHandle);
+      await validatePublishedFile(prepared.absolutePath, identity);
+    } catch (error) {
+      await removeOwnedTemporary(prepared.absolutePath, identity);
+      throw error;
+    }
   } finally {
     if (identity === undefined && handle !== undefined) {
       identity = await ownedIdentity(handle).catch(() => undefined);
     }
     await handle?.close().catch(() => undefined);
+    await verifyHandle?.close().catch(() => undefined);
+    await parentHandle?.close().catch(() => undefined);
     await removeOwnedTemporary(temporaryPath, identity);
   }
 }
@@ -237,6 +357,8 @@ function failedWrite(error: unknown, phase: "preparation" | "execution") {
             ? "The target parent directory changed after approval."
             : code === "temporary_file_changed"
               ? "The prepared file changed before publication."
+              : code === "published_file_changed"
+                ? "The published file changed before final validation."
               : code === "atomic_publish_failed"
                 ? "Atomic file publication failed."
                 : error instanceof WorkspaceGuardError
@@ -275,7 +397,7 @@ export function executeWriteFile(options: ExecuteWriteFileOptions) {
       approvalInterrupted,
       failed: failedWrite,
       async execute(prepared, context) {
-        await applyPreparedWrite(prepared, context, options.createTemporaryName ?? randomUUID);
+        await applyPreparedWrite(prepared, context, options);
         return {
           status: "success",
           summary: "Created a new workspace file.",

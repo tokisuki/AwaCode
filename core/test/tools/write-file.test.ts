@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -9,7 +9,7 @@ import { SessionStore } from "../../src/persistence/session-store.ts";
 import { WorkspaceGuard } from "../../src/security/workspace-guard.ts";
 import { ToolExecutionError, ToolValidationError } from "../../src/tools/contracts.ts";
 import type { PermissionRequest } from "../../src/tools/permission.ts";
-import { writeFileTool } from "../../src/tools/write-file.ts";
+import { executeWriteFile, writeFileTool } from "../../src/tools/write-file.ts";
 
 const temporaryDirectories: string[] = [];
 
@@ -164,6 +164,119 @@ test("write_file atomically loses a publication race without overwriting the win
     assert.equal(result.status, "failure");
     assert.equal(result.metadata.error, "target_exists");
     assert.equal(await readFile(join(setup.workspacePath, "race.txt"), "utf8"), "race winner");
+  } finally {
+    setup.connection.close();
+  }
+});
+
+async function assertMissing(path: string): Promise<void> {
+  await assert.rejects(access(path));
+}
+
+test("write_file rejects a parent replacement before temporary creation", async () => {
+  const input = { path: "parent/created.txt", content: "approved" };
+  const setup = await fixture("parent-before-temp", input);
+  const outside = await mkdtemp(join(tmpdir(), "awacode-write-outside-before-temp-"));
+  temporaryDirectories.push(outside);
+  await mkdir(join(setup.workspacePath, "parent"));
+  try {
+    const movedParent = join(outside, "moved-parent");
+    const result = await executeWriteFile({
+      callId: setup.callId,
+      store: setup.store,
+      permissionClient: { async requestPermission() { return "allow_once"; } },
+      context: { workspace: setup.workspace, signal: new AbortController().signal, now: () => 0 },
+      async barrier(event) {
+        if (event === "before_temp_create") {
+          await rename(join(setup.workspacePath, "parent"), movedParent);
+          await mkdir(join(setup.workspacePath, "parent"));
+          await writeFile(join(setup.workspacePath, "parent", "created.txt"), "racer", "utf8");
+        }
+      },
+    });
+    assert.equal(result.status, "failure");
+    assert.equal(result.metadata.error, "parent_changed");
+    assert.equal(await readFile(join(setup.workspacePath, "parent", "created.txt"), "utf8"), "racer");
+    await assertMissing(join(movedParent, "created.txt"));
+  } finally {
+    setup.connection.close();
+  }
+});
+
+test("write_file rejects a parent replacement immediately before publication", async () => {
+  const input = { path: "parent/created.txt", content: "approved" };
+  const setup = await fixture("parent-before-publish", input);
+  const outside = await mkdtemp(join(tmpdir(), "awacode-write-outside-before-publish-"));
+  temporaryDirectories.push(outside);
+  await mkdir(join(setup.workspacePath, "parent"));
+  try {
+    const movedParent = join(outside, "moved-parent");
+    const result = await executeWriteFile({
+      callId: setup.callId,
+      store: setup.store,
+      permissionClient: { async requestPermission() { return "allow_once"; } },
+      context: { workspace: setup.workspace, signal: new AbortController().signal, now: () => 0 },
+      createTemporaryName: () => "parent-swap",
+      async barrier(event) {
+        if (event === "before_publish") {
+          await rename(join(setup.workspacePath, "parent"), movedParent);
+          await mkdir(join(setup.workspacePath, "parent"));
+          await writeFile(join(setup.workspacePath, "parent", "created.txt"), "racer", "utf8");
+        }
+      },
+    });
+    assert.equal(result.status, "failure");
+    assert.equal(result.metadata.error, "parent_changed");
+    assert.equal(await readFile(join(setup.workspacePath, "parent", "created.txt"), "utf8"), "racer");
+    await assertMissing(join(movedParent, "created.txt"));
+  } finally {
+    setup.connection.close();
+  }
+});
+
+test("write_file exercises EEXIST at link publication and preserves the racing target", async () => {
+  const input = { path: "link-race.txt", content: "approved" };
+  const setup = await fixture("link-race", input);
+  try {
+    const result = await executeWriteFile({
+      callId: setup.callId,
+      store: setup.store,
+      permissionClient: { async requestPermission() { return "allow_once"; } },
+      context: { workspace: setup.workspace, signal: new AbortController().signal, now: () => 0 },
+      async barrier(event) {
+        if (event === "before_link") {
+          await writeFile(join(setup.workspacePath, "link-race.txt"), "race winner", "utf8");
+        }
+      },
+    });
+    assert.equal(result.status, "failure");
+    assert.equal(result.metadata.error, "target_exists");
+    assert.equal(await readFile(join(setup.workspacePath, "link-race.txt"), "utf8"), "race winner");
+  } finally {
+    setup.connection.close();
+  }
+});
+
+test("write_file post-publication validation never removes a replacement racer", async () => {
+  const input = { path: "post-publish-race.txt", content: "approved" };
+  const setup = await fixture("post-publish-race", input);
+  try {
+    const target = join(setup.workspacePath, "post-publish-race.txt");
+    const result = await executeWriteFile({
+      callId: setup.callId,
+      store: setup.store,
+      permissionClient: { async requestPermission() { return "allow_once"; } },
+      context: { workspace: setup.workspace, signal: new AbortController().signal, now: () => 0 },
+      async barrier(event) {
+        if (event === "after_publish") {
+          await unlink(target);
+          await writeFile(target, "replacement racer", "utf8");
+        }
+      },
+    });
+    assert.equal(result.status, "failure");
+    assert.equal(result.metadata.error, "published_file_changed");
+    assert.equal(await readFile(target, "utf8"), "replacement racer");
   } finally {
     setup.connection.close();
   }
