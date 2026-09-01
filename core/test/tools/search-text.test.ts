@@ -48,9 +48,16 @@ test("search_text validates its exact bounded input contract", () => {
     { query: "(a+)+$", is_regex: true },
     { query: "(a|aa)+$", is_regex: true },
     { query: "(.*)*", is_regex: true },
+    { query: "((a+))+$", is_regex: true },
+    { query: "(((a+)))+$", is_regex: true },
+    { query: "((a|aa))+$", is_regex: true },
+    { query: "(((a|aa)))+$", is_regex: true },
     { query: "x", is_regex: "yes" },
   ]) {
     assert.throws(() => searchTextTool.validate(invalid), ToolValidationError);
+  }
+  for (const safe of ["((literal))", "^((ab))+$", "^((foo)-(?:bar))$"]) {
+    assert.doesNotThrow(() => searchTextTool.validate({ query: safe, is_regex: true }));
   }
 });
 

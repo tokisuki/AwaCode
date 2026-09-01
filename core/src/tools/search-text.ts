@@ -80,6 +80,10 @@ function isSafeRegexPattern(pattern: string): boolean {
       const frame = frames.pop();
       const group = groupAtoms.pop();
       if (frame === undefined || group === undefined || frames.length === 0) return false;
+      const parent = frames.at(-1)!;
+      parent.hasAlternation ||= frame.hasAlternation;
+      parent.hasQuantifier ||= frame.hasQuantifier;
+      parent.unboundedQuantifiers += frame.unboundedQuantifiers;
       atom = { kind: "group", hasAlternation: frame.hasAlternation, hasQuantifier: frame.hasQuantifier };
       continue;
     }
