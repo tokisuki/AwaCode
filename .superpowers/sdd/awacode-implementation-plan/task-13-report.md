@@ -145,3 +145,10 @@ Outcome: exit `0`. The scripted provider served the deterministic eight-turn wor
 - JSON-RPC error responses now clear pending-method state, render a bounded diagnostic, restore running state, and update a live Settings dialog when applicable.
 - Settings fetch `config/status`, preserve stored credentials with `keep`, and display save/test result or Core-sanitized error.
 - A normal Core exit is clean only after requested stdin closure; otherwise MainWindow preserves content and enables manual restart.
+
+### Round 1 commits and final evidence
+
+- `34b12a7 fix(desktop): recover session and stream state`
+- `ef6e1ce test(desktop): exercise real core integration`
+
+After `ef6e1ce`, the fresh Qt command rebuilt `desktop/build-qt6-round1` and returned `0` for RpcCodec, process manager, MainWindow, models, and dialogs; the same command ran `real_core_integration.mjs` and returned `0`. The fresh bundled-Node Core verification then returned `0` for typecheck, build, and full dot-reporter test suite.
