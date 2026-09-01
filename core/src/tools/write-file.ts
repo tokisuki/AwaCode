@@ -50,9 +50,10 @@ export interface ExecuteWriteFileOptions {
 }
 
 export type WriteFileBarrierEvent = "before_temp_create" | "before_publish" | "before_link" | "after_publish";
+const WINDOWS_PUBLICATION_GUARD = "windows_retained_temp_handle" as const;
 
 class WriteFileError extends Error {
-  readonly code: "target_exists" | "parent_changed" | "temporary_file_changed" | "published_file_changed" | "atomic_publish_failed" | "interrupted";
+  readonly code: "target_exists" | "parent_changed" | "temporary_file_changed" | "published_file_changed" | "publication_lock_unavailable" | "unsupported_platform" | "atomic_publish_failed" | "interrupted";
   constructor(code: WriteFileError["code"]) {
     super("Workspace file could not be created.");
     this.name = "WriteFileError";
@@ -216,12 +217,53 @@ async function validatePublishedFile(path: string, identity: FileIdentity): Prom
   }
 }
 
+async function acquireWindowsPublicationLock(
+  prepared: PreparedWriteFile,
+  temporaryPath: string,
+  identity: FileIdentity,
+  context: ToolContext,
+  parentHandle: FileHandle,
+): Promise<FileHandle> {
+  if (process.platform !== "win32") {
+    throw new WriteFileError("unsupported_platform");
+  }
+  let handle: FileHandle | undefined;
+  try {
+    handle = await open(temporaryPath, "r");
+    await revalidateParent(prepared, context, parentHandle);
+    await validateTemporaryFile(prepared, temporaryPath, handle, identity, context);
+    return handle;
+  } catch (error) {
+    await handle?.close().catch(() => undefined);
+    if (error instanceof WriteFileError) throw error;
+    throw new WriteFileError("publication_lock_unavailable");
+  }
+}
+
+async function verifyWindowsPublicationLock(
+  prepared: PreparedWriteFile,
+  temporaryPath: string,
+  identity: FileIdentity,
+  context: ToolContext,
+  parentHandle: FileHandle,
+  lockHandle: FileHandle,
+): Promise<void> {
+  if (process.platform !== "win32") {
+    throw new WriteFileError("unsupported_platform");
+  }
+  await revalidateParent(prepared, context, parentHandle);
+  await validateTemporaryFile(prepared, temporaryPath, lockHandle, identity, context);
+}
+
 function preview(content: string): string {
   return truncateUtf8Output(content, PERMISSION_TEXT_PREVIEW_BYTES).text;
 }
 
 async function prepareWriteFile(input: WriteFileInput, context: ToolContext): Promise<PreparedWriteFile> {
   throwIfAborted(context.signal);
+  if (process.platform !== "win32") {
+    throw new WriteFileError("unsupported_platform");
+  }
   const resolved = await context.workspace.resolveNewFile(input.path);
   await context.accessBarrier?.({ kind: "file_resolved", path: resolved.relativePath });
   throwIfAborted(context.signal);
@@ -265,7 +307,7 @@ async function applyPreparedWrite(
   const temporaryPath = join(parentPath, `.awacode-write-${(options.createTemporaryName ?? randomUUID)()}.tmp`);
   let parentHandle: FileHandle | undefined;
   let handle: FileHandle | undefined;
-  let verifyHandle: FileHandle | undefined;
+  let publicationLock: FileHandle | undefined;
   let identity: FileIdentity | undefined;
   try {
     parentHandle = await open(parentPath, "r");
@@ -281,23 +323,32 @@ async function applyPreparedWrite(
     await handle.close();
     handle = undefined;
 
-    verifyHandle = await open(temporaryPath, "r");
-    await validateTemporaryFile(prepared, temporaryPath, verifyHandle, identity, context);
-    if (options.barrier !== undefined) {
-      // Windows may deny a directory rename while a child file handle is open. The
-      // injected race seam releases only the verification handle so tests can
-      // reproduce the pathname swap; production has no barrier and retains it.
-      await verifyHandle.close();
-      verifyHandle = undefined;
-      await options.barrier("before_publish");
-    }
-    await revalidateParent(prepared, context, parentHandle);
-    verifyHandle ??= await open(temporaryPath, "r");
-    await validateTemporaryFile(prepared, temporaryPath, verifyHandle, identity, context);
+    publicationLock = await acquireWindowsPublicationLock(
+      prepared,
+      temporaryPath,
+      identity,
+      context,
+      parentHandle,
+    );
+    await options.barrier?.("before_publish");
+    await verifyWindowsPublicationLock(
+      prepared,
+      temporaryPath,
+      identity,
+      context,
+      parentHandle,
+      publicationLock,
+    );
     throwIfAborted(context.signal);
     await options.barrier?.("before_link");
-    await revalidateParent(prepared, context, parentHandle);
-    await validateTemporaryFile(prepared, temporaryPath, verifyHandle, identity, context);
+    await verifyWindowsPublicationLock(
+      prepared,
+      temporaryPath,
+      identity,
+      context,
+      parentHandle,
+      publicationLock,
+    );
     throwIfAborted(context.signal);
     try {
       await link(temporaryPath, prepared.absolutePath);
@@ -309,7 +360,14 @@ async function applyPreparedWrite(
     }
     await options.barrier?.("after_publish");
     try {
-      await revalidateParent(prepared, context, parentHandle);
+      await verifyWindowsPublicationLock(
+        prepared,
+        temporaryPath,
+        identity,
+        context,
+        parentHandle,
+        publicationLock,
+      );
       await validatePublishedFile(prepared.absolutePath, identity);
     } catch (error) {
       await removeOwnedTemporary(prepared.absolutePath, identity);
@@ -320,7 +378,7 @@ async function applyPreparedWrite(
       identity = await ownedIdentity(handle).catch(() => undefined);
     }
     await handle?.close().catch(() => undefined);
-    await verifyHandle?.close().catch(() => undefined);
+    await publicationLock?.close().catch(() => undefined);
     await parentHandle?.close().catch(() => undefined);
     await removeOwnedTemporary(temporaryPath, identity);
   }
@@ -359,6 +417,10 @@ function failedWrite(error: unknown, phase: "preparation" | "execution") {
               ? "The prepared file changed before publication."
               : code === "published_file_changed"
                 ? "The published file changed before final validation."
+                : code === "publication_lock_unavailable"
+                  ? "The Windows publication lock could not be acquired."
+                  : code === "unsupported_platform"
+                    ? "Safe create-only publication is unavailable on this platform."
               : code === "atomic_publish_failed"
                 ? "Atomic file publication failed."
                 : error instanceof WorkspaceGuardError
@@ -402,7 +464,12 @@ export function executeWriteFile(options: ExecuteWriteFileOptions) {
           status: "success",
           summary: "Created a new workspace file.",
           content: `Created ${prepared.path}.`,
-          metadata: { path: prepared.path, bytes: prepared.bytes.length, sha256: prepared.digest },
+          metadata: {
+            path: prepared.path,
+            bytes: prepared.bytes.length,
+            sha256: prepared.digest,
+            publicationGuard: WINDOWS_PUBLICATION_GUARD,
+          },
         };
       },
     },

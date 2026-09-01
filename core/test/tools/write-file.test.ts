@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { access, mkdir, mkdtemp, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 
 import { openDatabase } from "../../src/persistence/database.ts";
 import { SessionStore } from "../../src/persistence/session-store.ts";
@@ -12,6 +14,7 @@ import type { PermissionRequest } from "../../src/tools/permission.ts";
 import { executeWriteFile, writeFileTool } from "../../src/tools/write-file.ts";
 
 const temporaryDirectories: string[] = [];
+const execFileAsync = promisify(execFile);
 
 async function fixture(label: string, input: unknown) {
   const dataRoot = await mkdtemp(join(tmpdir(), `awacode-write-data-${label}-`));
@@ -203,7 +206,7 @@ test("write_file rejects a parent replacement before temporary creation", async 
   }
 });
 
-test("write_file rejects a parent replacement immediately before publication", async () => {
+test("write_file retains its Windows verification lock immediately before publication", { skip: process.platform !== "win32" }, async () => {
   const input = { path: "parent/created.txt", content: "approved" };
   const setup = await fixture("parent-before-publish", input);
   const outside = await mkdtemp(join(tmpdir(), "awacode-write-outside-before-publish-"));
@@ -211,6 +214,7 @@ test("write_file rejects a parent replacement immediately before publication", a
   await mkdir(join(setup.workspacePath, "parent"));
   try {
     const movedParent = join(outside, "moved-parent");
+    let renameError: string | undefined;
     const result = await executeWriteFile({
       callId: setup.callId,
       store: setup.store,
@@ -219,16 +223,70 @@ test("write_file rejects a parent replacement immediately before publication", a
       createTemporaryName: () => "parent-swap",
       async barrier(event) {
         if (event === "before_publish") {
-          await rename(join(setup.workspacePath, "parent"), movedParent);
-          await mkdir(join(setup.workspacePath, "parent"));
-          await writeFile(join(setup.workspacePath, "parent", "created.txt"), "racer", "utf8");
+          try {
+            await rename(join(setup.workspacePath, "parent"), movedParent);
+          } catch (error) {
+            renameError = typeof error === "object" && error !== null && "code" in error
+              ? String(error.code)
+              : "unknown";
+          }
         }
       },
     });
-    assert.equal(result.status, "failure");
-    assert.equal(result.metadata.error, "parent_changed");
-    assert.equal(await readFile(join(setup.workspacePath, "parent", "created.txt"), "utf8"), "racer");
-    await assertMissing(join(movedParent, "created.txt"));
+    assert.equal(renameError, "EPERM");
+    assert.equal(result.status, "success");
+    assert.equal(result.metadata.publicationGuard, "windows_retained_temp_handle");
+    assert.equal(await readFile(join(setup.workspacePath, "parent", "created.txt"), "utf8"), "approved");
+    await assertMissing(movedParent);
+  } finally {
+    setup.connection.close();
+  }
+});
+
+test("write_file retained handle denies a real child parent/junction swap at the final pre-link boundary", { skip: process.platform !== "win32" }, async () => {
+  const input = { path: "parent/created.txt", content: "approved" };
+  const setup = await fixture("child-publication-lock", input);
+  const outside = await mkdtemp(join(tmpdir(), "awacode-write-child-lock-outside-"));
+  temporaryDirectories.push(outside);
+  await mkdir(join(setup.workspacePath, "parent"));
+  try {
+    const parent = join(setup.workspacePath, "parent");
+    const movedParent = join(outside, "moved-parent");
+    let childAttempt: { renamed: boolean; renameCode?: string; junctionCreated: boolean } | undefined;
+    const result = await executeWriteFile({
+      callId: setup.callId,
+      store: setup.store,
+      permissionClient: { async requestPermission() { return "allow_once"; } },
+      context: { workspace: setup.workspace, signal: new AbortController().signal, now: () => 0 },
+      createTemporaryName: () => "child-lock",
+      async barrier(event) {
+        if (event !== "before_link") return;
+        const script = [
+          "const { rename, symlink } = require('node:fs/promises');",
+          "(async () => {",
+          "  const result = { renamed: false, junctionCreated: false };",
+          "  try {",
+          "    await rename(process.argv[1], process.argv[2]);",
+          "    result.renamed = true;",
+          "    await symlink(process.argv[3], process.argv[1], 'junction');",
+          "    result.junctionCreated = true;",
+          "  } catch (error) { result.renameCode = error && error.code ? String(error.code) : 'unknown'; }",
+          "  process.stdout.write(JSON.stringify(result));",
+          "})().catch((error) => { process.stderr.write(String(error)); process.exitCode = 1; });",
+        ].join("\n");
+        const child = await execFileAsync(process.execPath, ["-e", script, parent, movedParent, outside], {
+          timeout: 5_000,
+          windowsHide: true,
+        });
+        childAttempt = JSON.parse(child.stdout) as typeof childAttempt;
+      },
+    });
+
+    assert.deepEqual(childAttempt, { renamed: false, junctionCreated: false, renameCode: "EPERM" });
+    assert.equal(result.status, "success");
+    assert.equal(result.metadata.publicationGuard, "windows_retained_temp_handle");
+    assert.equal(await readFile(join(parent, "created.txt"), "utf8"), "approved");
+    await assertMissing(movedParent);
   } finally {
     setup.connection.close();
   }
