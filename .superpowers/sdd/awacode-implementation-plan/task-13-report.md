@@ -210,3 +210,8 @@ $env:AWACODE_REAL_CORE_PROBE = (Resolve-Path .\desktop\build-qt6-round2\awacode-
 ### Concerns
 
 The pre-existing Windows CTest DLL-environment limitation remains: direct Qt executable runs with the documented Qt/MinGW runtime PATH are the recorded green evidence. No real credential was used.
+
+### Round 2 commits
+
+- `d4c7035 fix(desktop): preserve async settings and transcript order`
+- `cf902fb docs: record desktop review round two`
