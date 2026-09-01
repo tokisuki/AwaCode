@@ -51,4 +51,8 @@ Qt 的裸 `ctest` 初次运行没有继承 Qt/MinGW runtime DLL 查找环境而�
 
 ## 提交
 
-本报告与 README、部署/演示文档、demo fixture 一并作为 Task 15 文档验收提交；未修改 Core 或 Qt 生产逻辑。
+| 提交 | 内容 |
+| --- | --- |
+| `09536be docs: finalize submission materials` | README、README.txt、部署/演示指南、确定性 demo fixture/reset 测试、设计状态对账和本报告初版；未修改 Core 或 Qt 生产逻辑。 |
+
+本报告的提交证据补充作为独立的后续文档提交，未 amend、rebase 或 push 历史。
