@@ -26,6 +26,7 @@ import { readFileTool } from "../tools/read-file.ts";
 import { ToolRegistry } from "../tools/registry.ts";
 import { runCommandTool } from "../tools/run-command.ts";
 import { searchTextTool } from "../tools/search-text.ts";
+import { writeFileTool } from "../tools/write-file.ts";
 
 export type ModelProviderFactory = (config: EffectiveModelConfig) => ModelProvider;
 
@@ -78,6 +79,7 @@ class PerSessionAgent implements AgentControl {
       tools.register(editFileTool);
       tools.register(runCommandTool);
       tools.register(searchTextTool);
+      tools.register(writeFileTool);
       const orchestrator = new AgentOrchestrator({
         store: this.store,
         provider: this.providerFactory(config),

@@ -131,6 +131,23 @@ export class WorkspaceGuard {
     return this.resolveExisting(path, "directory");
   }
 
+  async resolveNewFile(path: string): Promise<ResolvedWorkspacePath> {
+    const safeRelativePath = validatedRelativePath(path);
+    const components = safeRelativePath.split("/").filter((component) => component !== ".");
+    const fileName = components.at(-1);
+    if (fileName === undefined || fileName.length === 0) {
+      throw new WorkspaceGuardError("invalid_path");
+    }
+    const parentRequest = components.length === 1 ? "." : components.slice(0, -1).join("/");
+    const parent = await this.resolveDirectory(parentRequest);
+    const absolutePath = join(parent.absolutePath, fileName);
+    if (!isPathWithinWorkspace(this.rootPath, absolutePath)) {
+      throw new WorkspaceGuardError("outside_workspace");
+    }
+    const relativePath = relative(this.rootPath, absolutePath).split(sep).join("/");
+    return { absolutePath, relativePath };
+  }
+
   async resolveListingDirectory(path: string): Promise<ResolvedWorkspacePath> {
     const safeRelativePath = validatedRelativePath(path);
     let currentPath = this.rootPath;
