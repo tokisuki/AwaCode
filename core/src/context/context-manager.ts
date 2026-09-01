@@ -167,6 +167,15 @@ function memoryFromSnapshot(value: unknown): MemoryTexts | undefined {
   return { global: memory.global, project: memory.project };
 }
 
+function systemContextUpdate(entry: ProviderHistoryEntry): { systemText: string; sha256: string } | null {
+  if (entry.type !== "message" || entry.role !== "system" || entry.kind !== "system_context_update"
+    || typeof entry.payload !== "object" || entry.payload === null) return null;
+  const payload = entry.payload as { systemText?: unknown; sha256?: unknown };
+  return typeof payload.systemText === "string" && typeof payload.sha256 === "string"
+    ? { systemText: payload.systemText, sha256: payload.sha256 }
+    : null;
+}
+
 export class ContextManager {
   private readonly store: SessionStore;
   private readonly sourceSnapshotHooks: readonly ContextSourceSnapshotHook[];
@@ -189,22 +198,14 @@ export class ContextManager {
     const existing = this.store.loadContextSnapshot(input.sessionId);
     const cutoff = existing?.summary === null || existing?.summary === undefined ? 0 : existing.summaryUptoSeq;
     const protectedIds = new Set([input.currentUserMessageId, ...(input.protectedMessageIds ?? [])]);
-    const candidates = input.history
+    const effectiveHistory = this.withStoredSystemUpdates(input);
+    const candidates = effectiveHistory
       .filter((entry) => entry.seq > cutoff && !protectedIds.has(entry.messageId))
       .map(entryBlock);
     if (candidates.length === 0) {
       return false;
     }
-    const systemContextSha256 = createHash("sha256").update(input.systemText).digest("hex");
-    const existingSource = typeof existing?.sourceSnapshot === "object" && existing.sourceSnapshot !== null
-      ? existing.sourceSnapshot as Record<string, unknown>
-      : {};
-    const previousSystem = typeof existingSource.systemContext === "object" && existingSource.systemContext !== null
-      ? existingSource.systemContext as { sha256?: unknown }
-      : undefined;
-    const baseline = existing === null || previousSystem?.sha256 !== systemContextSha256
-      ? input.systemText
-      : existing.baseline;
+    const baseline = existing?.baseline ?? input.systemText;
     const sourceSnapshot = existing?.sourceSnapshot ?? {};
     await this.compressBlocks(input, existing?.summary ?? null, baseline, sourceSnapshot, candidates);
     return true;
@@ -221,25 +222,10 @@ export class ContextManager {
     const previousSystem = typeof existingSource.systemContext === "object" && existingSource.systemContext !== null
       ? existingSource.systemContext as { sha256?: unknown }
       : undefined;
-    const baseline = existing === null || previousSystem?.sha256 !== systemContextSha256
-      ? input.systemText
-      : existing.baseline;
+    const baseline = existing?.baseline ?? input.systemText;
     const effectiveMemory = input.memory === null
       ? memoryFromSnapshot(existing?.sourceSnapshot)
       : input.memory;
-    const prefix: ModelMessage[] = [{ role: "system", content: baseline }];
-    if (effectiveMemory?.global.length) {
-      prefix.push({ role: "system", content: `Global memory:\n${effectiveMemory.global}` });
-    }
-    if (effectiveMemory?.project.length) {
-      prefix.push({ role: "system", content: `Project memory (takes priority over global memory):\n${effectiveMemory.project}` });
-    }
-    if (existing?.summary !== null && existing?.summary !== undefined && existing.summary.length > 0) {
-      prefix.push({ role: "system", content: `Conversation summary:\n${existing.summary}` });
-    }
-    const suffix: ModelMessage[] = input.transientSystemText === undefined
-      ? []
-      : [{ role: "system", content: input.transientSystemText }];
     const sourceSnapshot: Record<string, unknown> = {};
     for (const hook of this.sourceSnapshotHooks) {
       try {
@@ -270,20 +256,55 @@ export class ContextManager {
       ...(typeof contentSource === "object" && contentSource !== null ? contentSource as Record<string, unknown> : {}),
       systemContext: { sha256: systemContextSha256 },
     };
-    this.store.saveContextSnapshot({
+    const snapshotInput = {
       sessionId: input.sessionId,
       baseline,
       sourceSnapshot: persistedSource,
       baselineSeq: existing?.baselineSeq ?? 0,
       summary: existing?.summary ?? null,
       summaryUptoSeq: existing?.summaryUptoSeq ?? 0,
-    });
+    };
+    const systemContextChanged = existing !== null && (previousSystem?.sha256 === undefined
+      ? input.systemText !== existing.baseline
+      : previousSystem.sha256 !== systemContextSha256);
+    if (systemContextChanged) {
+      this.store.appendSystemContextUpdate({ ...snapshotInput, systemText: input.systemText, sha256: systemContextSha256 });
+    } else {
+      this.store.saveContextSnapshot(snapshotInput);
+    }
+
+    const effectiveHistory = this.withStoredSystemUpdates(input);
+    const pendingSystemUpdates = effectiveHistory
+      .filter((entry) => entry.seq > (existing?.baselineSeq ?? 0))
+      .flatMap((entry) => {
+        const update = systemContextUpdate(entry);
+        return update === null ? [] : [update];
+      });
+    const prefix: ModelMessage[] = [
+      { role: "system", content: baseline },
+      ...pendingSystemUpdates.map((update): ModelMessage => ({
+        role: "system", content: `System context update:\n${update.systemText}`,
+      })),
+    ];
+    if (effectiveMemory?.global.length) {
+      prefix.push({ role: "system", content: `Global memory:\n${effectiveMemory.global}` });
+    }
+    if (effectiveMemory?.project.length) {
+      prefix.push({ role: "system", content: `Project memory (takes priority over global memory):\n${effectiveMemory.project}` });
+    }
+    if (existing?.summary !== null && existing?.summary !== undefined && existing.summary.length > 0) {
+      prefix.push({ role: "system", content: `Conversation summary:\n${existing.summary}` });
+    }
+    const suffix: ModelMessage[] = input.transientSystemText === undefined
+      ? []
+      : [{ role: "system", content: input.transientSystemText }];
 
     const summaryCutoff = existing?.summary === null || existing?.summary === undefined
       ? 0
       : existing.summaryUptoSeq;
     const protectedIds = new Set([input.currentUserMessageId, ...(input.protectedMessageIds ?? [])]);
-    const blocks = input.history
+    const blocks = effectiveHistory
+      .filter((entry) => systemContextUpdate(entry) === null)
       .filter((entry) => entry.seq > summaryCutoff || protectedIds.has(entry.messageId))
       .map(entryBlock);
     const requiredIndices = blocks.flatMap((block, index) => protectedIds.has(block.messageId) ? [index] : []);
@@ -313,12 +334,16 @@ export class ContextManager {
     const selectedBlocks = blocks.filter((_, index) => selected.has(index));
     const evictedBlocks = blocks.filter((block, index) => !selected.has(index) && !protectedIds.has(block.messageId));
     if (allowCompression && evictedBlocks.length > 0 && this.summaryGenerator !== undefined) {
+      const maxEvictedSeq = Math.max(...evictedBlocks.map((block) => block.seq));
+      const systemUpdateBlocks = effectiveHistory
+        .filter((entry) => entry.seq > summaryCutoff && entry.seq <= maxEvictedSeq && systemContextUpdate(entry) !== null)
+        .map(entryBlock);
       await this.compressBlocks(
         input,
         existing?.summary ?? null,
         baseline,
         persistedSource,
-        evictedBlocks,
+        [...evictedBlocks, ...systemUpdateBlocks].sort((left, right) => left.seq - right.seq),
       );
       return this.buildInternal(input, false);
     }
@@ -330,6 +355,23 @@ export class ContextManager {
       estimatedTokens: fixedTokens(messages, input.tools),
       sourceSnapshot: persistedSource as Readonly<Record<string, unknown>>,
     };
+  }
+
+  private withStoredSystemUpdates(input: BuildContextInput): ProviderHistoryEntry[] {
+    const history = new Map(input.history.map((entry) => [entry.messageId, entry]));
+    for (const message of this.store.loadSession(input.sessionId).messages) {
+      if (message.status !== "complete" || message.role !== "system" || message.kind !== "system_context_update"
+        || history.has(message.id)) continue;
+      history.set(message.id, {
+        type: "message",
+        messageId: message.id,
+        seq: message.seq,
+        role: "system",
+        kind: message.kind,
+        payload: message.payload,
+      });
+    }
+    return [...history.values()].sort((left, right) => left.seq - right.seq);
   }
 
   private async compressBlocks(
@@ -375,11 +417,23 @@ export class ContextManager {
         summaryUptoSeq = Math.max(...blocks.slice(nextBlock, batchEnd).map((block) => block.seq));
         nextBlock = batchEnd;
       }
+      const storedUpdates = this.store.loadSession(input.sessionId).messages
+        .filter((message) => message.status === "complete" && message.role === "system"
+          && message.kind === "system_context_update" && message.seq <= summaryUptoSeq)
+        .flatMap((message) => {
+          const entry: ProviderHistoryEntry = {
+            type: "message", messageId: message.id, seq: message.seq, role: "system",
+            kind: message.kind, payload: message.payload,
+          };
+          const update = systemContextUpdate(entry);
+          return update === null ? [] : [{ seq: message.seq, ...update }];
+        });
+      const promoted = storedUpdates.at(-1);
       this.store.saveContextSnapshot({
         sessionId: input.sessionId,
-        baseline,
+        baseline: promoted?.systemText ?? baseline,
         sourceSnapshot,
-        baselineSeq: summaryUptoSeq,
+        baselineSeq: promoted?.seq ?? this.store.loadContextSnapshot(input.sessionId)?.baselineSeq ?? 0,
         summary: replacementSummary,
         summaryUptoSeq,
       });

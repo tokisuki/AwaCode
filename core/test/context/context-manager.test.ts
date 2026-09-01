@@ -111,13 +111,17 @@ test("context selection keeps newest whole tool blocks and the current user mess
   }
 });
 
-test("context snapshots refresh a changed system baseline and persist its source hash across restart", async () => {
+test("system context changes persist as events until compression promotes their baseline", async () => {
   const { connection, store, session } = await fixture("snapshot");
   try {
+    for (let seq = 1; seq <= 4; seq += 1) {
+      store.insertMessage({ sessionId: session.id, role: "user", kind: "text", payload: { text: `covered ${seq}` } });
+    }
+    const current = store.insertMessage({ sessionId: session.id, role: "user", kind: "text", payload: { text: "next" } });
     store.saveContextSnapshot({
       sessionId: session.id,
       baseline: "persisted baseline",
-      sourceSnapshot: { project: "old" },
+      sourceSnapshot: { project: "old", systemContext: { sha256: "old-hash" } },
       baselineSeq: 1,
       summary: "earlier work",
       summaryUptoSeq: 4,
@@ -125,51 +129,64 @@ test("context snapshots refresh a changed system baseline and persist its source
     const manager = new ContextManager(store, {
       sourceSnapshotHooks: [{ name: "project", read: () => ({ revision: 2 }) }],
     });
-    const history: ProviderHistoryEntry[] = [{
-      type: "message",
-      messageId: "current",
-      seq: 5,
-      role: "user",
-      kind: "text",
-      payload: { text: "next" },
-    }];
+    const history = validateProviderHistory(store, session.id);
 
     const built = await manager.build({
       sessionId: session.id,
       history,
-      currentUserMessageId: "current",
+      currentUserMessageId: current.id,
       systemText: "current workspace and runtime",
       tools: [],
       contextLimit: 8_000,
       maxOutputTokens: 1_000,
     });
 
-    assert.deepEqual(built.messages.slice(0, 2), [
-      { role: "system", content: "current workspace and runtime" },
+    assert.deepEqual(built.messages.slice(0, 3), [
+      { role: "system", content: "persisted baseline" },
+      { role: "system", content: "System context update:\ncurrent workspace and runtime" },
       { role: "system", content: "Conversation summary:\nearlier work" },
     ]);
-    assert.deepEqual(store.loadContextSnapshot(session.id), {
-      sessionId: session.id,
-      baseline: "current workspace and runtime",
-      sourceSnapshot: {
-        project: { revision: 2 },
-        systemContext: {
-          sha256: "dbbb2daa9ae4fe6dbbd1aa51c6c93db833ac3c058de5322febee5d13c85bfa1b",
-        },
-      },
-      baselineSeq: 1,
-      summary: "earlier work",
-      summaryUptoSeq: 4,
-      updatedAt: "2026-09-01T00:00:00.000Z",
-    });
+    const beforeCompression = store.loadContextSnapshot(session.id)!;
+    assert.equal(beforeCompression.baseline, "persisted baseline");
+    assert.equal(beforeCompression.baselineSeq, 1);
+    const updates = store.loadSession(session.id).messages.filter((message) => message.kind === "system_context_update");
+    assert.equal(updates.length, 1);
+    assert.equal(updates[0]!.seq, 6);
     const restarted = new ContextManager(store, {
       sourceSnapshotHooks: [{ name: "project", read: () => { throw new Error("offline"); } }],
     });
     const rebuilt = await restarted.build({
-      sessionId: session.id, history, currentUserMessageId: "current",
+      sessionId: session.id, history: validateProviderHistory(store, session.id), currentUserMessageId: current.id,
       systemText: "current workspace and runtime", tools: [], contextLimit: 8_000, maxOutputTokens: 1_000,
     });
-    assert.equal(rebuilt.messages[0]?.content, "current workspace and runtime");
+    assert.deepEqual(rebuilt.messages.slice(0, 2), built.messages.slice(0, 2));
+    assert.equal(store.loadSession(session.id).messages.filter((message) => message.kind === "system_context_update").length, 1);
+
+    store.insertMessage({ sessionId: session.id, role: "assistant", kind: "text", payload: { text: "x".repeat(9_000) } });
+    const latest = store.insertMessage({ sessionId: session.id, role: "user", kind: "text", payload: { text: "continue" } });
+    const compacting = new ContextManager(store, { summaryGenerator: async () => "compressed history" });
+    const compacted = await compacting.build({
+      sessionId: session.id,
+      history: validateProviderHistory(store, session.id),
+      currentUserMessageId: latest.id,
+      systemText: "current workspace and runtime",
+      tools: [],
+      contextLimit: 8_000,
+      maxOutputTokens: 1_000,
+    });
+    const promoted = store.loadContextSnapshot(session.id)!;
+    assert.equal(promoted.baseline, "current workspace and runtime");
+    assert.equal(promoted.baselineSeq, updates[0]!.seq);
+    assert.equal(compacted.messages[0]?.content, "current workspace and runtime");
+    assert.equal(compacted.messages.some((message) => message.content?.startsWith("System context update:") === true), false);
+    const afterRestart = await new ContextManager(store).build({
+      sessionId: session.id,
+      history: validateProviderHistory(store, session.id),
+      currentUserMessageId: latest.id,
+      systemText: "current workspace and runtime",
+      tools: [], contextLimit: 8_000, maxOutputTokens: 1_000,
+    });
+    assert.deepEqual(afterRestart.messages, compacted.messages);
   } finally {
     connection.close();
   }

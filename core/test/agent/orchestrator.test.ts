@@ -428,7 +428,7 @@ test("Reflect overflow protects the pending candidate from summaries before reje
         ...(request.tools === undefined ? {} : { tools: structuredClone(request.tools) }),
       });
       const last = request.messages.at(-1)?.content ?? "";
-      if (request.messages[0]?.content.includes("structured rolling summary")) {
+      if (request.messages[0]?.content?.includes("structured rolling summary")) {
         assert.equal(JSON.stringify(request.messages).includes("pending candidate secret"), false);
         return response("summary of old context only");
       }
@@ -457,7 +457,7 @@ test("Reflect overflow protects the pending candidate from summaries before reje
   try {
     const result = await orchestrator.run({ sessionId: f.sessionId, prompt: "Fix it" });
     assert.equal(result.finalText, "fixed candidate");
-    const summaryRequest = requests.find((request) => request.messages[0]?.content.includes("structured rolling summary"));
+    const summaryRequest = requests.find((request) => request.messages[0]?.content?.includes("structured rolling summary"));
     assert.ok(summaryRequest);
     const remedialRequest = requests.at(-1)!;
     assert.equal(JSON.stringify(remedialRequest.messages).includes("pending candidate secret"), false);

@@ -89,6 +89,11 @@ export interface SaveContextSnapshotInput {
   summaryUptoSeq: number;
 }
 
+export interface AppendSystemContextUpdateInput extends SaveContextSnapshotInput {
+  systemText: string;
+  sha256: string;
+}
+
 export interface InsertMessageInput {
   sessionId: string;
   role: MessageRole;
@@ -639,6 +644,48 @@ export class SessionStore {
       );
       this.db.exec("COMMIT");
       return this.loadContextSnapshot(input.sessionId) as ContextSnapshotRecord;
+    } catch (error) {
+      this.rollback();
+      throw error;
+    }
+  }
+
+  appendSystemContextUpdate(input: AppendSystemContextUpdateInput): MessageRecord {
+    if (!Number.isSafeInteger(input.baselineSeq) || input.baselineSeq < 0
+      || !Number.isSafeInteger(input.summaryUptoSeq) || input.summaryUptoSeq < 0) {
+      throw new RangeError("context snapshot sequence values must be nonnegative safe integers");
+    }
+    const id = this.createId();
+    const now = this.currentDate().toISOString();
+    const payloadJson = stringifyJson({ systemText: input.systemText, sha256: input.sha256 });
+    const sourceSnapshotJson = stringifyJson(input.sourceSnapshot);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.requireSession(input.sessionId);
+      const next = this.db.prepare(`
+        SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM messages WHERE session_id = ?
+      `).get(input.sessionId) as { seq: number };
+      this.db.prepare(`
+        INSERT INTO messages
+          (id, session_id, seq, role, kind, payload_json, status, created_at, updated_at)
+        VALUES (?, ?, ?, 'system', 'system_context_update', ?, 'complete', ?, ?)
+      `).run(id, input.sessionId, next.seq, payloadJson, now, now);
+      this.db.prepare(`
+        INSERT INTO context_snapshots
+          (session_id, baseline, source_snapshot_json, baseline_seq, summary, summary_upto_seq, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(session_id) DO UPDATE SET
+          baseline = excluded.baseline,
+          source_snapshot_json = excluded.source_snapshot_json,
+          baseline_seq = excluded.baseline_seq,
+          summary = excluded.summary,
+          summary_upto_seq = excluded.summary_upto_seq,
+          updated_at = excluded.updated_at
+      `).run(input.sessionId, input.baseline, sourceSnapshotJson, input.baselineSeq,
+        input.summary, input.summaryUptoSeq, now);
+      this.db.prepare("UPDATE sessions SET updated_at = ? WHERE id = ?").run(now, input.sessionId);
+      this.db.exec("COMMIT");
+      return this.getMessage(id);
     } catch (error) {
       this.rollback();
       throw error;
