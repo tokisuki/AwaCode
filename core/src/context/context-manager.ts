@@ -49,6 +49,7 @@ export interface BuildContextInput {
   readonly sessionId: string;
   readonly history: readonly ProviderHistoryEntry[];
   readonly currentUserMessageId: string;
+  readonly protectedMessageIds?: readonly string[];
   readonly systemText: string;
   readonly transientSystemText?: string;
   readonly tools: readonly FunctionToolDefinition[];
@@ -187,8 +188,9 @@ export class ContextManager {
     }
     const existing = this.store.loadContextSnapshot(input.sessionId);
     const cutoff = existing?.summary === null || existing?.summary === undefined ? 0 : existing.summaryUptoSeq;
+    const protectedIds = new Set([input.currentUserMessageId, ...(input.protectedMessageIds ?? [])]);
     const candidates = input.history
-      .filter((entry) => entry.seq > cutoff && entry.messageId !== input.currentUserMessageId)
+      .filter((entry) => entry.seq > cutoff && !protectedIds.has(entry.messageId))
       .map(entryBlock);
     if (candidates.length === 0) {
       return false;
@@ -280,21 +282,22 @@ export class ContextManager {
     const summaryCutoff = existing?.summary === null || existing?.summary === undefined
       ? 0
       : existing.summaryUptoSeq;
+    const protectedIds = new Set([input.currentUserMessageId, ...(input.protectedMessageIds ?? [])]);
     const blocks = input.history
-      .filter((entry) => entry.seq > summaryCutoff || entry.messageId === input.currentUserMessageId)
+      .filter((entry) => entry.seq > summaryCutoff || protectedIds.has(entry.messageId))
       .map(entryBlock);
-    const requiredIndex = blocks.findIndex((block) => block.messageId === input.currentUserMessageId);
-    if (requiredIndex === -1) {
+    const requiredIndices = blocks.flatMap((block, index) => protectedIds.has(block.messageId) ? [index] : []);
+    if (requiredIndices.length !== protectedIds.size) {
       throw new ContextBudgetError();
     }
     const availableForRecent = Math.min(recentBudget, usable - fixedTokens([...prefix, ...suffix], input.tools));
-    const required = blocks[requiredIndex]!;
-    if (availableForRecent < 0 || required.tokens > availableForRecent) {
+    const requiredTokens = requiredIndices.reduce((total, index) => total + blocks[index]!.tokens, 0);
+    if (availableForRecent < 0 || requiredTokens > availableForRecent) {
       throw new ContextBudgetError();
     }
 
-    const selected = new Set<number>([requiredIndex]);
-    let used = required.tokens;
+    const selected = new Set<number>(requiredIndices);
+    let used = requiredTokens;
     for (let index = blocks.length - 1; index >= 0; index -= 1) {
       if (selected.has(index)) {
         continue;
@@ -308,7 +311,7 @@ export class ContextManager {
       }
     }
     const selectedBlocks = blocks.filter((_, index) => selected.has(index));
-    const evictedBlocks = blocks.filter((block, index) => !selected.has(index) && block.messageId !== input.currentUserMessageId);
+    const evictedBlocks = blocks.filter((block, index) => !selected.has(index) && !protectedIds.has(block.messageId));
     if (allowCompression && evictedBlocks.length > 0 && this.summaryGenerator !== undefined) {
       await this.compressBlocks(
         input,

@@ -295,7 +295,7 @@ export class AgentOrchestrator {
       }
 
       await this.phase("reflect");
-      const reflected = await this.providerTurn(input.sessionId, user.id, "reflect", [], REFLECT_PROMPT, false);
+      const reflected = await this.providerTurn(input.sessionId, user.id, "reflect", [], REFLECT_PROMPT, false, [user.id, candidate.message.id]);
       if (reflected.response.toolCalls.length > 0) {
         await this.persistRejectedToolCalls(reflected, input.sessionId, "Tools are not allowed during Reflect.");
         throw new AgentRunError("Reflect returned unexpected tool calls.");
@@ -315,6 +315,7 @@ export class AgentOrchestrator {
           [],
           REFLECT_CORRECTION_PROMPT,
           false,
+          [user.id, candidate.message.id],
         );
         if (corrected.response.toolCalls.length > 0) {
           await this.persistRejectedToolCalls(corrected, input.sessionId, "Tools are not allowed during Reflect.");
@@ -575,6 +576,7 @@ export class AgentOrchestrator {
     tools: readonly FunctionToolDefinition[],
     instruction: string,
     provisional: boolean,
+    protectedMessageIds: readonly string[] = [currentUserMessageId],
   ): Promise<StreamedTurn> {
     const history = validateProviderHistory(this.options.store, sessionId);
     let memory;
@@ -589,6 +591,7 @@ export class AgentOrchestrator {
       sessionId,
       history,
       currentUserMessageId,
+      protectedMessageIds,
       systemText: this.options.systemPrompt ?? DEFAULT_SYSTEM_PROMPT,
       transientSystemText: instruction,
       tools,

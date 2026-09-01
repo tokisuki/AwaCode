@@ -8,12 +8,13 @@ import {
   ContextBudgetError,
   ContextCompressionError,
   ContextManager,
+  type BuildContextInput,
   estimateTextTokens,
   recentContextBudget,
 } from "../../src/context/context-manager.ts";
 import { openDatabase } from "../../src/persistence/database.ts";
 import { SessionStore } from "../../src/persistence/session-store.ts";
-import type { ProviderHistoryEntry } from "../../src/session/history.ts";
+import { validateProviderHistory, type ProviderHistoryEntry } from "../../src/session/history.ts";
 
 const temporaryDirectories: string[] = [];
 
@@ -282,6 +283,34 @@ test("transient phase instructions count against the same context budget as base
   } finally {
     connection.close();
   }
+});
+
+test("multiple protected messages stay out of rolling summaries and remain visible together", async () => {
+  const { connection, store, session } = await fixture("protected-candidate");
+  try {
+    const candidate = store.insertMessage({ sessionId: session.id, role: "assistant", kind: "text", payload: { text: "candidate must be rejected later" } });
+    store.insertMessage({ sessionId: session.id, role: "assistant", kind: "text", payload: { text: "x".repeat(9_000) } });
+    const current = store.insertMessage({ sessionId: session.id, role: "user", kind: "text", payload: { text: "review candidate" } });
+    const history = validateProviderHistory(store, session.id);
+    const summarized: string[] = [];
+    const manager = new ContextManager(store, { summaryGenerator: async ({ messages }) => {
+      summarized.push(JSON.stringify(messages));
+      return "compressed filler";
+    } });
+    const built = await manager.build({
+      sessionId: session.id,
+      history,
+      currentUserMessageId: current.id,
+      protectedMessageIds: [current.id, candidate.id],
+      systemText: "system",
+      tools: [],
+      contextLimit: 8_000,
+      maxOutputTokens: 1_000,
+    } as BuildContextInput & { protectedMessageIds: readonly string[] });
+    assert.equal(built.selectedMessageIds.includes(candidate.id), true);
+    assert.equal(built.selectedMessageIds.includes(current.id), true);
+    assert.equal(summarized.some((text) => text.includes("candidate must be rejected later")), false);
+  } finally { connection.close(); }
 });
 
 test("global memory precedes project memory so project instructions have priority", async () => {

@@ -410,6 +410,63 @@ test("malformed Reflect retries once and continue permits one remedial Execute w
   }
 });
 
+test("Reflect overflow protects the pending candidate from summaries before rejecting it", async () => {
+  const f = await fixture("reflect-overflow-protection");
+  f.store.insertMessage({
+    sessionId: f.sessionId,
+    role: "assistant",
+    kind: "text",
+    payload: { text: "old context that may be summarized" },
+  });
+  const requests: ModelStreamRequest[] = [];
+  let ordinaryCall = 0;
+  let reflectOverflowed = false;
+  const provider: ModelProvider = {
+    async stream(request) {
+      requests.push({
+        messages: structuredClone(request.messages),
+        ...(request.tools === undefined ? {} : { tools: structuredClone(request.tools) }),
+      });
+      const last = request.messages.at(-1)?.content ?? "";
+      if (request.messages[0]?.content.includes("structured rolling summary")) {
+        assert.equal(JSON.stringify(request.messages).includes("pending candidate secret"), false);
+        return response("summary of old context only");
+      }
+      if (last.includes("Review the candidate") && !reflectOverflowed) {
+        reflectOverflowed = true;
+        throw new ModelContextOverflowError();
+      }
+      ordinaryCall += 1;
+      return [
+        response("Plan."),
+        response("pending candidate secret"),
+        response('{"status":"continue","reason":"tests fail"}'),
+        response("fixed candidate"),
+      ][ordinaryCall - 1]!;
+    },
+  };
+  const orchestrator = new AgentOrchestrator({
+    store: f.store,
+    provider,
+    tools: new ToolRegistry(),
+    permissionClient: allowPermission,
+    workspace: f.workspace,
+    contextLimit: 32_768,
+    maxOutputTokens: 4_096,
+  });
+  try {
+    const result = await orchestrator.run({ sessionId: f.sessionId, prompt: "Fix it" });
+    assert.equal(result.finalText, "fixed candidate");
+    const summaryRequest = requests.find((request) => request.messages[0]?.content.includes("structured rolling summary"));
+    assert.ok(summaryRequest);
+    const remedialRequest = requests.at(-1)!;
+    assert.equal(JSON.stringify(remedialRequest.messages).includes("pending candidate secret"), false);
+    assert.equal(f.store.loadContextSnapshot(f.sessionId)?.summary?.includes("pending candidate secret"), false);
+  } finally {
+    f.connection.close();
+  }
+});
+
 test("Reflect continue after the twelfth Execute request closes without a thirteenth remedial Execute", async () => {
   const f = await fixture("remedial-turn-bound");
   const registry = new ToolRegistry();
