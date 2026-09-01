@@ -35,6 +35,8 @@ void MainWindowTest::keepsStreamBeforeLaterTranscriptEventsAndClearsCommittedSta
   window.receiveNotification("agent/phase", QJsonObject{{"phase", "reflect"}});
   QVERIFY(window.transcriptText().indexOf(QStringLiteral("first answer")) < window.transcriptText().indexOf(QStringLiteral("[reflect]")));
   window.receiveNotification("stream/commit", QJsonObject{{"messageId", "first"}});
+  QVERIFY(!window.transcriptText().contains(QStringLiteral("[provisional] first answer")));
+  QVERIFY(window.transcriptText().indexOf(QStringLiteral("first answer")) < window.transcriptText().indexOf(QStringLiteral("[reflect]")));
   window.setConfigured(true);
   auto *taskInput = window.findChild<QPlainTextEdit *>(QStringLiteral("taskInput"));
   QVERIFY(taskInput != nullptr);

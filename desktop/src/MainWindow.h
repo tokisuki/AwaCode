@@ -54,13 +54,12 @@ private:
   void loadSession(const QString &sessionId);
   void handleApproval(const QString &id, const QJsonObject &params);
   void renderTranscript();
-  void foldStreamMessagesIntoBase();
   QString payloadText(const QJsonObject &message) const;
 
-  struct StreamMessage {
+  struct TranscriptEntry {
     QString text;
+    QString messageId;
     bool provisional = true;
-    bool committed = false;
   };
 
   AgentProcessManager *manager_ = nullptr;
@@ -70,9 +69,7 @@ private:
   QString projectId_;
   QString sessionId_;
   QHash<QString, QString> pendingMethods_;
-  QHash<QString, StreamMessage> streamMessages_;
-  QStringList streamMessageOrder_;
-  QString transcriptBase_;
+  QList<TranscriptEntry> transcriptEntries_;
   SessionListModel sessions_;
   ToolTimelineModel tools_;
   QLineEdit *workspaceField_ = nullptr;

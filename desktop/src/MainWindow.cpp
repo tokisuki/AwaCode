@@ -121,18 +121,22 @@ void MainWindow::setConfigured(bool configured, const QString &model) {
 void MainWindow::receiveNotification(const QString &method, const QJsonObject &params) {
   if (method == QStringLiteral("stream/text")) {
     const QString messageId = params.value("messageId").toString();
-    if (!streamMessages_.contains(messageId)) streamMessageOrder_.append(messageId);
-    StreamMessage &message = streamMessages_[messageId];
-    message.text.append(params.value("delta").toString());
-    message.provisional = params.value("provisional").toBool();
+    TranscriptEntry *entry = nullptr;
+    for (TranscriptEntry &candidate : transcriptEntries_) {
+      if (candidate.messageId == messageId) entry = &candidate;
+    }
+    if (entry == nullptr) {
+      transcriptEntries_.append({{}, messageId, true});
+      entry = &transcriptEntries_.last();
+    }
+    entry->text.append(params.value("delta").toString());
+    entry->provisional = params.value("provisional").toBool();
     if (!streamTimer_->isActive()) streamTimer_->start();
   } else if (method == QStringLiteral("stream/commit")) {
     streamTimer_->stop();
     const QString messageId = params.value("messageId").toString();
-    if (streamMessages_.contains(messageId)) {
-      const StreamMessage message = streamMessages_.take(messageId);
-      streamMessageOrder_.removeAll(messageId);
-      transcriptBase_.append(message.text);
+    for (TranscriptEntry &entry : transcriptEntries_) {
+      if (entry.messageId == messageId) entry.provisional = false;
     }
     renderTranscript();
   } else if (method == QStringLiteral("agent/phase")) {
@@ -183,7 +187,6 @@ void MainWindow::runTask() {
     createSession();
     return;
   }
-  foldStreamMessagesIntoBase();
   tools_.clear();
   appendTranscript(QStringLiteral("\nYou: %1\n").arg(prompt));
   sendRequest(QStringLiteral("agent/run"), {{"sessionId", sessionId_}, {"prompt", prompt}});
@@ -196,7 +199,7 @@ void MainWindow::selectSession(const QModelIndex &index) {
 }
 
 void MainWindow::flushBufferedText() {
-  if (streamMessages_.isEmpty()) {
+  if (!streamTimer_->isActive()) {
     streamTimer_->stop();
     return;
   }
@@ -231,9 +234,7 @@ void MainWindow::receiveResponse(const QString &method, const QJsonValue &result
     sessions_.prepend({sessionId_, object.value("title").toString(), object.value("status").toString()});
     runTask();
   } else if (method == QStringLiteral("session/load")) {
-    transcriptBase_.clear();
-    streamMessages_.clear();
-    streamMessageOrder_.clear();
+    transcriptEntries_.clear();
     for (const QJsonValue &value : object.value("messages").toArray()) {
       const QJsonObject message = value.toObject();
       const QString text = payloadText(message);
@@ -298,30 +299,16 @@ void MainWindow::setRunning(bool running) {
 }
 
 void MainWindow::appendTranscript(const QString &text) {
-  foldStreamMessagesIntoBase();
-  transcriptBase_.append(text);
+  transcriptEntries_.append({text, {}, false});
   renderTranscript();
 }
 
-void MainWindow::foldStreamMessagesIntoBase() {
-  streamTimer_->stop();
-  for (const QString &id : streamMessageOrder_) {
-    const StreamMessage message = streamMessages_.value(id);
-    transcriptBase_.append(message.provisional && !message.committed
-      ? QStringLiteral("[provisional] %1").arg(message.text)
-      : message.text);
-  }
-  streamMessages_.clear();
-  streamMessageOrder_.clear();
-}
-
 void MainWindow::renderTranscript() {
-  QString text = transcriptBase_;
-  for (const QString &id : streamMessageOrder_) {
-    const StreamMessage message = streamMessages_.value(id);
-    text += message.provisional && !message.committed
-      ? QStringLiteral("[provisional] %1").arg(message.text)
-      : message.text;
+  QString text;
+  for (const TranscriptEntry &entry : transcriptEntries_) {
+    text += entry.provisional
+      ? QStringLiteral("[provisional] %1").arg(entry.text)
+      : entry.text;
   }
   transcript_->setPlainText(text);
   transcript_->moveCursor(QTextCursor::End);
