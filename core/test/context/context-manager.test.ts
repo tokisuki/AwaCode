@@ -330,6 +330,32 @@ test("multiple protected messages stay out of rolling summaries and remain visib
   } finally { connection.close(); }
 });
 
+test("jointly oversized protected messages fail instead of summarizing either one", async () => {
+  const { connection, store, session } = await fixture("protected-too-large");
+  try {
+    const candidate = store.insertMessage({
+      sessionId: session.id, role: "assistant", kind: "text", payload: { text: "c".repeat(5_000) },
+    });
+    const current = store.insertMessage({
+      sessionId: session.id, role: "user", kind: "text", payload: { text: "u".repeat(5_000) },
+    });
+    let summaryCalls = 0;
+    const manager = new ContextManager(store, { summaryGenerator: async () => {
+      summaryCalls += 1;
+      return "must not summarize protected content";
+    } });
+    await assert.rejects(manager.build({
+      sessionId: session.id,
+      history: validateProviderHistory(store, session.id),
+      currentUserMessageId: current.id,
+      protectedMessageIds: [candidate.id, current.id],
+      systemText: "system",
+      tools: [], contextLimit: 8_000, maxOutputTokens: 1_000,
+    }), ContextBudgetError);
+    assert.equal(summaryCalls, 0);
+  } finally { connection.close(); }
+});
+
 test("global memory precedes project memory so project instructions have priority", async () => {
   const { connection, store, session } = await fixture("memory-order");
   try {
