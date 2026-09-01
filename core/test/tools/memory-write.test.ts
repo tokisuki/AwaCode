@@ -31,7 +31,7 @@ test("memory_write validates explicit global/project exact-write operations and 
     oldText: "old",
     newText: "",
   });
-  for (const invalid of [{}, { scope: "session", new_text: "x" }, { scope: "global", new_text: 1 }, { scope: "global", old_text: "", new_text: "x" }]) {
+  for (const invalid of [{}, { scope: "session", new_text: "x" }, { scope: "global", new_text: 1 }, { scope: "global", new_text: "" }, { scope: "global", old_text: "", new_text: "x" }]) {
     assert.throws(() => memoryWriteTool.validate(invalid), ToolValidationError);
   }
 

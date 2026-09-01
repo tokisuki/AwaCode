@@ -18,6 +18,7 @@ function validateMemoryWriteInput(value: unknown): MemoryWriteToolInput {
     (input.scope !== "global" && input.scope !== "project")
     || typeof input.new_text !== "string"
     || (Object.hasOwn(input, "old_text") && (typeof input.old_text !== "string" || input.old_text.length === 0))
+    || (!Object.hasOwn(input, "old_text") && input.new_text.length === 0)
   ) {
     throw new ToolValidationError();
   }
