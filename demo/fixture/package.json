@@ -1,0 +1,8 @@
+{
+  "name": "awacode-discount-demo",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  }
+}
