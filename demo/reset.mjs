@@ -23,29 +23,60 @@ function isStrictChild(path, parent) {
   return pathRelative.length > 0 && !pathRelative.startsWith(`..${sep}`) && pathRelative !== ".." && !pathRelative.includes(`:${sep}`);
 }
 
-async function reset(target) {
-  if (!isStrictChild(target, demoRoot)) {
-    throw new Error("The reset target must be inside the demo directory.");
+function targetAncestors(target) {
+  const segments = relative(demoRoot, target).split(sep);
+  const ancestors = [demoRoot];
+  let current = demoRoot;
+  for (const segment of segments) {
+    current = resolve(current, segment);
+    ancestors.push(current);
   }
-  if (target === fixture || isStrictChild(fixture, target)) {
-    throw new Error("The reset target cannot contain the read-only fixture.");
-  }
-  try {
-    if ((await lstat(target)).isSymbolicLink()) {
-      throw new Error("The reset target must not be a symbolic link.");
-    }
-  } catch (error) {
-    if (error?.code !== "ENOENT") throw error;
-  }
-  await rm(target, { recursive: true, force: true, maxRetries: 1 });
-  await cp(fixture, target, { recursive: true, force: false, errorOnExist: true });
-  process.stdout.write(`Demo workspace restored: ${target}\n`);
+  return ancestors;
 }
 
-const target = parseTarget(process.argv.slice(2));
-if (target !== undefined) {
-  reset(target).catch((error) => {
-    process.stderr.write(`${error instanceof Error ? error.message : "Unable to reset demo workspace."}\n`);
-    process.exitCode = 1;
-  });
+export async function assertSafeDemoTarget(target, { lstat: lstatPath = lstat } = {}) {
+  const resolvedTarget = resolve(target);
+  if (!isStrictChild(resolvedTarget, demoRoot)) {
+    throw new Error("The reset target must be inside the demo directory.");
+  }
+  if (resolvedTarget === fixture || isStrictChild(fixture, resolvedTarget)) {
+    throw new Error("The reset target cannot contain the read-only fixture.");
+  }
+  for (const ancestor of targetAncestors(resolvedTarget)) {
+    try {
+      if ((await lstatPath(ancestor)).isSymbolicLink()) {
+        throw new Error("The reset target must not traverse a symbolic link or junction.");
+      }
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        return resolvedTarget;
+      }
+      throw error;
+    }
+  }
+  return resolvedTarget;
+}
+
+export async function resetDemoWorkspace(target, { afterDeleteBeforeCopy } = {}) {
+  const resolvedTarget = await assertSafeDemoTarget(target);
+  await assertSafeDemoTarget(resolvedTarget);
+  await rm(resolvedTarget, { recursive: true, force: true, maxRetries: 1 });
+  await afterDeleteBeforeCopy?.();
+  await assertSafeDemoTarget(resolvedTarget);
+  await cp(fixture, resolvedTarget, { recursive: true, force: false, errorOnExist: true });
+  process.stdout.write(`Demo workspace restored: ${resolvedTarget}\n`);
+}
+
+function isMainModule() {
+  return process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+}
+
+if (isMainModule()) {
+  const target = parseTarget(process.argv.slice(2));
+  if (target !== undefined) {
+    resetDemoWorkspace(target).catch((error) => {
+      process.stderr.write(`${error instanceof Error ? error.message : "Unable to reset demo workspace."}\n`);
+      process.exitCode = 1;
+    });
+  }
 }

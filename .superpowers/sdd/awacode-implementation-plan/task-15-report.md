@@ -56,3 +56,25 @@ Qt 的裸 `ctest` 初次运行没有继承 Qt/MinGW runtime DLL 查找环境而�
 | `09536be docs: finalize submission materials` | README、README.txt、部署/演示指南、确定性 demo fixture/reset 测试、设计状态对账和本报告初版；未修改 Core 或 Qt 生产逻辑。 |
 
 本报告的提交证据补充作为独立的后续文档提交，未 amend、rebase 或 push 历史。
+
+## 修复轮次 1：demo 祖先链接与 Qt 测试环境
+
+### RED
+
+先向 `demo/reset.test.mjs` 加入受控祖先检查、真实 junction/symlink 祖先外部 sentinel，以及删除后复制前祖先替换三项回归。Node 24 命令：
+
+```text
+node24 --test demo/reset.test.mjs
+```
+
+结果：失败，模块报 `reset.mjs does not provide an export named 'assertSafeDemoTarget'`。该失败发生在任何 `rm` 前；因此没有对外部 sentinel 进行破坏性试验。
+
+### GREEN
+
+`reset.mjs` 现在逐段 `lstat` 从 `demo/` 根到目标的每个现有祖先，拒绝 symbolic link/junction；删除前再次验证，并在可测试的“删除后、复制前”边界再次验证。运行同一命令的结果：4/4 通过，包括真实链接祖先拒绝、外部 sentinel 保留、交换边界及普通重复复位。
+
+README 与部署说明均将 Qt 6.8.3/匹配 MinGW 13.1 的 `bin` 加入 `PATH` 后才执行 `ctest`，并说明 `0xc0000135` 的直接测试诊断回退。
+
+附加命令验证使用 Node 24：无参数退出 2，`--target D:\awacode-outside-target` 被拒绝，明确的 `--target demo\.workspace\round1-command-validation` 成功复位并在验证后清理。`README.txt` 重新按所有 Unicode code point 计数仍为 629；本轮变更的私钥/token 签名扫描和 `git diff --check` 均无异常。
+
+本轮 green 代码与文档会作为新的、未 amend 的提交记录；其准确 SHA 在后续提交证据补充中登记。

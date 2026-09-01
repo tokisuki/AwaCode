@@ -67,6 +67,7 @@ Pop-Location
 ```powershell
 $env:QT_ROOT = "C:\Qt\6.8.3\mingw_64"
 $env:QT_MINGW_BIN = "C:\Qt\Tools\mingw1310_64\bin"
+$env:PATH = "$env:QT_ROOT\bin;$env:QT_MINGW_BIN;$env:PATH"
 cmake -S desktop -B desktop\build-qt6 -G Ninja `
   "-DCMAKE_PREFIX_PATH=$env:QT_ROOT" `
   "-DCMAKE_CXX_COMPILER=$env:QT_MINGW_BIN\g++.exe"
@@ -74,7 +75,7 @@ cmake --build desktop\build-qt6
 ctest --test-dir desktop\build-qt6 --output-on-failure
 ```
 
-运行桌面端时让 Qt 和 MinGW DLL 可被找到，并明确指定 Node 24：
+上一步的 `PATH` 同时用于 `ctest` 和桌面端；运行时再明确指定 Node 24：
 
 ```powershell
 $env:PATH = "$env:QT_ROOT\bin;$env:QT_MINGW_BIN;$env:PATH"
@@ -121,6 +122,7 @@ Core 持久化完整审计历史，但向模型发送受预算控制的上下文
 - **`not_configured` / Run 按钮禁用**：在 Settings 保存完整配置，或确认三个 `AWACODE_*` 必需变量均为非空；不要把 Key 放进 `.env`、Git 或录屏。
 - **Node 版本错误**：用 `node --version` 确认 24；若 CLI/Qt 继承的 `node` 不是 24，设置 `AWACODE_NODE_PATH`。
 - **Qt 启动缺 DLL / platform plugin**：使用同一个 Qt MinGW kit 的 `windeployqt`，并确保 `QT_ROOT\bin` 和 MinGW `bin` 在 `PATH` 中。
+- **`ctest` 显示 `0xc0000135`**：这表示 Windows 找不到 Qt/MinGW DLL。确认在启动 `ctest` 的同一 shell 先执行上节的 `PATH` 行；仍需定位时，在同一环境执行 `Get-ChildItem desktop\build-qt6\awacode-*-test.exe | ForEach-Object { & $_.FullName }`，逐个运行相同的 Qt 测试二进制。
 - **命令被拒绝或中断**：审批时只输入 `allow_once` 或 `deny`；取消、超时、断开都不会执行该次副作用。重新检查时间线后再新建或继续任务。
 - **上下文溢出**：提高用户配置的上下文窗口，减少单次任务范围，或开始新会话；不要假定 Core 会丢弃历史来“修好”请求。
 
