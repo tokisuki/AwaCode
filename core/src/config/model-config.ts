@@ -5,8 +5,8 @@ import { basename, dirname, resolve } from "node:path";
 import { resolveDataPaths, type DataPathOptions } from "../persistence/data-paths.ts";
 import { redactDiagnostic } from "./diagnostic-redactor.ts";
 
-const DEFAULT_CONTEXT_LIMIT = 32768;
-const DEFAULT_MAX_OUTPUT_TOKENS = 4096;
+const DEFAULT_CONTEXT_LIMIT = 1000000;
+const DEFAULT_MAX_OUTPUT_TOKENS = 384000;
 let inProcessSaveQueue: Promise<void> = Promise.resolve();
 
 type OptionalSource = "environment" | "file" | "absent";
