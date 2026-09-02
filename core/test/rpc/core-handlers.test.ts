@@ -281,7 +281,8 @@ test("agent run boundary failures cross RPC as an explicit application error", a
       (error: unknown) => error instanceof RpcFault
         && error.code === -32009
         && error.message === "Agent run could not complete"
-        && (error.data as { reason?: unknown }).reason === "agent_run_error");
+        && (error.data as { reason?: unknown; detail?: unknown }).reason === "agent_run_error"
+        && (error.data as { detail?: unknown }).detail === "Plan could not be finalized.");
   } finally {
     client.close();
     server.close();

@@ -204,7 +204,10 @@ function agentFault(error: unknown): never {
     });
   }
   if (error instanceof AgentRunError) {
-    throw new RpcFault(RPC_ERROR_CODES.agentRun, "Agent run could not complete", { reason: error.code });
+    throw new RpcFault(RPC_ERROR_CODES.agentRun, "Agent run could not complete", {
+      reason: error.code,
+      detail: error.message.slice(0, 1_000),
+    });
   }
   if (error instanceof ModelConfigOperationError) {
     return configFault(error);

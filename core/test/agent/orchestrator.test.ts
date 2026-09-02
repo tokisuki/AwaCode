@@ -301,6 +301,123 @@ test("Execute explicitly replaces Plan's read-only tool boundary before asking t
   }
 });
 
+test("an explicit command request rejects one tool-free claim and completes only after run_command evidence", async () => {
+  const f = await fixture("command-evidence");
+  const order: string[] = [];
+  const registry = new ToolRegistry();
+  registry.register(scriptedTool("run_command", order));
+  const provider = new ScriptedProvider([
+    response("Run the requested command."),
+    response("git status completed successfully."),
+    response("", [{ id: "actual-command", name: "run_command", arguments: "{\"value\":\"git status\"}" }]),
+    response("git status actually completed."),
+  ]);
+  const orchestrator = new AgentOrchestrator({
+    store: f.store,
+    provider,
+    tools: registry,
+    permissionClient: allowPermission,
+    workspace: f.workspace,
+    contextLimit: 32_768,
+    maxOutputTokens: 4_096,
+  });
+
+  try {
+    const result = await orchestrator.run({
+      sessionId: f.sessionId,
+      prompt: "请实际执行 git status，并依据命令的真实输出告诉我结果。",
+    });
+    assert.equal(result.finalText, "git status actually completed.");
+    assert.equal(result.toolCalls, 1);
+    assert.equal(provider.requests.length, 4);
+    assert.deepEqual(order, ["run_command:start:git status", "run_command:end:git status"]);
+    const rejected = f.store.loadSession(f.sessionId).messages.find((message) =>
+      (message.payload as { text?: unknown }).text === "git status completed successfully.");
+    assert.equal((rejected?.payload as { candidateStatus?: unknown }).candidateStatus, "rejected");
+  } finally {
+    f.connection.close();
+  }
+});
+
+test("an explicit file creation request completes only after write_file evidence", async () => {
+  const f = await fixture("write-evidence");
+  const order: string[] = [];
+  const registry = new ToolRegistry();
+  registry.register(scriptedTool("write_file", order));
+  const provider = new ScriptedProvider([
+    response("Create the requested file."),
+    response("The file has been created."),
+    response("", [{ id: "actual-write", name: "write_file", arguments: "{\"value\":\"awacode-evidence-probe.txt\"}" }]),
+    response("The file was actually created."),
+  ]);
+  const orchestrator = new AgentOrchestrator({
+    store: f.store,
+    provider,
+    tools: registry,
+    permissionClient: allowPermission,
+    workspace: f.workspace,
+    contextLimit: 32_768,
+    maxOutputTokens: 4_096,
+  });
+
+  try {
+    const result = await orchestrator.run({
+      sessionId: f.sessionId,
+      prompt: "请在当前工作区新建文件 awacode-evidence-probe.txt，并实际使用文件工具写入内容。",
+    });
+    assert.equal(result.finalText, "The file was actually created.");
+    assert.equal(result.toolCalls, 1);
+    assert.deepEqual(order, [
+      "write_file:start:awacode-evidence-probe.txt",
+      "write_file:end:awacode-evidence-probe.txt",
+    ]);
+    const rejected = f.store.loadSession(f.sessionId).messages.find((message) =>
+      (message.payload as { text?: unknown }).text === "The file has been created.");
+    assert.equal((rejected?.payload as { candidateStatus?: unknown }).candidateStatus, "rejected");
+  } finally {
+    f.connection.close();
+  }
+});
+
+test("missing required execution evidence twice ends as an explicit agent error", async () => {
+  const f = await fixture("missing-evidence-error");
+  const registry = new ToolRegistry();
+  registry.register(scriptedTool("run_command", []));
+  const provider = new ScriptedProvider([
+    response("Run the requested command."),
+    response("The command completed."),
+    response("The command definitely completed."),
+  ]);
+  const orchestrator = new AgentOrchestrator({
+    store: f.store,
+    provider,
+    tools: registry,
+    permissionClient: allowPermission,
+    workspace: f.workspace,
+    contextLimit: 32_768,
+    maxOutputTokens: 4_096,
+  });
+
+  try {
+    await assert.rejects(
+      orchestrator.run({ sessionId: f.sessionId, prompt: "请实际执行 git status。" }),
+      (error: unknown) => error instanceof AgentRunError
+        && error.message === "Execute did not provide required command execution evidence after one correction.",
+    );
+    assert.equal(provider.requests.length, 3);
+    const loaded = f.store.loadSession(f.sessionId);
+    assert.equal(loaded.session.status, "error");
+    assert.deepEqual(
+      loaded.messages
+        .filter((message) => message.role === "assistant" && message.kind === "text")
+        .map((message) => (message.payload as { candidateStatus?: unknown }).candidateStatus),
+      ["rejected", "rejected"],
+    );
+  } finally {
+    f.connection.close();
+  }
+});
+
 test("Plan exhausts its read turns by forcing one tool-free plan before Execute", async () => {
   const f = await fixture("plan-finalization");
   const order: string[] = [];

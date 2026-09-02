@@ -113,12 +113,44 @@ interface ExecuteOutcome {
   readonly stopReason: "execute_turn_limit" | "tool_call_limit" | "repeated_tool_call" | null;
 }
 
+interface ExecutionEvidenceRequirement {
+  readonly description: string;
+  readonly toolNames: readonly string[];
+}
+
 const PLAN_PROMPT = "Inspect the workspace with the available read-only tools when useful, then return a concise actionable plan.";
 const PLAN_FINAL_PROMPT = "Read-only exploration is finished. Do not call tools. Return a concise actionable plan now.";
 const executePrompt = (definitions: readonly FunctionToolDefinition[]) => {
   const names = definitions.map((definition) => definition.function.name).join(", ") || "none";
   return `The Plan phase's read-only tool restriction has ended. The current Execute tools are: ${names}. Execute the coding task using these current tools when useful; do not rely on Plan statements that a current tool was unavailable. Return the final answer when work is complete.`;
 };
+
+function requiredExecutionEvidence(prompt: string): ExecutionEvidenceRequirement[] {
+  const requirements: ExecutionEvidenceRequirement[] = [];
+  if (
+    /(?:实际|真正|直接)(?:执行|运行)|(?:执行|运行)(?:一下|下)?(?:这条|该|以下)?命令|\b(?:actually\s+)?(?:run|execute)\s+(?:the\s+)?(?:command|tests?|build|git\b|npm\b|pnpm\b|yarn\b|node\b|python\b|pytest\b|cargo\b|cmake\b)/iu.test(prompt)
+  ) {
+    requirements.push({ description: "command execution", toolNames: ["run_command"] });
+  }
+  if (
+    /(?:新建|创建|写入|生成|保存)(?:一个|该|这个|以下)?(?:名为[^，。；\n]{0,80})?(?:文件|[^\s，。；]+\.[a-z0-9_-]+)|\b(?:create|write|save|generate)\b.{0,50}\bfile\b/iu.test(prompt)
+  ) {
+    requirements.push({ description: "file write", toolNames: ["write_file"] });
+  }
+  return requirements;
+}
+
+function missingExecutionEvidence(
+  requirements: readonly ExecutionEvidenceRequirement[],
+  observedToolNames: ReadonlySet<string>,
+): ExecutionEvidenceRequirement[] {
+  return requirements.filter((requirement) =>
+    !requirement.toolNames.some((toolName) => observedToolNames.has(toolName)));
+}
+
+function isRealToolAttempt(result: ToolResult): boolean {
+  return result.metadata.error !== "unknown_tool" && result.metadata.error !== "invalid_tool_input";
+}
 const PLAN_TOOL_NAMES = new Set(["list_files", "read_file", "search_text"]);
 const MAX_PLAN_TURNS = 12;
 const MAX_EXECUTE_TURNS = 12;
@@ -270,7 +302,7 @@ export class AgentOrchestrator {
       }
 
       await this.phase("execute");
-      const execution = await this.executeUntilFinal(input.sessionId, user.id);
+      const execution = await this.executeUntilFinal(input.sessionId, user.id, input.prompt);
       const finalTurn = execution.turn;
       finalText = finalTurn.response.content;
       if (execution.stopReason !== null) {
@@ -395,14 +427,21 @@ export class AgentOrchestrator {
   private async executeUntilFinal(
     sessionId: string,
     currentUserMessageId: string,
+    prompt: string,
   ): Promise<ExecuteOutcome> {
     const definitions = toolDefinitions(this.options.tools);
-    const instruction = executePrompt(definitions);
+    const baseInstruction = executePrompt(definitions);
+    const evidenceRequirements = requiredExecutionEvidence(prompt);
+    const observedToolNames = new Set<string>();
+    let evidenceCorrectionUsed = false;
     while (true) {
       if (this.executeTurns >= MAX_EXECUTE_TURNS) {
         return { turn: await this.closingTurn(sessionId, currentUserMessageId, "execute_turn_limit"), stopReason: "execute_turn_limit" };
       }
       this.executeTurns += 1;
+      const instruction = evidenceCorrectionUsed
+        ? `${baseInstruction} Your previous answer was rejected because it claimed completion without the required tool evidence. Call the required tool now before giving a final answer.`
+        : baseInstruction;
       const turn = await this.providerTurn(
         sessionId,
         currentUserMessageId,
@@ -415,14 +454,24 @@ export class AgentOrchestrator {
         if (turn.response.finishReason !== "stop") {
           throw new AgentRunError(`Execute response ended with unsupported finish reason: ${turn.response.finishReason ?? "missing"}.`);
         }
+        const missingEvidence = missingExecutionEvidence(evidenceRequirements, observedToolNames);
+        const candidateStatus = missingEvidence.length === 0 ? "accepted" : "rejected";
         this.options.store.finalizeStreamingAssistantMessage({
           messageId: turn.message.id,
           kind: "text",
           payload: this.messagePayload(turn.response.content, "execute", {
-            candidateStatus: "accepted",
+            candidateStatus,
             ...this.reasoningPayload(turn.response),
           }),
         });
+        if (missingEvidence.length > 0) {
+          const descriptions = missingEvidence.map((requirement) => requirement.description).join(" and ");
+          if (evidenceCorrectionUsed) {
+            throw new AgentRunError(`Execute did not provide required ${descriptions} evidence after one correction.`);
+          }
+          evidenceCorrectionUsed = true;
+          continue;
+        }
         return { turn, stopReason: null };
       }
       this.options.store.finalizeStreamingAssistantWithToolCalls({
@@ -453,7 +502,10 @@ export class AgentOrchestrator {
           stopReason = "tool_call_limit";
           await this.settleNonExecuted(call.id, ordinal, call.name, stopReason);
         } else {
-          await this.executeTool(sessionId, call.id, ordinal, call.name, call.arguments);
+          const result = await this.executeTool(sessionId, call.id, ordinal, call.name, call.arguments);
+          if (isRealToolAttempt(result)) {
+            observedToolNames.add(call.name);
+          }
         }
       }
       if (stopReason === null && this.executedToolCalls >= MAX_TOOL_EXECUTIONS) {
