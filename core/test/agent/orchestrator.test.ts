@@ -925,6 +925,58 @@ test("the twelfth Execute tool turn closes with one no-tools summary instead of 
   }
 });
 
+test("Plan reaching the global tool limit closes with one no-tools summary instead of failing the run", async () => {
+  const f = await fixture("plan-tool-limit");
+  const registry = new ToolRegistry();
+  registry.register(scriptedTool("list_files", []));
+  const calls = Array.from({ length: 25 }, (_, index) => ({
+    id: `plan-tool-${index + 1}`,
+    name: "list_files",
+    arguments: `{"value":"${index + 1}"}`,
+  }));
+  const provider = new ScriptedProvider([
+    response("", calls),
+    response("Stopped at the tool limit after reporting completed and unfinished work."),
+  ]);
+  const orchestrator = new AgentOrchestrator({
+    store: f.store,
+    provider,
+    tools: registry,
+    permissionClient: allowPermission,
+    workspace: f.workspace,
+    contextLimit: 32_768,
+    maxOutputTokens: 4_096,
+  });
+
+  try {
+    const result = await orchestrator.run({ sessionId: f.sessionId, prompt: "Inspect many files" });
+    assert.deepEqual({
+      finalText: result.finalText,
+      status: result.status,
+      reason: result.reason,
+      modelTurns: result.modelTurns,
+      toolCalls: result.toolCalls,
+    }, {
+      finalText: "Stopped at the tool limit after reporting completed and unfinished work.",
+      status: "completed",
+      reason: "tool_call_limit",
+      modelTurns: 2,
+      toolCalls: 24,
+    });
+    assert.equal(provider.requests.length, 2);
+    assert.equal(provider.requests[1]!.tools, undefined);
+    assert.match(provider.requests[1]!.messages.at(-1)!.content as string, /completed work/i);
+    assert.match(provider.requests[1]!.messages.at(-1)!.content as string, /unfinished work/i);
+    assert.match(provider.requests[1]!.messages.at(-1)!.content as string, /tool_call_limit/);
+    const persisted = f.store.loadSession(f.sessionId).toolCalls;
+    assert.equal(persisted.length, 25);
+    assert.equal(persisted[23]!.status, "success");
+    assert.equal(persisted[24]!.status, "failure");
+  } finally {
+    f.connection.close();
+  }
+});
+
 test("only twenty-four tools execute and later calls in the persisted block receive non-executed failures", async () => {
   const f = await fixture("tool-limit");
   const registry = new ToolRegistry();

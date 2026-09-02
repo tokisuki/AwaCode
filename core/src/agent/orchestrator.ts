@@ -257,7 +257,14 @@ export class AgentOrchestrator {
       await this.status("busy", "run_started");
 
       await this.phase("plan");
-      await this.planUntilReady(input.sessionId, user.id);
+      const planClosing = await this.planUntilReady(input.sessionId, user.id);
+      if (planClosing !== null) {
+        finalText = planClosing.response.content;
+        const result = this.result(runId, finalText, "completed", "tool_call_limit");
+        this.options.store.setSessionStatus(input.sessionId, "completed");
+        await this.status("done", result.reason);
+        return result;
+      }
 
       await this.phase("execute");
       const execution = await this.executeUntilFinal(input.sessionId, user.id);
@@ -307,7 +314,7 @@ export class AgentOrchestrator {
     return { runId, finalText, status, reason, modelTurns: this.modelTurns, toolCalls: this.executedToolCalls };
   }
 
-  private async planUntilReady(sessionId: string, currentUserMessageId: string): Promise<void> {
+  private async planUntilReady(sessionId: string, currentUserMessageId: string): Promise<StreamedTurn | null> {
     const definitions = toolDefinitions(this.options.tools, PLAN_TOOL_NAMES);
     const availableNames = new Set(definitions.map((definition) => definition.function.name));
     for (let turnNumber = 1; turnNumber <= MAX_PLAN_TURNS; turnNumber += 1) {
@@ -328,7 +335,7 @@ export class AgentOrchestrator {
           kind: "plan",
           payload: this.messagePayload(plan.response.content, "plan", this.reasoningPayload(plan.response)),
         });
-        return;
+        return null;
       }
       if (plan.response.toolCalls.some((call) => !availableNames.has(call.name))) {
         await this.persistRejectedToolCalls(plan, sessionId, "Only advertised read-only tools are allowed during Plan.");
@@ -354,7 +361,7 @@ export class AgentOrchestrator {
         await this.executeTool(sessionId, call.id, ordinal, call.name, call.arguments);
       }
       if (limitReached) {
-        throw new AgentRunError("Plan reached the tool call limit.");
+        return this.closingTurn(sessionId, currentUserMessageId, "tool_call_limit");
       }
     }
     const finalPlan = await this.providerTurn(
@@ -379,6 +386,7 @@ export class AgentOrchestrator {
       kind: "plan",
       payload: this.messagePayload(finalPlan.response.content, "plan", this.reasoningPayload(finalPlan.response)),
     });
+    return null;
   }
 
   private async executeUntilFinal(
