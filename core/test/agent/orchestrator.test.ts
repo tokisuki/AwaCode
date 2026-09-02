@@ -29,6 +29,9 @@ import type { ToolDefinition, ToolResult } from "../../src/tools/contracts.ts";
 import type { PermissionClient } from "../../src/tools/permission.ts";
 import { ToolRegistry } from "../../src/tools/registry.ts";
 import { editFileTool } from "../../src/tools/edit-file.ts";
+import { readFileTool } from "../../src/tools/read-file.ts";
+import { runCommandTool } from "../../src/tools/run-command.ts";
+import { writeFileTool } from "../../src/tools/write-file.ts";
 
 const temporaryDirectories: string[] = [];
 
@@ -254,6 +257,51 @@ test("Plan and serial tools commit the first tool-free Execute response without 
   }
 });
 
+test("Plan executes only advertised structured read calls and never treats DSML text as a tool", async () => {
+  const f = await fixture("plan-read-loop");
+  await writeFile(join(f.workspace.rootPath, "README.md"), "AwaCode fixture", "utf8");
+  const registry = new ToolRegistry();
+  registry.register(readFileTool);
+  registry.register(editFileTool);
+  registry.register(writeFileTool);
+  registry.register(runCommandTool);
+  const provider = new ScriptedProvider([
+    response("<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name=\"read_file\"><｜｜DSML｜｜parameter name=\"path\" string=\"true\">README.md</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>", [
+      { id: "plan-read", name: "read_file", arguments: "{\"path\":\"README.md\"}" },
+    ]),
+    response("Inspect README, then report the project purpose."),
+    response("AwaCode fixture is a small coding-agent project."),
+  ]);
+  const orchestrator = new AgentOrchestrator({
+    store: f.store,
+    provider,
+    tools: registry,
+    permissionClient: allowPermission,
+    workspace: f.workspace,
+    contextLimit: 32_768,
+    maxOutputTokens: 4_096,
+  });
+
+  try {
+    const result = await orchestrator.run({ sessionId: f.sessionId, prompt: "Describe this project" });
+    assert.equal(result.status, "completed");
+    assert.equal(result.modelTurns, 3);
+    assert.equal(result.toolCalls, 1);
+    assert.deepEqual(provider.requests[0]!.tools?.map((tool) => tool.function.name), ["read_file"]);
+    assert.deepEqual(provider.requests[1]!.tools?.map((tool) => tool.function.name), ["read_file"]);
+    const planFollowUp = provider.requests[1]!.messages;
+    assert.equal(planFollowUp.some((message) => message.role === "tool"
+      && message.toolCallId === "plan-read"
+      && message.content.includes("AwaCode fixture")), true);
+    const loaded = f.store.loadSession(f.sessionId);
+    assert.deepEqual(loaded.toolCalls.map((call) => [call.toolName, call.status]), [["read_file", "success"]]);
+    assert.equal(loaded.messages.some((message) => message.kind === "plan"
+      && (message.payload as { text?: unknown }).text === "Inspect README, then report the project purpose."), true);
+  } finally {
+    f.connection.close();
+  }
+});
+
 test("every user-facing model request requires plain text without Markdown", async () => {
   const f = await fixture("plain-text");
   const provider = new ScriptedProvider([response("Plan."), response("Done.")]);
@@ -462,14 +510,14 @@ test("unknown, invalid, and denied tool calls each persist exactly one terminal 
   await writeFile(join(f.workspace.rootPath, "demo.txt"), "old", "utf8");
   const registry = new ToolRegistry();
   registry.register(scriptedTool("alpha", []));
-  registry.register(editFileTool);
+  registry.register(runCommandTool);
   const provider = new ScriptedProvider([
     response("Plan."),
     response("", [
       { id: "unknown", name: "missing_tool", arguments: "{}" },
       { id: "malformed", name: "alpha", arguments: "{" },
       { id: "invalid", name: "alpha", arguments: "{\"wrong\":true}" },
-      { id: "denied", name: "edit_file", arguments: "{\"path\":\"demo.txt\",\"old_text\":\"old\",\"new_text\":\"new\"}" },
+      { id: "denied", name: "run_command", arguments: "{\"command\":\"echo never\"}" },
     ]),
     response("No changes were made."),
   ]);
@@ -500,17 +548,68 @@ test("unknown, invalid, and denied tool calls each persist exactly one terminal 
   }
 });
 
+test("Execute auto-allows file edits and creates without calling the external permission client", async () => {
+  const f = await fixture("auto-allow-edit");
+  await writeFile(join(f.workspace.rootPath, "demo.txt"), "before old after", "utf8");
+  const registry = new ToolRegistry();
+  registry.register(editFileTool);
+  registry.register(writeFileTool);
+  const provider = new ScriptedProvider([
+    response("Replace the requested text."),
+    response("", [
+      {
+        id: "auto-edit",
+        name: "edit_file",
+        arguments: "{\"path\":\"demo.txt\",\"old_text\":\"old\",\"new_text\":\"new\"}",
+      },
+      {
+        id: "auto-create",
+        name: "write_file",
+        arguments: "{\"path\":\"created.txt\",\"content\":\"created\"}",
+      },
+    ]),
+    response("The file was updated."),
+  ]);
+  let externalPermissionRequests = 0;
+  const orchestrator = new AgentOrchestrator({
+    store: f.store,
+    provider,
+    tools: registry,
+    permissionClient: {
+      async requestPermission() {
+        externalPermissionRequests += 1;
+        throw new Error("write approval must be automatic");
+      },
+    },
+    workspace: f.workspace,
+    contextLimit: 32_768,
+    maxOutputTokens: 4_096,
+  });
+
+  try {
+    const result = await orchestrator.run({ sessionId: f.sessionId, prompt: "Edit demo.txt" });
+    assert.equal(result.status, "completed");
+    assert.equal(externalPermissionRequests, 0);
+    assert.equal(await readFile(join(f.workspace.rootPath, "demo.txt"), "utf8"), "before new after");
+    assert.equal(await readFile(join(f.workspace.rootPath, "created.txt"), "utf8"), "created");
+    assert.equal(f.store.loadToolCall("auto-edit").status, "success");
+    assert.equal(f.store.loadToolCall("auto-create").status, "success");
+  } finally {
+    f.connection.close();
+  }
+});
+
 test("cancellation interrupts an awaiting approval, settles the call, and never auto-replays it", async () => {
   const f = await fixture("cancel");
   await writeFile(join(f.workspace.rootPath, "demo.txt"), "old", "utf8");
   const registry = new ToolRegistry();
-  registry.register(editFileTool);
+  registry.register(runCommandTool);
   const provider = new ScriptedProvider([
     response("Plan."),
     response("", [{
-      id: "cancelled-edit",
-      name: "edit_file",
-      arguments: "{\"path\":\"demo.txt\",\"old_text\":\"old\",\"new_text\":\"new\"}",
+      id: "cancelled-command",
+      name: "run_command",
+      arguments: "{\"command\":\"echo never\"}",
     }]),
   ]);
   let approvalEntered!: () => void;
@@ -548,7 +647,7 @@ test("cancellation interrupts an awaiting approval, settles the call, and never 
     const loaded = f.store.loadSession(f.sessionId);
     assert.equal(loaded.session.status, "cancelled");
     assert.deepEqual(loaded.toolCalls.map((call) => [call.callId, call.status, call.result !== null]), [
-      ["cancelled-edit", "interrupted", true],
+      ["cancelled-command", "interrupted", true],
     ]);
     assert.equal(loaded.messages.filter((message) => message.status === "streaming").length, 0);
     assert.equal(await readFile(join(f.workspace.rootPath, "demo.txt"), "utf8"), "old");
@@ -596,7 +695,7 @@ test("unexpected Plan tool calls are rejected but first settled into complete hi
 
   try {
     await assert.rejects(orchestrator.run({ sessionId: f.sessionId, prompt: "Plan" }),
-      (error: unknown) => error instanceof Error && error.message === "Plan returned unexpected tool calls.");
+      (error: unknown) => error instanceof Error && error.message === "Plan returned an unavailable tool call.");
     const loaded = f.store.loadSession(f.sessionId);
     assert.equal(loaded.session.status, "error");
     assert.deepEqual(loaded.toolCalls.map((call) => [call.callId, call.status, call.result !== null]), [

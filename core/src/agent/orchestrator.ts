@@ -113,20 +113,30 @@ interface ExecuteOutcome {
   readonly stopReason: "execute_turn_limit" | "tool_call_limit" | "repeated_tool_call" | null;
 }
 
-const PLAN_PROMPT = "Plan the requested coding task. Do not call tools. Return a concise actionable plan.";
+const PLAN_PROMPT = "Inspect the workspace with the available read-only tools when useful, then return a concise actionable plan.";
 const EXECUTE_PROMPT = "Execute the coding task using tools when useful. Return the final answer when work is complete.";
+const PLAN_TOOL_NAMES = new Set(["list_files", "read_file", "search_text"]);
+const MAX_PLAN_TURNS = 12;
 const MAX_EXECUTE_TURNS = 12;
 const MAX_TOOL_EXECUTIONS = 24;
 const DEFAULT_SYSTEM_PROMPT = "You are AwaCode, a careful coding agent. Call memory_write only when the current user explicitly asks to remember, update, or forget information. Never infer or automatically write memory. Default unspecified memory scope to project; use global only for explicit cross-project preferences.";
 const PLAIN_TEXT_SYSTEM_PROMPT = "All user-facing prose must be plain text. Do not use Markdown syntax, including headings, bullets, numbered lists, emphasis, block quotes, links, tables, or fenced code blocks.";
+const AUTO_ALLOW_WRITE_PERMISSION: PermissionClient = {
+  async requestPermission(request) {
+    if (request.kind !== "write") {
+      throw new TypeError("Only write permissions can be auto-allowed.");
+    }
+    return "allow_once";
+  },
+};
 
 function isContextOverflow(error: unknown): boolean {
   return error instanceof ModelContextOverflowError
     || (typeof error === "object" && error !== null && "code" in error && error.code === "context_overflow");
 }
 
-function toolDefinitions(registry: ToolRegistry): FunctionToolDefinition[] {
-  return registry.list().map((tool) => ({
+function toolDefinitions(registry: ToolRegistry, allowedNames?: ReadonlySet<string>): FunctionToolDefinition[] {
+  return registry.list().filter((tool) => allowedNames === undefined || allowedNames.has(tool.name)).map((tool) => ({
     type: "function",
     function: {
       name: tool.name,
@@ -246,16 +256,7 @@ export class AgentOrchestrator {
       await this.status("busy", "run_started");
 
       await this.phase("plan");
-      const plan = await this.providerTurn(input.sessionId, user.id, "plan", [], PLAN_PROMPT, false);
-      if (plan.response.toolCalls.length > 0) {
-        await this.persistRejectedToolCalls(plan, input.sessionId, "Tools are not allowed during Plan.");
-        throw new AgentRunError("Plan returned unexpected tool calls.");
-      }
-      this.options.store.finalizeStreamingAssistantMessage({
-        messageId: plan.message.id,
-        kind: "plan",
-        payload: this.messagePayload(plan.response.content, "plan", this.reasoningPayload(plan.response)),
-      });
+      await this.planUntilReady(input.sessionId, user.id);
 
       await this.phase("execute");
       const execution = await this.executeUntilFinal(input.sessionId, user.id);
@@ -303,6 +304,59 @@ export class AgentOrchestrator {
 
   private result(runId: string, finalText: string, status: AgentTerminalStatus, reason: string): AgentRunResult {
     return { runId, finalText, status, reason, modelTurns: this.modelTurns, toolCalls: this.executedToolCalls };
+  }
+
+  private async planUntilReady(sessionId: string, currentUserMessageId: string): Promise<void> {
+    const definitions = toolDefinitions(this.options.tools, PLAN_TOOL_NAMES);
+    const availableNames = new Set(definitions.map((definition) => definition.function.name));
+    for (let turnNumber = 1; turnNumber <= MAX_PLAN_TURNS; turnNumber += 1) {
+      const plan = await this.providerTurn(
+        sessionId,
+        currentUserMessageId,
+        "plan",
+        definitions,
+        PLAN_PROMPT,
+        false,
+      );
+      if (plan.response.toolCalls.length === 0) {
+        if (plan.response.finishReason !== "stop") {
+          throw new AgentRunError(`Plan response ended with unsupported finish reason: ${plan.response.finishReason ?? "missing"}.`);
+        }
+        this.options.store.finalizeStreamingAssistantMessage({
+          messageId: plan.message.id,
+          kind: "plan",
+          payload: this.messagePayload(plan.response.content, "plan", this.reasoningPayload(plan.response)),
+        });
+        return;
+      }
+      if (plan.response.toolCalls.some((call) => !availableNames.has(call.name))) {
+        await this.persistRejectedToolCalls(plan, sessionId, "Only advertised read-only tools are allowed during Plan.");
+        throw new AgentRunError("Plan returned an unavailable tool call.");
+      }
+      this.options.store.finalizeStreamingAssistantWithToolCalls({
+        messageId: plan.message.id,
+        payload: this.messagePayload(plan.response.content, "plan", this.reasoningPayload(plan.response)),
+        toolCalls: plan.response.toolCalls.map((call, ordinal) => ({
+          callId: call.id,
+          ordinal,
+          toolName: call.name,
+          inputText: call.arguments,
+        })),
+      });
+      let limitReached = false;
+      for (const [ordinal, call] of plan.response.toolCalls.entries()) {
+        if (this.executedToolCalls >= MAX_TOOL_EXECUTIONS) {
+          limitReached = true;
+          await this.settleNonExecuted(call.id, ordinal, call.name, "tool_call_limit");
+          continue;
+        }
+        await this.executeTool(sessionId, call.id, ordinal, call.name, call.arguments);
+      }
+      if (limitReached) {
+        throw new AgentRunError("Plan reached the tool call limit.");
+      }
+    }
+    throw new AgentRunError("Plan reached the model turn limit.");
   }
 
   private async executeUntilFinal(
@@ -457,7 +511,9 @@ export class AgentOrchestrator {
         approvedToolRuntime: {
           callId,
           store: this.options.store,
-          permissionClient: this.options.permissionClient,
+          permissionClient: definition.approval === "write"
+            ? AUTO_ALLOW_WRITE_PERMISSION
+            : this.options.permissionClient,
         },
       }),
       ...(this.options.memory === undefined ? {} : { memoryRuntime: this.options.memory }),

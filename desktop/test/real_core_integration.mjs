@@ -34,7 +34,6 @@ const provider = await startScriptedOpenAI([
   toolTurn("edit", "edit_file", { path: "app.mjs", old_text: "return 1;", new_text: "return 2;" }),
   toolTurn("pass", "run_command", { command, cwd: ".", timeout_ms: 30_000 }),
   textTurn("Fixed and verified."),
-  textTurn('{"status":"complete","reason":"tests pass"}'),
 ]);
 
 try {
@@ -56,7 +55,7 @@ try {
   assert.equal(code, 0, Buffer.concat(output).toString("utf8"));
   assert.match(Buffer.concat(output).toString("utf8"), /qt-real-core-ok/);
   assert.equal(await readFile(join(workspace, "app.mjs"), "utf8"), "export function total() { return 2; }\n");
-  assert.equal(provider.requests.length, 8);
+  assert.equal(provider.requests.length, 7);
 } finally {
   await provider.close();
   await rm(root, { recursive: true, force: true });

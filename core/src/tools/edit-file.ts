@@ -604,7 +604,7 @@ function validateEditFileInput(value: unknown): EditFileInput {
 
 export const editFileTool: ToolDefinition<EditFileInput> = {
   name: "edit_file",
-  description: "Replace exact text in an existing UTF-8 workspace file after one-shot approval.",
+  description: "Replace exact text in an existing UTF-8 workspace file with guarded atomic publication.",
   inputSchema: {
     type: "object",
     additionalProperties: false,

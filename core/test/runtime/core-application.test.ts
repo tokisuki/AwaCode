@@ -144,7 +144,12 @@ test("startup recovers durable state and composes a configured per-session agent
     assert.deepEqual(persisted.session.model, {
       model: "fixture-model", contextLimit: 32768, maxOutputTokens: 4096,
     });
-    const executeRequest = provider.requests.find((request) => request.tools !== undefined);
+    assert.deepEqual(provider.requests[0]?.tools?.map((tool) => tool.function.name).sort(), [
+      "list_files",
+      "read_file",
+      "search_text",
+    ]);
+    const executeRequest = provider.requests[1];
     assert.deepEqual(executeRequest?.tools?.map((tool) => tool.function.name).sort(), [
       "edit_file",
       "list_files",

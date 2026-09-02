@@ -486,7 +486,7 @@ function validateWriteFileInput(value: unknown): WriteFileInput {
 
 export const writeFileTool: ToolDefinition<WriteFileInput> = {
   name: "write_file",
-  description: "Create a new UTF-8 workspace file after one-shot approval; never overwrite an existing target.",
+  description: "Create a new UTF-8 workspace file safely; never overwrite an existing target.",
   inputSchema: {
     type: "object",
     additionalProperties: false,

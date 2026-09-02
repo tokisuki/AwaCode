@@ -75,7 +75,7 @@ test.after(async () => {
   await Promise.all(temporaryDirectories.map((directory) => rm(directory, { recursive: true, force: true })));
 });
 
-test("built CLI completes a read, failing test, approved edit, and passing test workflow", async () => {
+test("built CLI completes a read, failing test, automatic edit, and approved passing test workflow", async () => {
   const dataRoot = await temporaryDirectory("workflow-data");
   const workspace = await temporaryDirectory("workflow-workspace");
   await writeFile(join(workspace, "app.mjs"), "export function total() { return 1; }\n", "utf8");
@@ -114,7 +114,7 @@ test("built CLI completes a read, failing test, approved edit, and passing test 
     while (approvals < requested) {
       approvals += 1;
       child.child.stdin.write("allow_once\n");
-      if (approvals === 3) child.child.stdin.end();
+      if (approvals === 2) child.child.stdin.end();
     }
   };
   child.child.stdout.on("data", onOutput);
@@ -123,7 +123,7 @@ test("built CLI completes a read, failing test, approved edit, and passing test 
     const [code, signal] = await withTimeout(child.closed, 20_000, "Headless workflow CLI");
     assert.equal(code, 0);
     assert.equal(signal, null);
-    assert.equal(approvals, 3);
+    assert.equal(approvals, 2);
     assert.equal(await readFile(join(workspace, "app.mjs"), "utf8"), "export function total() { return 2; }\n");
     assert.equal(server.requests.length, 7);
     assert.ok(server.requests.every((request) => request.url === "/v1/chat/completions"));
@@ -172,12 +172,8 @@ test("killed Core converges an awaiting approval call and resume remains display
   const workspace = await temporaryDirectory("recovery-workspace");
   await writeFile(join(workspace, "demo.txt"), "old\n", "utf8");
   const server = await startScriptedOpenAI([
-    textTurn("Plan: update demo.txt."),
-    toolTurn("call-crash-edit", "edit_file", {
-      path: "demo.txt",
-      old_text: "old",
-      new_text: "new",
-    }),
+    textTurn("Plan: run the requested command."),
+    toolTurn("call-crash-command", "run_command", { command: "echo never" }),
   ]);
   try {
   const env = modelEnvironment(dataRoot, server.baseUrl);
@@ -266,7 +262,7 @@ test("killed Core converges an awaiting approval call and resume remains display
     const stdout = Buffer.concat(resumeOutput.stdout).toString("utf8");
     assert.match(stdout, new RegExp(`Session ${sessionId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
     assert.match(stdout, /\[interrupted\]/);
-    assert.match(stdout, /tool 1 edit_file \[interrupted\]/);
+    assert.match(stdout, /tool 1 run_command \[interrupted\]/);
     assert.doesNotMatch(stdout, /\[phase\]|\[result\]|Decision \(allow_once/);
     assert.equal(Buffer.concat(resumeOutput.stderr).toString("utf8"), "");
     assert.equal(await readFile(join(workspace, "demo.txt"), "utf8"), "old\n");
