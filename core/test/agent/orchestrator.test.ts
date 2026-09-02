@@ -301,6 +301,49 @@ test("Execute explicitly replaces Plan's read-only tool boundary before asking t
   }
 });
 
+test("Plan describes later Execute capabilities while exposing only read-only tool schemas", async () => {
+  const f = await fixture("plan-future-tools");
+  const registry = new ToolRegistry();
+  registry.register(readFileTool);
+  registry.register(editFileTool);
+  registry.register(runCommandTool);
+  let turn = 0;
+  const provider: ModelProvider = {
+    async stream(request) {
+      turn += 1;
+      if (turn === 1) {
+        assert.deepEqual(request.tools?.map((tool) => tool.function.name), ["read_file"]);
+        const system = request.messages
+          .filter((message) => message.role === "system")
+          .map((message) => message.content)
+          .join("\n");
+        assert.match(system, /Execute[^\n]*edit_file/is);
+        assert.match(system, /Execute[^\n]*run_command/is);
+        assert.match(system, /do not claim[^\n]*(?:session|environment)[^\n]*lacks/is);
+        return response("Inspect now; edit and test during Execute.");
+      }
+      assert.deepEqual(request.tools?.map((tool) => tool.function.name), ["edit_file", "read_file", "run_command"]);
+      return response("Ready to execute.");
+    },
+  };
+  const orchestrator = new AgentOrchestrator({
+    store: f.store,
+    provider,
+    tools: registry,
+    permissionClient: allowPermission,
+    workspace: f.workspace,
+    contextLimit: 32_768,
+    maxOutputTokens: 4_096,
+  });
+
+  try {
+    const result = await orchestrator.run({ sessionId: f.sessionId, prompt: "Inspect the project" });
+    assert.equal(result.finalText, "Ready to execute.");
+  } finally {
+    f.connection.close();
+  }
+});
+
 test("an explicit command request rejects one tool-free claim and completes only after run_command evidence", async () => {
   const f = await fixture("command-evidence");
   const order: string[] = [];

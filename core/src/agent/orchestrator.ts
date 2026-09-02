@@ -118,11 +118,14 @@ interface ExecutionEvidenceRequirement {
   readonly toolNames: readonly string[];
 }
 
-const PLAN_PROMPT = "Inspect the workspace with the available read-only tools when useful, then return a concise actionable plan.";
-const PLAN_FINAL_PROMPT = "Read-only exploration is finished. Do not call tools. Return a concise actionable plan now.";
+const executeToolNames = (definitions: readonly FunctionToolDefinition[]) =>
+  definitions.map((definition) => definition.function.name).join(", ") || "none";
+const planPrompt = (definitions: readonly FunctionToolDefinition[]) =>
+  `Inspect the workspace with the currently callable read-only tools when useful, then return a concise actionable plan. The read-only restriction applies only during Plan. The tools that will be callable during Execute are: ${executeToolNames(definitions)}. File editing, file creation, and command execution are intentionally unavailable only during Plan. Do not claim that the session or environment lacks these capabilities; plan to use the Execute tools when the task needs them.`;
+const planFinalPrompt = (definitions: readonly FunctionToolDefinition[]) =>
+  `Read-only exploration is finished. Do not call tools. Return a concise actionable plan now. The tools that will be callable during Execute are: ${executeToolNames(definitions)}. Do not claim that the session or environment lacks these capabilities.`;
 const executePrompt = (definitions: readonly FunctionToolDefinition[]) => {
-  const names = definitions.map((definition) => definition.function.name).join(", ") || "none";
-  return `The Plan phase's read-only tool restriction has ended. The current Execute tools are: ${names}. Execute the coding task using these current tools when useful; do not rely on Plan statements that a current tool was unavailable. Return the final answer when work is complete.`;
+  return `The Plan phase's read-only tool restriction has ended. The current Execute tools are: ${executeToolNames(definitions)}. Execute the coding task using these current tools when useful; do not rely on Plan statements that a current tool was unavailable. Return the final answer when work is complete.`;
 };
 
 function requiredExecutionEvidence(prompt: string): ExecutionEvidenceRequirement[] {
@@ -350,6 +353,7 @@ export class AgentOrchestrator {
   }
 
   private async planUntilReady(sessionId: string, currentUserMessageId: string): Promise<StreamedTurn | null> {
+    const executeDefinitions = toolDefinitions(this.options.tools);
     const definitions = toolDefinitions(this.options.tools, PLAN_TOOL_NAMES);
     const availableNames = new Set(definitions.map((definition) => definition.function.name));
     for (let turnNumber = 1; turnNumber <= MAX_PLAN_TURNS; turnNumber += 1) {
@@ -358,7 +362,7 @@ export class AgentOrchestrator {
         currentUserMessageId,
         "plan",
         definitions,
-        PLAN_PROMPT,
+        planPrompt(executeDefinitions),
         false,
       );
       if (plan.response.toolCalls.length === 0) {
@@ -404,7 +408,7 @@ export class AgentOrchestrator {
       currentUserMessageId,
       "plan",
       [],
-      PLAN_FINAL_PROMPT,
+      planFinalPrompt(executeDefinitions),
       false,
     );
     if (finalPlan.response.toolCalls.length > 0) {
