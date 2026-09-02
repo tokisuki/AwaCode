@@ -16,6 +16,7 @@ import type { JsonRpcPeer } from "../protocol/rpc-peer.ts";
 import {
   AgentBusyError,
   AgentCancelledError,
+  AgentRunError,
   type AgentRunInput,
   type AgentRunResult,
 } from "../agent/orchestrator.ts";
@@ -201,6 +202,9 @@ function agentFault(error: unknown): never {
       reason: error.code,
       ...(detail === undefined ? {} : { detail }),
     });
+  }
+  if (error instanceof AgentRunError) {
+    throw new RpcFault(RPC_ERROR_CODES.agentRun, "Agent run could not complete", { reason: error.code });
   }
   if (error instanceof ModelConfigOperationError) {
     return configFault(error);

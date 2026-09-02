@@ -257,6 +257,48 @@ test("Plan and serial tools commit the first tool-free Execute response without 
   }
 });
 
+test("Plan exhausts its read turns by forcing one tool-free plan before Execute", async () => {
+  const f = await fixture("plan-finalization");
+  const order: string[] = [];
+  const registry = new ToolRegistry();
+  registry.register(scriptedTool("read_file", order));
+  const provider = new ScriptedProvider([
+    ...Array.from({ length: 12 }, (_, index) => response("", [{
+      id: `plan-read-${index + 1}`,
+      name: "read_file",
+      arguments: JSON.stringify({ value: `file-${index + 1}` }),
+    }])),
+    response("Inspect the memory files, then explain their lifecycle."),
+    response("The memory module stores durable project facts."),
+  ]);
+  const orchestrator = new AgentOrchestrator({
+    store: f.store,
+    provider,
+    tools: registry,
+    permissionClient: allowPermission,
+    workspace: f.workspace,
+    contextLimit: 32_768,
+    maxOutputTokens: 4_096,
+    createRunId: () => "run-plan-finalization",
+  });
+
+  try {
+    assert.deepEqual(await orchestrator.run({ sessionId: f.sessionId, prompt: "Explain memory" }), {
+      runId: "run-plan-finalization",
+      finalText: "The memory module stores durable project facts.",
+      status: "completed",
+      reason: "model_stop",
+      modelTurns: 14,
+      toolCalls: 12,
+    });
+    assert.equal(provider.requests[12]?.tools, undefined);
+    assert.equal(provider.requests[13]?.tools?.[0]?.function.name, "read_file");
+    assert.equal(f.store.loadSession(f.sessionId).session.status, "completed");
+  } finally {
+    f.connection.close();
+  }
+});
+
 test("Plan executes only advertised structured read calls and never treats DSML text as a tool", async () => {
   const f = await fixture("plan-read-loop");
   await writeFile(join(f.workspace.rootPath, "README.md"), "AwaCode fixture", "utf8");

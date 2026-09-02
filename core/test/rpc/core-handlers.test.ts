@@ -14,6 +14,7 @@ import { SessionStore } from "../../src/persistence/session-store.ts";
 import { JsonRpcPeer } from "../../src/protocol/rpc-peer.ts";
 import { RpcFault } from "../../src/protocol/json-rpc.ts";
 import { registerCoreHandlers } from "../../src/rpc/core-handlers.ts";
+import { AgentRunError } from "../../src/agent/orchestrator.ts";
 import { ContextBudgetError, ContextCompressionError } from "../../src/context/context-manager.ts";
 import { ModelRequestError, OpenAIChatClient } from "../../src/llm/openai-chat-client.ts";
 
@@ -255,6 +256,32 @@ test("model request failures cross RPC with a bounded safe diagnostic instead of
         && error.message === "Model request failed"
         && (error.data as { reason?: unknown }).reason === "request_failed"
         && (error.data as { detail?: unknown }).detail === "reasoning_content must be passed back");
+  } finally {
+    client.close();
+    server.close();
+    connection.close();
+  }
+});
+
+test("agent run boundary failures cross RPC as an explicit application error", async () => {
+  const dataRoot = await temporaryDirectory("agent-run-error-data");
+  const connection = await openDatabase({ env: { AWACODE_DATA_DIR: dataRoot } });
+  const store = new SessionStore(connection.db);
+  const { client, server } = connectedPeers();
+  registerCoreHandlers(server, {
+    store,
+    configService: new ModelConfigService({ env: { AWACODE_DATA_DIR: dataRoot } }),
+    agent: {
+      async run() { throw new AgentRunError("Plan could not be finalized."); },
+      cancel() { return false; },
+    },
+  });
+  try {
+    await assert.rejects(client.request("agent/run", { sessionId: "session", prompt: "continue" }),
+      (error: unknown) => error instanceof RpcFault
+        && error.code === -32009
+        && error.message === "Agent run could not complete"
+        && (error.data as { reason?: unknown }).reason === "agent_run_error");
   } finally {
     client.close();
     server.close();

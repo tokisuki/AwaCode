@@ -114,6 +114,7 @@ interface ExecuteOutcome {
 }
 
 const PLAN_PROMPT = "Inspect the workspace with the available read-only tools when useful, then return a concise actionable plan.";
+const PLAN_FINAL_PROMPT = "Read-only exploration is finished. Do not call tools. Return a concise actionable plan now.";
 const EXECUTE_PROMPT = "Execute the coding task using tools when useful. Return the final answer when work is complete.";
 const PLAN_TOOL_NAMES = new Set(["list_files", "read_file", "search_text"]);
 const MAX_PLAN_TURNS = 12;
@@ -356,7 +357,28 @@ export class AgentOrchestrator {
         throw new AgentRunError("Plan reached the tool call limit.");
       }
     }
-    throw new AgentRunError("Plan reached the model turn limit.");
+    const finalPlan = await this.providerTurn(
+      sessionId,
+      currentUserMessageId,
+      "plan",
+      [],
+      PLAN_FINAL_PROMPT,
+      false,
+    );
+    if (finalPlan.response.toolCalls.length > 0) {
+      await this.persistRejectedToolCalls(finalPlan, sessionId, "Tools are disabled during Plan finalization.");
+      throw new AgentRunError("Plan finalization returned unexpected tool calls.");
+    }
+    if (finalPlan.response.finishReason !== "stop") {
+      throw new AgentRunError(
+        `Plan finalization ended with unsupported finish reason: ${finalPlan.response.finishReason ?? "missing"}.`,
+      );
+    }
+    this.options.store.finalizeStreamingAssistantMessage({
+      messageId: finalPlan.message.id,
+      kind: "plan",
+      payload: this.messagePayload(finalPlan.response.content, "plan", this.reasoningPayload(finalPlan.response)),
+    });
   }
 
   private async executeUntilFinal(
