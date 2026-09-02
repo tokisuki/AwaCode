@@ -21,7 +21,7 @@ private slots:
   void conversationPaneDominatesAndKeepsComposerDirectlyBelowMessages();
   void userAndAssistantMessagesRenderAsOpposingConversationBubbles();
   void conversationRefreshPreservesAReadersScrollPosition();
-  void conversationBubblesHaveOneConsistentReadableWidth();
+  void shortConversationBubblesFitTheirContent();
   void textShorterThanTheBubbleStaysOnOneLine();
   void loadsThePackagedAwaBrandLogo();
   void rendersUserAndAssistantBubblesWithDistinctBrandAndNeutralSurfaces();
@@ -30,6 +30,8 @@ private slots:
   void hydratesPayloadMessagesAndToolCalls();
   void ignoresBusyWithoutADispatchedRequestId();
   void displaysRpcErrorsAndRestoresRunState();
+  void cancellationIsShownAsAStatusInsteadOfACoreError();
+  void phaseMessagesUsePlainNamesWithoutBrackets();
   void keepsStreamBeforeLaterTranscriptEventsAndClearsCommittedStateForNextRun();
   void marksInterruptedContentAfterCoreCrash();
   void marksUnexpectedEofRestartable();
@@ -119,20 +121,29 @@ void MainWindowTest::conversationRefreshPreservesAReadersScrollPosition() {
   QCOMPARE(view.verticalScrollBar()->value(), readingPosition);
 }
 
-void MainWindowTest::conversationBubblesHaveOneConsistentReadableWidth() {
+void MainWindowTest::shortConversationBubblesFitTheirContent() {
   ConversationView view;
   view.resize(760, 420);
   view.setMessages({
-    {QStringLiteral("user"), QStringLiteral("Short question")},
-    {QStringLiteral("assistant"), QStringLiteral("A somewhat longer answer that still fits comfortably.")},
+    {QStringLiteral("user"), QStringLiteral("OK")},
+    {QStringLiteral("assistant"), QString(240, QLatin1Char('A'))},
   });
   view.show();
   QCoreApplication::processEvents();
 
   const auto bubbles = view.findChildren<QFrame *>(QStringLiteral("messageBubble"));
   QCOMPARE(bubbles.size(), 2);
-  QCOMPARE(bubbles[0]->width(), bubbles[1]->width());
-  QVERIFY(bubbles[0]->width() >= 500);
+  QFrame *userBubble = nullptr;
+  QFrame *assistantBubble = nullptr;
+  for (QFrame *bubble : bubbles) {
+    if (bubble->property("messageRole") == QStringLiteral("user")) userBubble = bubble;
+    if (bubble->property("messageRole") == QStringLiteral("assistant")) assistantBubble = bubble;
+  }
+  QVERIFY(userBubble != nullptr);
+  QVERIFY(assistantBubble != nullptr);
+  QVERIFY(userBubble->width() < 180);
+  QVERIFY(assistantBubble->width() >= 500);
+  QVERIFY(userBubble->width() < assistantBubble->width());
 }
 
 void MainWindowTest::textShorterThanTheBubbleStaysOnOneLine() {
@@ -424,10 +435,10 @@ void MainWindowTest::keepsStreamBeforeLaterTranscriptEventsAndClearsCommittedSta
   window.receiveNotification("stream/text", QJsonObject{{"messageId", "first"}, {"delta", "first answer"}, {"provisional", true}});
   QTRY_VERIFY_WITH_TIMEOUT(window.transcriptText().contains(QStringLiteral("first answer")), 200);
   window.receiveNotification("agent/phase", QJsonObject{{"phase", "reflect"}});
-  QVERIFY(window.transcriptText().indexOf(QStringLiteral("first answer")) < window.transcriptText().indexOf(QStringLiteral("[reflect]")));
+  QVERIFY(window.transcriptText().indexOf(QStringLiteral("first answer")) < window.transcriptText().indexOf(QStringLiteral("Reflect")));
   window.receiveNotification("stream/commit", QJsonObject{{"messageId", "first"}});
   QVERIFY(!window.transcriptText().contains(QStringLiteral("[provisional] first answer")));
-  QVERIFY(window.transcriptText().indexOf(QStringLiteral("first answer")) < window.transcriptText().indexOf(QStringLiteral("[reflect]")));
+  QVERIFY(window.transcriptText().indexOf(QStringLiteral("first answer")) < window.transcriptText().indexOf(QStringLiteral("Reflect")));
   window.setConfigured(true);
   auto *taskInput = window.findChild<QPlainTextEdit *>(QStringLiteral("taskInput"));
   QVERIFY(taskInput != nullptr);
@@ -502,6 +513,34 @@ void MainWindowTest::displaysRpcErrorsAndRestoresRunState() {
   QVERIFY(window.runButton()->isEnabled());
   QVERIFY(window.transcriptText().contains(QStringLiteral("Model request failed")));
   QVERIFY(window.transcriptText().contains(QStringLiteral("reasoning_content must be passed back")));
+}
+
+void MainWindowTest::cancellationIsShownAsAStatusInsteadOfACoreError() {
+  MainWindow window;
+  window.receiveError("agent/run", QJsonObject{{"code", -32005}, {"message", "Agent run cancelled"}});
+
+  QVERIFY(window.transcriptText().contains(QStringLiteral("Run cancelled.")));
+  QVERIFY(!window.transcriptText().contains(QStringLiteral("Core error")));
+  QPlainTextEdit *diagnostics = nullptr;
+  for (QPlainTextEdit *editor : window.findChildren<QPlainTextEdit *>()) {
+    if (editor->isReadOnly()) diagnostics = editor;
+  }
+  QVERIFY(diagnostics != nullptr);
+  QVERIFY(!diagnostics->toPlainText().contains(QStringLiteral("Agent run cancelled")));
+}
+
+void MainWindowTest::phaseMessagesUsePlainNamesWithoutBrackets() {
+  MainWindow window;
+  window.receiveNotification("agent/phase", QJsonObject{{"phase", "plan"}});
+  window.receiveNotification("agent/phase", QJsonObject{{"phase", "execute"}});
+  window.receiveNotification("agent/phase", QJsonObject{{"phase", "closing"}});
+
+  const QString transcript = window.transcriptText();
+  QVERIFY(transcript.contains(QStringLiteral("Plan")));
+  QVERIFY(transcript.contains(QStringLiteral("Execute")));
+  QVERIFY(transcript.contains(QStringLiteral("Closing")));
+  QVERIFY(!transcript.contains(QLatin1Char('[')));
+  QVERIFY(!transcript.contains(QLatin1Char(']')));
 }
 
 void MainWindowTest::marksInterruptedContentAfterCoreCrash() {

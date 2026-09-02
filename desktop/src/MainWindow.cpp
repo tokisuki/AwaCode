@@ -238,7 +238,9 @@ void MainWindow::receiveNotification(const QString &method, const QJsonObject &p
     }
     renderTranscript();
   } else if (method == QStringLiteral("agent/phase")) {
-    appendTranscript(QStringLiteral("\n[%1]\n").arg(params.value("phase").toString()));
+    QString phase = params.value("phase").toString();
+    if (!phase.isEmpty()) phase[0] = phase[0].toUpper();
+    appendTranscript(QStringLiteral("\n%1\n").arg(phase));
   } else if (method == QStringLiteral("tool/start")) {
     tools_.started(params);
   } else if (method == QStringLiteral("tool/end")) {
@@ -521,6 +523,12 @@ void MainWindow::handleResponseError(const QString &id, const QJsonObject &error
 }
 
 void MainWindow::receiveError(const QString &method, const QJsonObject &error) {
+  if (method == QStringLiteral("agent/run") && error.value("code").toInt() == -32005) {
+    appendTranscript(QStringLiteral("\nRun cancelled.\n"));
+    currentRunRequestId_.clear();
+    setRunning(false);
+    return;
+  }
   const QString message = error.value("message").toString(QStringLiteral("Core request failed"));
   const QString detail = error.value("data").toObject().value("detail").toString();
   const QString display = detail.isEmpty() ? message : QStringLiteral("%1: %2").arg(message, detail);

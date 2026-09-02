@@ -111,18 +111,27 @@ void ConversationView::resizeEvent(QResizeEvent *event) {
 
 void ConversationView::updateBubbleWidths() {
   const int availableWidth = qMax(240, viewport()->width() - 24);
-  const int bubbleWidth = qMin(680, availableWidth * 7 / 8);
+  const int maximumBubbleWidth = qMin(680, availableWidth * 7 / 8);
   for (QFrame *bubble : content_->findChildren<QFrame *>(QStringLiteral("messageBubble"))) {
-    bubble->setFixedWidth(bubbleWidth);
     if (auto *text = bubble->findChild<QLabel *>(QStringLiteral("messageText"))) {
+      int naturalTextWidth = 0;
+      for (const QString &line : text->text().split(QLatin1Char('\n'))) {
+        naturalTextWidth = qMax(naturalTextWidth, text->fontMetrics().horizontalAdvance(line));
+      }
+      int desiredContentWidth = naturalTextWidth + 4;
+      for (QLabel *label : bubble->findChildren<QLabel *>(QString(), Qt::FindDirectChildrenOnly)) {
+        if (label != text) desiredContentWidth = qMax(desiredContentWidth, label->sizeHint().width());
+      }
+      const int bubbleWidth = qMin(maximumBubbleWidth, qMax(72, desiredContentWidth + 28));
+      bubble->setFixedWidth(bubbleWidth);
       const int textWidth = qMax(1, bubbleWidth - 28);
       text->setFixedWidth(textWidth);
-      const bool needsWrapping = text->text().contains(QLatin1Char('\n'))
-        || text->fontMetrics().horizontalAdvance(text->text()) > textWidth;
+      const bool needsWrapping = naturalTextWidth > textWidth;
       text->setWordWrap(needsWrapping);
+      const int explicitLineCount = text->text().count(QLatin1Char('\n')) + 1;
       const int textHeight = needsWrapping
         ? text->heightForWidth(textWidth)
-        : text->fontMetrics().lineSpacing();
+        : explicitLineCount * text->fontMetrics().lineSpacing();
       text->setFixedHeight(qMax(text->fontMetrics().lineSpacing(), textHeight));
     }
   }
