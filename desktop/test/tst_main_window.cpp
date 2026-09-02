@@ -2,13 +2,16 @@
 
 #include <QJsonArray>
 #include <QFrame>
+#include <QFontMetrics>
 #include <QListView>
 #include <QLabel>
 #include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QScrollBar>
 #include <QTimer>
 
+#include "ConversationView.h"
 #include "MainWindow.h"
 
 class MainWindowTest final : public QObject {
@@ -17,6 +20,9 @@ class MainWindowTest final : public QObject {
 private slots:
   void conversationPaneDominatesAndKeepsComposerDirectlyBelowMessages();
   void userAndAssistantMessagesRenderAsOpposingConversationBubbles();
+  void conversationRefreshPreservesAReadersScrollPosition();
+  void conversationBubblesHaveOneConsistentReadableWidth();
+  void textShorterThanTheBubbleStaysOnOneLine();
   void loadsThePackagedAwaBrandLogo();
   void rendersUserAndAssistantBubblesWithDistinctBrandAndNeutralSurfaces();
   void disablesRunUntilConfigured();
@@ -90,6 +96,63 @@ void MainWindowTest::userAndAssistantMessagesRenderAsOpposingConversationBubbles
   const int midpoint = conversationView->mapToGlobal(conversationView->rect().center()).x();
   QVERIFY(userBubble->mapToGlobal(userBubble->rect().center()).x() > midpoint);
   QVERIFY(assistantBubble->mapToGlobal(assistantBubble->rect().center()).x() < midpoint);
+}
+
+void MainWindowTest::conversationRefreshPreservesAReadersScrollPosition() {
+  ConversationView view;
+  view.resize(760, 260);
+  QList<ConversationMessage> messages;
+  for (int index = 0; index < 24; ++index) {
+    messages.append({QStringLiteral("assistant"),
+      QStringLiteral("Message %1 has enough content to occupy a visible row.").arg(index)});
+  }
+  view.setMessages(messages);
+  view.show();
+  QTRY_VERIFY_WITH_TIMEOUT(view.verticalScrollBar()->maximum() > 0, 500);
+  const int readingPosition = view.verticalScrollBar()->maximum() / 2;
+  view.verticalScrollBar()->setValue(readingPosition);
+
+  messages.last().text.append(QStringLiteral(" Updated."));
+  view.setMessages(messages);
+  QCoreApplication::processEvents();
+
+  QCOMPARE(view.verticalScrollBar()->value(), readingPosition);
+}
+
+void MainWindowTest::conversationBubblesHaveOneConsistentReadableWidth() {
+  ConversationView view;
+  view.resize(760, 420);
+  view.setMessages({
+    {QStringLiteral("user"), QStringLiteral("Short question")},
+    {QStringLiteral("assistant"), QStringLiteral("A somewhat longer answer that still fits comfortably.")},
+  });
+  view.show();
+  QCoreApplication::processEvents();
+
+  const auto bubbles = view.findChildren<QFrame *>(QStringLiteral("messageBubble"));
+  QCOMPARE(bubbles.size(), 2);
+  QCOMPARE(bubbles[0]->width(), bubbles[1]->width());
+  QVERIFY(bubbles[0]->width() >= 500);
+}
+
+void MainWindowTest::textShorterThanTheBubbleStaysOnOneLine() {
+  ConversationView view;
+  view.resize(760, 300);
+  const QString text = QStringLiteral(
+    "This sentence is deliberately long, but its measured width still fits inside the shared bubble.");
+  view.setMessages({{QStringLiteral("assistant"), text}});
+  view.show();
+  QCoreApplication::processEvents();
+
+  auto *label = view.findChild<QLabel *>(QStringLiteral("messageText"));
+  QVERIFY(label != nullptr);
+  const QFontMetrics metrics(label->font());
+  QVERIFY2(metrics.horizontalAdvance(text) < label->width(),
+    qPrintable(QStringLiteral("text=%1 label=%2").arg(metrics.horizontalAdvance(text)).arg(label->width())));
+  QVERIFY2(label->height() < metrics.lineSpacing() * 2,
+    qPrintable(QStringLiteral("text=%1 label=%2 height=%3 line=%4 heightForWidth=%5")
+      .arg(metrics.horizontalAdvance(text)).arg(label->width()).arg(label->height())
+      .arg(metrics.lineSpacing()).arg(label->heightForWidth(label->width()))));
 }
 
 void MainWindowTest::loadsThePackagedAwaBrandLogo() {

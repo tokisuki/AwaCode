@@ -3,6 +3,7 @@
 #include <QFrame>
 #include <QHBoxLayout>
 #include <QLabel>
+#include <QResizeEvent>
 #include <QScrollBar>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -22,6 +23,9 @@ ConversationView::ConversationView(QWidget *parent) : QScrollArea(parent) {
 }
 
 void ConversationView::setMessages(const QList<ConversationMessage> &messages) {
+  const int previousMaximum = verticalScrollBar()->maximum();
+  const int previousValue = verticalScrollBar()->value();
+  const bool followLatest = previousMaximum == 0 || previousValue >= previousMaximum - 4;
   while (QLayoutItem *item = messages_->takeAt(0)) {
     delete item->widget();
     delete item;
@@ -47,8 +51,7 @@ void ConversationView::setMessages(const QList<ConversationMessage> &messages) {
     auto *bubble = new QFrame(row);
     bubble->setObjectName(QStringLiteral("messageBubble"));
     bubble->setProperty("messageRole", message.role);
-    bubble->setMaximumWidth(680);
-    bubble->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Preferred);
+    bubble->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Preferred);
     auto *bubbleLayout = new QVBoxLayout(bubble);
     bubbleLayout->setContentsMargins(14, 10, 14, 11);
     bubbleLayout->setSpacing(5);
@@ -71,7 +74,7 @@ void ConversationView::setMessages(const QList<ConversationMessage> &messages) {
     text->setTextFormat(Qt::PlainText);
     text->setTextInteractionFlags(Qt::TextSelectableByMouse);
     text->setWordWrap(true);
-    text->setMaximumWidth(640);
+    text->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     bubbleLayout->addWidget(text);
 
     if (message.role == QStringLiteral("user")) {
@@ -88,7 +91,39 @@ void ConversationView::setMessages(const QList<ConversationMessage> &messages) {
     messages_->addWidget(row);
   }
   messages_->addStretch(1);
-  QTimer::singleShot(0, this, [this] { verticalScrollBar()->setValue(verticalScrollBar()->maximum()); });
+  updateBubbleWidths();
+  QTimer::singleShot(0, this, [this, followLatest, previousValue] {
+    messages_->activate();
+    content_->adjustSize();
+    const int target = followLatest
+      ? verticalScrollBar()->maximum()
+      : qMin(previousValue, verticalScrollBar()->maximum());
+    verticalScrollBar()->setValue(target);
+  });
 }
 
 QString ConversationView::plainText() const { return plainText_; }
+
+void ConversationView::resizeEvent(QResizeEvent *event) {
+  QScrollArea::resizeEvent(event);
+  updateBubbleWidths();
+}
+
+void ConversationView::updateBubbleWidths() {
+  const int availableWidth = qMax(240, viewport()->width() - 24);
+  const int bubbleWidth = qMin(680, availableWidth * 7 / 8);
+  for (QFrame *bubble : content_->findChildren<QFrame *>(QStringLiteral("messageBubble"))) {
+    bubble->setFixedWidth(bubbleWidth);
+    if (auto *text = bubble->findChild<QLabel *>(QStringLiteral("messageText"))) {
+      const int textWidth = qMax(1, bubbleWidth - 28);
+      text->setFixedWidth(textWidth);
+      const bool needsWrapping = text->text().contains(QLatin1Char('\n'))
+        || text->fontMetrics().horizontalAdvance(text->text()) > textWidth;
+      text->setWordWrap(needsWrapping);
+      const int textHeight = needsWrapping
+        ? text->heightForWidth(textWidth)
+        : text->fontMetrics().lineSpacing();
+      text->setFixedHeight(qMax(text->fontMetrics().lineSpacing(), textHeight));
+    }
+  }
+}

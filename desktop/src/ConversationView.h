@@ -5,6 +5,7 @@
 #include <QString>
 
 class QVBoxLayout;
+class QResizeEvent;
 class QWidget;
 
 struct ConversationMessage {
@@ -20,7 +21,12 @@ public:
   void setMessages(const QList<ConversationMessage> &messages);
   QString plainText() const;
 
+protected:
+  void resizeEvent(QResizeEvent *event) override;
+
 private:
+  void updateBubbleWidths();
+
   QWidget *content_ = nullptr;
   QVBoxLayout *messages_ = nullptr;
   QString plainText_;
