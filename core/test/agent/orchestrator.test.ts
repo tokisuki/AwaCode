@@ -968,14 +968,18 @@ test("agent RPC maps persisted incomplete tool history to history-integrity with
   }
 });
 
-test("provider context overflow triggers one persisted compression and retries the original turn once", async () => {
+test("provider context overflow compacts through active completed tools and retries with one verbatim current user", async () => {
   const f = await fixture("overflow-retry");
   f.store.insertMessage({ sessionId: f.sessionId, role: "assistant", kind: "text", payload: { text: "older context" } });
+  const order: string[] = [];
+  const registry = new ToolRegistry();
+  registry.register(scriptedTool("alpha", order));
   const requests: ModelStreamRequest[] = [];
   const script: Array<AssistantModelMessage | Error> = [
     response("Plan."),
+    response("", [{ id: "active-tool", name: "alpha", arguments: "{\"value\":\"evidence\"}" }]),
     new ModelContextOverflowError(),
-    response("Goal: finish the request.\nCurrent state: planned."),
+    response("Goal: finish the request. Current state: tool evidence collected."),
     response("Candidate complete."),
   ];
   const provider: ModelProvider = {
@@ -994,7 +998,7 @@ test("provider context overflow triggers one persisted compression and retries t
   const orchestrator = new AgentOrchestrator({
     store: f.store,
     provider,
-    tools: new ToolRegistry(),
+    tools: registry,
     permissionClient: allowPermission,
     workspace: f.workspace,
     contextLimit: 32_768,
@@ -1003,11 +1007,18 @@ test("provider context overflow triggers one persisted compression and retries t
   try {
     const result = await orchestrator.run({ sessionId: f.sessionId, prompt: "Do it" });
     assert.equal(result.status, "completed");
-    assert.equal(requests.length, 4);
-    assert.match(requests[2]?.messages[0]?.content ?? "", /structured rolling summary/i);
-    assert.equal(requests[2]?.maxOutputTokens, 4_096);
-    assert.equal(f.store.loadContextSnapshot(f.sessionId)?.summary, "Goal: finish the request.\nCurrent state: planned.");
-    assert.ok(requests[3]?.messages.some((message) => message.role === "system" && message.content.includes("Conversation summary")));
+    assert.equal(requests.length, 5);
+    assert.match(requests[3]?.messages[0]?.content ?? "", /structured rolling summary/i);
+    assert.equal(requests[3]?.maxOutputTokens, 4_096);
+    assert.ok(requests[3]?.messages.some((message) => message.role === "assistant"
+      && message.toolCalls?.some((call) => call.name === "alpha")));
+    assert.ok(requests[3]?.messages.some((message) => message.role === "tool" && message.toolCallId === "active-tool"));
+    const toolMessage = f.store.loadSession(f.sessionId).messages.find((message) => message.kind === "tool_calls");
+    assert.ok(toolMessage);
+    assert.equal(f.store.loadContextSnapshot(f.sessionId)?.summaryUptoSeq, toolMessage.seq);
+    assert.equal(f.store.loadContextSnapshot(f.sessionId)?.summary, "Goal: finish the request. Current state: tool evidence collected.");
+    assert.ok(requests[4]?.messages.some((message) => message.role === "system" && message.content.includes("Conversation summary")));
+    assert.equal(requests[4]?.messages.filter((message) => message.role === "user" && message.content === "Do it").length, 1);
   } finally {
     f.connection.close();
   }

@@ -43,11 +43,152 @@ test.after(async () => {
   await Promise.all(temporaryDirectories.map((directory) => rm(directory, { recursive: true, force: true })));
 });
 
-test("token estimation and recent budget follow the documented conservative arithmetic", () => {
+test("token estimation and recent budget use the configured input capacity without a legacy cap", () => {
   assert.equal(estimateTextTokens("abcd中🙂"), 3);
-  assert.equal(recentContextBudget(32_768, 4_096), 7_168);
-  assert.equal(recentContextBudget(8_192, 4_096), 2_000);
-  assert.equal(recentContextBudget(100_000, 10_000), 15_000);
+  assert.equal(recentContextBudget(32_768, 4_096), 28_672);
+  assert.equal(recentContextBudget(8_192, 4_096), 4_096);
+  assert.equal(recentContextBudget(1_048_576, 32_000), 1_016_576);
+});
+
+test("a large configured window retains a completed tool block beyond the former recent-history cap", async () => {
+  const { connection, store, session } = await fixture("configured-window");
+  try {
+    const history: ProviderHistoryEntry[] = [
+      {
+        type: "message", messageId: "current", seq: 1, role: "user", kind: "text",
+        payload: { text: "inspect the project" },
+      },
+      {
+        type: "assistant_tool_block", messageId: "large-tool", seq: 2, kind: "tool_calls",
+        payload: { text: "searching" },
+        toolCalls: [{ callId: "search", ordinal: 0, toolName: "search_text", inputText: "{}" }],
+        toolResults: [{
+          callId: "search", ordinal: 0, status: "success", kind: "normal",
+          result: { status: "success", content: "x".repeat(80_000) }, errorText: null,
+        }],
+      },
+      {
+        type: "message", messageId: "latest", seq: 3, role: "assistant", kind: "text",
+        payload: { text: "continue inspecting" },
+      },
+    ];
+    const built = await new ContextManager(store).build({
+      sessionId: session.id,
+      history,
+      currentUserMessageId: "current",
+      systemText: "system",
+      tools: [],
+      contextLimit: 1_048_576,
+      maxOutputTokens: 32_000,
+    });
+
+    assert.deepEqual(built.selectedMessageIds, ["current", "large-tool", "latest"]);
+    assert.equal(built.recentBudget, 1_016_576);
+  } finally {
+    connection.close();
+  }
+});
+
+test("rolling compression may cover completed tool work after the current user while retaining that user verbatim", async () => {
+  const { connection, store, session } = await fixture("active-run-compression");
+  try {
+    const summaryRequests: string[] = [];
+    const manager = new ContextManager(store, {
+      summaryGenerator: async ({ messages }) => {
+        summaryRequests.push(JSON.stringify(messages));
+        return "Current task and completed search were summarized.";
+      },
+    });
+    const built = await manager.build({
+      sessionId: session.id,
+      history: [
+        {
+          type: "message", messageId: "old", seq: 1, role: "assistant", kind: "text",
+          payload: { text: "o".repeat(10_000) },
+        },
+        {
+          type: "message", messageId: "current", seq: 2, role: "user", kind: "text",
+          payload: { text: "inspect this project" },
+        },
+        {
+          type: "assistant_tool_block", messageId: "completed-tool", seq: 3, kind: "tool_calls",
+          payload: { text: "searching" },
+          toolCalls: [{ callId: "search", ordinal: 0, toolName: "search_text", inputText: "{}" }],
+          toolResults: [{
+            callId: "search", ordinal: 0, status: "success", kind: "normal",
+            result: { status: "success", content: "x".repeat(20_000) }, errorText: null,
+          }],
+        },
+        {
+          type: "message", messageId: "latest", seq: 4, role: "assistant", kind: "text",
+          payload: { text: "continue" },
+        },
+      ],
+      currentUserMessageId: "current",
+      systemText: "system",
+      tools: [],
+      contextLimit: 4_000,
+      maxOutputTokens: 1_000,
+    });
+
+    assert.ok(summaryRequests.length >= 1);
+    assert.match(summaryRequests.join("\n"), /inspect this project/);
+    assert.match(summaryRequests.join("\n"), /search_text/);
+    assert.equal(store.loadContextSnapshot(session.id)?.summaryUptoSeq, 3);
+    assert.deepEqual(built.selectedMessageIds, ["current", "latest"]);
+    assert.equal(built.messages.filter((message) => message.role === "user" && message.content === "inspect this project").length, 1);
+  } finally {
+    connection.close();
+  }
+});
+
+test("rolling compression continues when the replacement summary displaces another completed block", async () => {
+  const { connection, store, session } = await fixture("multi-pass-compression");
+  try {
+    const summaryRequests: string[] = [];
+    const manager = new ContextManager(store, {
+      summaryGenerator: async ({ messages }) => {
+        summaryRequests.push(JSON.stringify(messages));
+        return summaryRequests.length === 1 ? "s".repeat(4_000) : "final compact summary";
+      },
+    });
+    const built = await manager.build({
+      sessionId: session.id,
+      history: [
+        {
+          type: "message", messageId: "old", seq: 1, role: "assistant", kind: "text",
+          payload: { text: "o".repeat(3_000) },
+        },
+        {
+          type: "assistant_tool_block", messageId: "recent", seq: 2, kind: "tool_calls",
+          payload: { text: "large completed read" },
+          toolCalls: [{ callId: "read", ordinal: 0, toolName: "read_file", inputText: "{}" }],
+          toolResults: [{
+            callId: "read", ordinal: 0, status: "success", kind: "normal",
+            result: { status: "success", content: "r".repeat(10_400) }, errorText: null,
+          }],
+        },
+        {
+          type: "message", messageId: "current", seq: 3, role: "user", kind: "text",
+          payload: { text: "continue" },
+        },
+      ],
+      currentUserMessageId: "current",
+      systemText: "system",
+      tools: [],
+      contextLimit: 4_000,
+      maxOutputTokens: 1_000,
+    });
+
+    assert.equal(summaryRequests.length, 2);
+    assert.match(summaryRequests[0]!, /\"o{100}/);
+    assert.match(summaryRequests[1]!, /read_file/);
+    assert.equal(store.loadContextSnapshot(session.id)?.summaryUptoSeq, 3);
+    assert.deepEqual(built.selectedMessageIds, ["current"]);
+    assert.equal(built.messages.filter((message) => message.role === "user" && message.content === "continue").length, 1);
+  } finally {
+    connection.close();
+  }
 });
 
 test("context selection keeps newest whole tool blocks and the current user message in chronological order", async () => {
@@ -162,7 +303,8 @@ test("system context changes persist as events until compression promotes their 
     assert.deepEqual(rebuilt.messages.slice(0, 2), built.messages.slice(0, 2));
     assert.equal(store.loadSession(session.id).messages.filter((message) => message.kind === "system_context_update").length, 1);
 
-    store.insertMessage({ sessionId: session.id, role: "assistant", kind: "text", payload: { text: "x".repeat(9_000) } });
+    store.insertMessage({ sessionId: session.id, role: "assistant", kind: "text", payload: { text: "x".repeat(16_000) } });
+    store.insertMessage({ sessionId: session.id, role: "assistant", kind: "text", payload: { text: "y".repeat(16_000) } });
     const latest = store.insertMessage({ sessionId: session.id, role: "user", kind: "text", payload: { text: "continue" } });
     const compacting = new ContextManager(store, { summaryGenerator: async () => "compressed history" });
     const compacted = await compacting.build({
@@ -334,10 +476,10 @@ test("jointly oversized protected messages fail instead of summarizing either on
   const { connection, store, session } = await fixture("protected-too-large");
   try {
     const candidate = store.insertMessage({
-      sessionId: session.id, role: "assistant", kind: "text", payload: { text: "c".repeat(5_000) },
+      sessionId: session.id, role: "assistant", kind: "text", payload: { text: "c".repeat(16_000) },
     });
     const current = store.insertMessage({
-      sessionId: session.id, role: "user", kind: "text", payload: { text: "u".repeat(5_000) },
+      sessionId: session.id, role: "user", kind: "text", payload: { text: "u".repeat(16_000) },
     });
     let summaryCalls = 0;
     const manager = new ContextManager(store, { summaryGenerator: async () => {
@@ -356,33 +498,38 @@ test("jointly oversized protected messages fail instead of summarizing either on
   } finally { connection.close(); }
 });
 
-test("compression never advances its cutoff across a protected history block", async () => {
+test("active-run compression crosses the current user but stops before another protected candidate", async () => {
   const { connection, store, session } = await fixture("protected-cutoff-barrier");
   try {
     const original = store.insertMessage({
       sessionId: session.id, role: "user", kind: "text", payload: { text: "original user request" },
     });
-    store.insertMessage({
-      sessionId: session.id, role: "assistant", kind: "plan", payload: { text: "p".repeat(9_000) },
-    });
+    for (let index = 0; index < 4; index += 1) {
+      store.insertMessage({
+        sessionId: session.id, role: "assistant", kind: "plan", payload: { text: String(index).repeat(5_000) },
+      });
+    }
     const candidate = store.insertMessage({
       sessionId: session.id, role: "assistant", kind: "text",
       payload: { text: "pending candidate", candidateStatus: "pending" },
     });
-    let summaryCalls = 0;
-    const manager = new ContextManager(store, { summaryGenerator: async () => {
-      summaryCalls += 1;
-      return "illegal summary";
+    const summarized: string[] = [];
+    const manager = new ContextManager(store, { summaryGenerator: async ({ messages }) => {
+      summarized.push(JSON.stringify(messages));
+      return "active work summary";
     } });
-    await assert.rejects(manager.build({
+    const built = await manager.build({
       sessionId: session.id,
       history: validateProviderHistory(store, session.id),
       currentUserMessageId: original.id,
       protectedMessageIds: [original.id, candidate.id],
-      systemText: "system", tools: [], contextLimit: 8_000, maxOutputTokens: 1_000,
-    }), ContextBudgetError);
-    assert.equal(summaryCalls, 0);
-    assert.equal(store.loadContextSnapshot(session.id)?.summaryUptoSeq, 0);
+      systemText: "system", tools: [], contextLimit: 4_000, maxOutputTokens: 1_000,
+    });
+    assert.ok(summarized.length > 0);
+    assert.equal(summarized.some((request) => request.includes("pending candidate")), false);
+    assert.ok((store.loadContextSnapshot(session.id)?.summaryUptoSeq ?? 0) < candidate.seq);
+    assert.equal(built.selectedMessageIds.includes(original.id), true);
+    assert.equal(built.selectedMessageIds.includes(candidate.id), true);
   } finally { connection.close(); }
 });
 
@@ -548,7 +695,7 @@ test("rolling compression replaces the old summary, truncates tool output, and a
     const toolResult = request?.messages.find((message) => message.role === "tool");
     assert.ok(toolResult);
     assert.ok((toolResult.content?.length ?? 0) <= 2_000);
-    assert.deepEqual(store.loadContextSnapshot(session.id)?.summaryUptoSeq, 2);
+    assert.deepEqual(store.loadContextSnapshot(session.id)?.summaryUptoSeq, 3);
     assert.equal(store.loadContextSnapshot(session.id)?.summary, "replacement summary");
   } finally {
     connection.close();

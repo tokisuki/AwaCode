@@ -83,8 +83,7 @@ export function estimateTextTokens(value: string): number {
 }
 
 export function recentContextBudget(contextLimit: number, maxOutputTokens: number): number {
-  const usable = contextLimit - maxOutputTokens;
-  return Math.min(15_000, Math.max(2_000, Math.floor(usable * 0.25)));
+  return contextLimit - maxOutputTokens;
 }
 
 function payloadText(payload: unknown): string {
@@ -208,7 +207,7 @@ export class ContextManager {
   }
 
   async build(input: BuildContextInput): Promise<BuiltContext> {
-    return this.buildInternal(input, true);
+    return this.buildInternal(input);
   }
 
   async compressForOverflow(input: BuildContextInput): Promise<boolean> {
@@ -223,7 +222,12 @@ export class ContextManager {
     if (protectedEntries.length !== protectedIds.size) {
       throw new ContextBudgetError();
     }
-    const protectedBarrierSeq = Math.min(...protectedEntries.map((entry) => entry.seq));
+    const protectedBarrierSeq = Math.min(
+      ...protectedEntries
+        .filter((entry) => entry.messageId !== input.currentUserMessageId)
+        .map((entry) => entry.seq),
+      Number.POSITIVE_INFINITY,
+    );
     const candidates = effectiveHistory
       .filter((entry) => entry.seq > cutoff && entry.seq < protectedBarrierSeq)
       .map(entryBlock);
@@ -236,7 +240,7 @@ export class ContextManager {
     return true;
   }
 
-  private async buildInternal(input: BuildContextInput, allowCompression: boolean): Promise<BuiltContext> {
+  private async buildInternal(input: BuildContextInput): Promise<BuiltContext> {
     const usable = input.contextLimit - input.maxOutputTokens;
     const recentBudget = recentContextBudget(input.contextLimit, input.maxOutputTokens);
     const existing = this.store.loadContextSnapshot(input.sessionId);
@@ -358,14 +362,16 @@ export class ContextManager {
     }
     const selectedBlocks = blocks.filter((_, index) => selected.has(index));
     const evictedBlocks = blocks.filter((block, index) => !selected.has(index) && !protectedIds.has(block.messageId));
-    if (allowCompression && evictedBlocks.length > 0 && this.summaryGenerator !== undefined) {
-      const protectedBarrierSeq = Math.min(...requiredIndices.map((index) => blocks[index]!.seq));
+    if (evictedBlocks.length > 0 && this.summaryGenerator !== undefined) {
       const compressiblePrefix: ModelBlock[] = [];
       for (const [index, block] of blocks.entries()) {
-        if (block.seq >= protectedBarrierSeq || selected.has(index)) break;
+        if (selected.has(index)) {
+          if (block.messageId !== input.currentUserMessageId) break;
+          if (block.seq <= summaryCutoff) continue;
+        }
         compressiblePrefix.push(block);
       }
-      if (compressiblePrefix.length === 0) {
+      if (compressiblePrefix.length === 0 || !compressiblePrefix.some((block) => evictedBlocks.includes(block))) {
         throw new ContextBudgetError();
       }
       const maxEvictedSeq = compressiblePrefix.at(-1)!.seq;
@@ -379,10 +385,7 @@ export class ContextManager {
         persistedSource,
         [...compressiblePrefix, ...systemUpdateBlocks].sort((left, right) => left.seq - right.seq),
       );
-      return this.buildInternal(input, false);
-    }
-    if (!allowCompression && evictedBlocks.length > 0 && this.summaryGenerator !== undefined) {
-      throw new ContextBudgetError();
+      return this.buildInternal(input);
     }
     const messages = [...prefix, ...selectedBlocks.flatMap((block) => block.messages), ...suffix];
     return {

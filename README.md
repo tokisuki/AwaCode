@@ -39,7 +39,7 @@ $env:AWACODE_MODEL = "deepseek-v4-flash"
 $env:AWACODE_API_KEY = "YOUR_API_KEY"
 ```
 
-环境变量优先于本地文件。可选的 `AWACODE_CONTEXT_LIMIT` 和 `AWACODE_MAX_OUTPUT_TOKENS` 必须为正整数，且后者小于前者。未提供完整有效配置时，Core 返回 `not_configured`；不会偷偷连到测试模型或任何线上提供方。
+环境变量优先于本地文件。可选的 `AWACODE_CONTEXT_LIMIT` 和 `AWACODE_MAX_OUTPUT_TOKENS` 必须为正整数，且后者小于前者。Core 会把两者之差全部作为输入容量，再扣除系统提示、记忆、摘要、阶段指令和工具 Schema 的实际估算量；不会另设固定比例或固定小型近期历史窗口。未提供完整有效配置时，Core 返回 `not_configured`；不会偷偷连到测试模型或任何线上提供方。
 
 运行薄 CLI：
 
