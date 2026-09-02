@@ -1,8 +1,10 @@
 AwaCode：本地桌面编程智能体
 仓库：https://github.com/tokisuki/AwaCode
 
-运行：安装 Node.js 24；进入 core 执行 npm ci、npm run build；由用户在桌面端 Settings 配置自己的 OpenAI-compatible Base URL、模型和 API Key，然后执行 npm run cli -- --workspace "项目路径" --prompt "任务"。桌面端还需 Qt 6.8.3+ MinGW 13.1、CMake 和 Ninja，构建方法见 README.md。
+运行：Windows 安装 Node.js 24；进入 core 执行 npm ci、npm run build。桌面端还需 Qt 6.8.3+ MinGW 13.1、CMake 和 Ninja，按 README.md 完成一次构建后可双击 start-awacode.cmd 启动。首次使用由用户在 Settings 中配置自己的 OpenAI-compatible Base URL、模型、上下文窗口、最大输出和 API Key；也可使用命令行客户端。凭据仅保存在环境变量或未入库的本地文件中。
 
-功能：Qt 控制台和命令行都通过 JSON-RPC 管理 TypeScript Core。Core 自行实现会话 SQLite 持久化、流式模型调用、可读取项目的 Plan + Execute 工具循环、上下文滚动摘要、全局/项目显式记忆、崩溃恢复，以及列举、读取、搜索、精确编辑、新建文件和命令等本地工具。模型的用户可见回复固定为纯文本；读写文件自动允许，命令每次需 allow_once 或 deny。
+特色功能：项目不是现成 Agent 产品的界面封装，也未使用任何 Agent 框架或 SDK。Qt 客户端只负责会话、展示和审批，通过 NDJSON JSON-RPC 管理自行实现的 TypeScript Core。Core 使用模型原生 function calling 完成可先读取项目的 Plan + Execute 循环，提供列举、读取、搜索、精确编辑、新建文件、执行命令和显式记忆七个本地工具。文件操作经过工作区路径守卫、内容复核和原子写入后自动执行；命令显示实际命令、工作目录和风险提示，每次只允许 allow_once 或 deny。
 
-限制：仅验证 Windows + Node 24 + Qt 6.8.3+ MinGW 13.1；只支持 OpenAI-compatible Chat Completions；没有 MCP、插件、子 Agent、远程执行或系统级沙箱。命令仍以当前用户权限运行。密钥只来自环境变量或未入库本地配置，不能提交或录入视频。
+会话、消息、工具状态和上下文快照持久化到 SQLite，桌面端支持新建、切换和删除会话。崩溃后未完成调用会收敛为 interrupted，历史可以恢复，但不会自动重放写文件或命令。上下文按用户配置的窗口预算构建，超限时生成替换式滚动摘要。长期记忆分为项目级和全局级，仅在用户明确要求记住、更新或忘记时写入，项目记忆优先，避免自动提炼造成污染。Qt 界面还展示流式纯文本回复、工具时间线、取消和 Core 重启状态。
+
+限制：目前仅验证 Windows、Node 24 和 Qt 6.8.3+ MinGW 13.1；只支持 OpenAI-compatible Chat Completions；没有 MCP、插件、子 Agent、远程执行或系统级沙箱，命令仍以当前用户权限运行。
