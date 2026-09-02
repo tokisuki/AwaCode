@@ -4,6 +4,7 @@ import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 
 import { parseCliArguments } from "./arguments.ts";
+import { formatCliError } from "./error-format.ts";
 import { formatCoreNotification, formatLoadedSession } from "./presentation.ts";
 import { selectNodeExecutable } from "./runtime-selection.ts";
 import {
@@ -94,7 +95,7 @@ async function run(): Promise<void> {
   if (interrupted) process.exitCode = 130;
 }
 
-await run().catch(() => {
-  process.stderr.write("AwaCode CLI failed.\n");
+await run().catch((error: unknown) => {
+  process.stderr.write(`${formatCliError(error)}\n`);
   process.exitCode = 1;
 });
