@@ -11,6 +11,7 @@
 #include "ToolTimelineModel.h"
 
 class AgentProcessManager;
+class ConversationView;
 class QLineEdit;
 class QListView;
 class QPlainTextEdit;
@@ -83,6 +84,7 @@ private:
   struct TranscriptEntry {
     QString text;
     QString messageId;
+    QString role = QStringLiteral("system");
     bool provisional = true;
     bool rejected = false;
   };
@@ -113,7 +115,7 @@ private:
   QPushButton *deleteSession_ = nullptr;
   QPushButton *settingsButton_ = nullptr;
   QListView *sessionView_ = nullptr;
-  QPlainTextEdit *transcript_ = nullptr;
+  ConversationView *transcript_ = nullptr;
   QPlainTextEdit *taskInput_ = nullptr;
   QPlainTextEdit *stderr_ = nullptr;
   QPushButton *run_ = nullptr;

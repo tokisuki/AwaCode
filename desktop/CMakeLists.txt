@@ -37,6 +37,7 @@ add_test(NAME awacode-rpc-codec-test COMMAND awacode-rpc-codec-test)
 add_test(NAME awacode-process-manager-test COMMAND awacode-process-manager-test)
 
 add_executable(awacode-main-window-test
+  resources.qrc
   test/tst_main_window.cpp
   src/RpcCodec.cpp
   src/AgentProcessManager.cpp
@@ -44,6 +45,7 @@ add_executable(awacode-main-window-test
   src/ToolTimelineModel.cpp
   src/ApprovalDialog.cpp
   src/SettingsDialog.cpp
+  src/ConversationView.cpp
   src/MainWindow.cpp
 )
 target_include_directories(awacode-main-window-test PRIVATE src)
@@ -74,6 +76,7 @@ target_link_libraries(awacode-real-core-probe PRIVATE Qt6::Core)
 target_sources(awacode-real-core-probe PRIVATE src/RpcCodec.cpp src/AgentProcessManager.cpp)
 
 add_executable(awacode-desktop
+  resources.qrc
   src/main.cpp
   src/RpcCodec.cpp
   src/AgentProcessManager.cpp
@@ -81,6 +84,7 @@ add_executable(awacode-desktop
   src/ToolTimelineModel.cpp
   src/ApprovalDialog.cpp
   src/SettingsDialog.cpp
+  src/ConversationView.cpp
   src/MainWindow.cpp
 )
 target_link_libraries(awacode-desktop PRIVATE Qt6::Widgets)

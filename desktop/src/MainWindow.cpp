@@ -1,27 +1,49 @@
 #include "MainWindow.h"
 
 #include <QFileDialog>
+#include <QFile>
 #include <QHBoxLayout>
 #include <QJsonArray>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListView>
 #include <QMessageBox>
+#include <QPainter>
+#include <QPainterPath>
 #include <QPlainTextEdit>
+#include <QPixmap>
 #include <QSplitter>
 #include <QTimer>
 #include <QVBoxLayout>
-#include <QTextCursor>
 
 #include "AgentProcessManager.h"
 #include "ApprovalDialog.h"
+#include "ConversationView.h"
 #include "SettingsDialog.h"
+
+namespace {
+QPixmap circularLogo(const QString &resourcePath, int size) {
+  const QPixmap source(resourcePath);
+  QPixmap result(size, size);
+  result.fill(Qt::transparent);
+  if (source.isNull()) return result;
+  QPainter painter(&result);
+  painter.setRenderHint(QPainter::Antialiasing);
+  QPainterPath clip;
+  clip.addEllipse(0, 0, size, size);
+  painter.setClipPath(clip);
+  const QPixmap scaled = source.scaled(size, size, Qt::KeepAspectRatioByExpanding, Qt::SmoothTransformation);
+  painter.drawPixmap((size - scaled.width()) / 2, (size - scaled.height()) / 2, scaled);
+  return result;
+}
+}
 
 MainWindow::MainWindow(AgentProcessManager *manager, QWidget *parent) : QMainWindow(parent) {
   manager_ = manager;
   coreAlive_ = manager_ == nullptr;
 
   auto *root = new QWidget(this);
+  root->setObjectName(QStringLiteral("appRoot"));
   auto *layout = new QVBoxLayout(root);
   auto *top = new QHBoxLayout;
   workspaceField_ = new QLineEdit(root);
@@ -40,9 +62,36 @@ MainWindow::MainWindow(AgentProcessManager *manager, QWidget *parent) : QMainWin
   top->addWidget(restart_);
   layout->addLayout(top);
 
-  auto *splitter = new QSplitter(root);
+  auto *splitter = new QSplitter(Qt::Horizontal, root);
+  splitter->setObjectName(QStringLiteral("mainSplitter"));
+  splitter->setChildrenCollapsible(false);
   auto *left = new QWidget(splitter);
+  left->setObjectName(QStringLiteral("sessionRail"));
+  left->setMinimumWidth(180);
+  left->setMaximumWidth(240);
   auto *leftLayout = new QVBoxLayout(left);
+  auto *brand = new QWidget(left);
+  brand->setObjectName(QStringLiteral("brandBlock"));
+  auto *brandLayout = new QHBoxLayout(brand);
+  brandLayout->setContentsMargins(0, 0, 0, 8);
+  auto *logo = new QLabel(brand);
+  logo->setObjectName(QStringLiteral("brandLogo"));
+  logo->setAccessibleName(QStringLiteral("AwaCode logo"));
+  logo->setFixedSize(54, 54);
+  logo->setPixmap(circularLogo(QStringLiteral(":/branding/awa.jpg"), 54));
+  auto *brandText = new QWidget(brand);
+  auto *brandTextLayout = new QVBoxLayout(brandText);
+  brandTextLayout->setContentsMargins(0, 4, 0, 4);
+  brandTextLayout->setSpacing(1);
+  auto *brandName = new QLabel(QStringLiteral("AwaCode"), brandText);
+  brandName->setObjectName(QStringLiteral("brandName"));
+  auto *brandCaption = new QLabel(QStringLiteral("Coding agent"), brandText);
+  brandCaption->setObjectName(QStringLiteral("brandCaption"));
+  brandTextLayout->addWidget(brandName);
+  brandTextLayout->addWidget(brandCaption);
+  brandLayout->addWidget(logo);
+  brandLayout->addWidget(brandText, 1);
+  leftLayout->addWidget(brand);
   auto *sessionActions = new QHBoxLayout;
   newSession_ = new QPushButton(QStringLiteral("New session"), left);
   newSession_->setObjectName(QStringLiteral("newSession"));
@@ -55,37 +104,60 @@ MainWindow::MainWindow(AgentProcessManager *manager, QWidget *parent) : QMainWin
   sessionActions->addWidget(deleteSession_);
   leftLayout->addLayout(sessionActions);
   leftLayout->addWidget(sessionView_);
-  transcript_ = new QPlainTextEdit(splitter);
-  transcript_->setReadOnly(true);
-  auto *toolView = new QListView(splitter);
-  toolView->setModel(&tools_);
-  splitter->addWidget(left);
-  splitter->addWidget(transcript_);
-  splitter->addWidget(toolView);
-  splitter->setStretchFactor(1, 1);
-  layout->addWidget(splitter, 1);
+  auto *conversationPane = new QWidget(splitter);
+  conversationPane->setObjectName(QStringLiteral("conversationPane"));
+  conversationPane->setMinimumWidth(480);
+  auto *conversationLayout = new QVBoxLayout(conversationPane);
+  transcript_ = new ConversationView(conversationPane);
+  conversationLayout->addWidget(transcript_, 1);
 
-  taskInput_ = new QPlainTextEdit(root);
+  taskInput_ = new QPlainTextEdit(conversationPane);
   taskInput_->setObjectName(QStringLiteral("taskInput"));
   taskInput_->setPlaceholderText(QStringLiteral("Describe the coding task…"));
-  layout->addWidget(taskInput_);
+  taskInput_->setMinimumHeight(92);
+  taskInput_->setMaximumHeight(132);
+  conversationLayout->addWidget(taskInput_);
   auto *bottom = new QHBoxLayout;
-  run_ = new QPushButton(QStringLiteral("Run"), root);
-  cancel_ = new QPushButton(QStringLiteral("Cancel"), root);
+  run_ = new QPushButton(QStringLiteral("Run"), conversationPane);
+  run_->setObjectName(QStringLiteral("primaryAction"));
+  cancel_ = new QPushButton(QStringLiteral("Cancel"), conversationPane);
   cancel_->setObjectName(QStringLiteral("cancel"));
   cancel_->setEnabled(false);
   bottom->addStretch();
-  bottom->addWidget(run_);
   bottom->addWidget(cancel_);
-  layout->addLayout(bottom);
-  stderr_ = new QPlainTextEdit(root);
+  bottom->addWidget(run_);
+  conversationLayout->addLayout(bottom);
+
+  auto *activityRail = new QWidget(splitter);
+  activityRail->setObjectName(QStringLiteral("activityRail"));
+  activityRail->setMinimumWidth(190);
+  activityRail->setMaximumWidth(260);
+  auto *activityLayout = new QVBoxLayout(activityRail);
+  activityLayout->addWidget(new QLabel(QStringLiteral("Activity"), activityRail));
+  auto *toolView = new QListView(activityRail);
+  toolView->setModel(&tools_);
+  activityLayout->addWidget(toolView, 1);
+  activityLayout->addWidget(new QLabel(QStringLiteral("Diagnostics"), activityRail));
+  stderr_ = new QPlainTextEdit(activityRail);
   stderr_->setReadOnly(true);
   stderr_->setPlaceholderText(QStringLiteral("Core stderr and protocol diagnostics"));
   stderr_->setMaximumBlockCount(500);
-  layout->addWidget(stderr_);
+  stderr_->setMaximumHeight(140);
+  activityLayout->addWidget(stderr_);
+
+  splitter->addWidget(left);
+  splitter->addWidget(conversationPane);
+  splitter->addWidget(activityRail);
+  splitter->setStretchFactor(0, 0);
+  splitter->setStretchFactor(1, 1);
+  splitter->setStretchFactor(2, 0);
+  splitter->setSizes({210, 820, 230});
+  layout->addWidget(splitter, 1);
   setCentralWidget(root);
   setWindowTitle(QStringLiteral("AwaCode Agent Console"));
   resize(1200, 760);
+  QFile theme(QStringLiteral(":/styles/awacode.qss"));
+  if (theme.open(QIODevice::ReadOnly | QIODevice::Text)) setStyleSheet(QString::fromUtf8(theme.readAll()));
   setConfigured(false);
 
   streamTimer_ = new QTimer(this);
@@ -127,7 +199,7 @@ MainWindow::MainWindow(AgentProcessManager *manager, QWidget *parent) : QMainWin
 
 QPushButton *MainWindow::runButton() const { return run_; }
 QPushButton *MainWindow::restartButton() const { return restart_; }
-QString MainWindow::transcriptText() const { return transcript_->toPlainText(); }
+QString MainWindow::transcriptText() const { return transcript_->plainText(); }
 QString MainWindow::toolTimelineText(int row) const { return tools_.displayText(row); }
 
 void MainWindow::setConfigured(bool configured, const QString &model) {
@@ -145,7 +217,7 @@ void MainWindow::receiveNotification(const QString &method, const QJsonObject &p
       if (candidate.messageId == messageId) entry = &candidate;
     }
     if (entry == nullptr) {
-      transcriptEntries_.append({{}, messageId, true});
+      transcriptEntries_.append({{}, messageId, QStringLiteral("assistant"), true});
       entry = &transcriptEntries_.last();
     }
     entry->text.append(params.value("delta").toString());
@@ -271,7 +343,8 @@ void MainWindow::dispatchRun(const QString &prompt) {
   dispatchPending_ = false;
   if (id.isEmpty()) { updateControls(); return; }
   currentRunRequestId_ = id;
-  appendTranscript(QStringLiteral("\nYou: %1\n").arg(prompt));
+  transcriptEntries_.append({prompt, {}, QStringLiteral("user"), false});
+  renderTranscript();
   taskInput_->clear();
   setRunning(true);
 }
@@ -399,11 +472,17 @@ void MainWindow::processResponse(const QString &method, const QJsonValue &result
       const QString text = payloadText(message);
       if (!text.isEmpty()) {
         const QJsonObject payload = message.value("payload").toObject();
-        const QString marker = payload.value("candidateStatus").toString() == QStringLiteral("rejected")
-          ? QStringLiteral("[rejected] ") : QString();
-        appendTranscript(QStringLiteral("%1: %2%3\n").arg(message.value("role").toString(), marker, text));
+        transcriptEntries_.append({
+          text,
+          {},
+          message.value("role").toString() == QStringLiteral("user")
+            ? QStringLiteral("user") : QStringLiteral("assistant"),
+          false,
+          payload.value("candidateStatus").toString() == QStringLiteral("rejected"),
+        });
       }
     }
+    renderTranscript();
     tools_.hydrate(object.value("toolCalls").toArray());
   } else if (method == QStringLiteral("session/delete")) {
     const QString deletedSessionId = object.value("sessionId").toString();
@@ -513,19 +592,17 @@ void MainWindow::updateControls() {
 }
 
 void MainWindow::appendTranscript(const QString &text) {
-  transcriptEntries_.append({text, {}, false});
+  transcriptEntries_.append({text, {}, QStringLiteral("system"), false});
   renderTranscript();
 }
 
 void MainWindow::renderTranscript() {
-  QString text;
+  QList<ConversationMessage> messages;
+  messages.reserve(transcriptEntries_.size());
   for (const TranscriptEntry &entry : transcriptEntries_) {
-    text += entry.rejected ? QStringLiteral("[rejected] %1").arg(entry.text)
-      : entry.provisional ? QStringLiteral("[provisional] %1").arg(entry.text)
-      : entry.text;
+    messages.append({entry.role, entry.text, entry.provisional, entry.rejected});
   }
-  transcript_->setPlainText(text);
-  transcript_->moveCursor(QTextCursor::End);
+  transcript_->setMessages(messages);
 }
 
 QString MainWindow::payloadText(const QJsonObject &message) const {

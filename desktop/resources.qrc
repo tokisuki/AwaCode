@@ -1,0 +1,6 @@
+<RCC>
+  <qresource prefix="/">
+    <file alias="branding/awa.jpg">../logo/awa.jpg</file>
+    <file alias="styles/awacode.qss">src/awacode.qss</file>
+  </qresource>
+</RCC>

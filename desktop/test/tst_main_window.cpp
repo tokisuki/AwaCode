@@ -1,7 +1,9 @@
 #include <QtTest>
 
 #include <QJsonArray>
+#include <QFrame>
 #include <QListView>
+#include <QLabel>
 #include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QPushButton>
@@ -13,6 +15,10 @@ class MainWindowTest final : public QObject {
   Q_OBJECT
 
 private slots:
+  void conversationPaneDominatesAndKeepsComposerDirectlyBelowMessages();
+  void userAndAssistantMessagesRenderAsOpposingConversationBubbles();
+  void loadsThePackagedAwaBrandLogo();
+  void rendersUserAndAssistantBubblesWithDistinctBrandAndNeutralSurfaces();
   void disablesRunUntilConfigured();
   void batchesMultipleProvisionalDeltasOnceAndCommitsThem();
   void hydratesPayloadMessagesAndToolCalls();
@@ -35,6 +41,95 @@ private slots:
   void deletingASelectedUnloadedSessionStillRemovesIt();
   void deleteButtonConfirmsTheSelectedSessionTitle();
 };
+
+void MainWindowTest::conversationPaneDominatesAndKeepsComposerDirectlyBelowMessages() {
+  MainWindow window;
+  window.resize(1280, 800);
+  window.show();
+  QCoreApplication::processEvents();
+
+  auto *sessionRail = window.findChild<QWidget *>(QStringLiteral("sessionRail"));
+  auto *conversationPane = window.findChild<QWidget *>(QStringLiteral("conversationPane"));
+  auto *activityRail = window.findChild<QWidget *>(QStringLiteral("activityRail"));
+  auto *conversationView = window.findChild<QWidget *>(QStringLiteral("conversationView"));
+  auto *taskInput = window.findChild<QPlainTextEdit *>(QStringLiteral("taskInput"));
+  QVERIFY(sessionRail != nullptr);
+  QVERIFY(conversationPane != nullptr);
+  QVERIFY(activityRail != nullptr);
+  QVERIFY(conversationView != nullptr);
+  QVERIFY(taskInput != nullptr);
+  QCOMPARE(conversationView->parentWidget(), conversationPane);
+  QCOMPARE(taskInput->parentWidget(), conversationPane);
+  QVERIFY(conversationPane->width() > sessionRail->width() * 2);
+  QVERIFY(conversationPane->width() > activityRail->width() * 2);
+  QVERIFY(taskInput->geometry().top() > conversationView->geometry().bottom());
+}
+
+void MainWindowTest::userAndAssistantMessagesRenderAsOpposingConversationBubbles() {
+  MainWindow window;
+  window.resize(1280, 800);
+  window.receiveResponse("session/load", QJsonObject{{"messages", QJsonArray{
+    QJsonObject{{"role", "user"}, {"payload", QJsonObject{{"text", "Inspect this project"}}}},
+    QJsonObject{{"role", "assistant"}, {"payload", QJsonObject{{"text", "I will inspect it."}}}},
+  }}});
+  window.show();
+  QCoreApplication::processEvents();
+
+  auto *conversationView = window.findChild<QWidget *>(QStringLiteral("conversationView"));
+  const auto bubbles = window.findChildren<QFrame *>(QStringLiteral("messageBubble"));
+  QCOMPARE(bubbles.size(), 2);
+  QFrame *userBubble = nullptr;
+  QFrame *assistantBubble = nullptr;
+  for (QFrame *bubble : bubbles) {
+    if (bubble->property("messageRole") == QStringLiteral("user")) userBubble = bubble;
+    if (bubble->property("messageRole") == QStringLiteral("assistant")) assistantBubble = bubble;
+  }
+  QVERIFY(conversationView != nullptr);
+  QVERIFY(userBubble != nullptr);
+  QVERIFY(assistantBubble != nullptr);
+  const int midpoint = conversationView->mapToGlobal(conversationView->rect().center()).x();
+  QVERIFY(userBubble->mapToGlobal(userBubble->rect().center()).x() > midpoint);
+  QVERIFY(assistantBubble->mapToGlobal(assistantBubble->rect().center()).x() < midpoint);
+}
+
+void MainWindowTest::loadsThePackagedAwaBrandLogo() {
+  MainWindow window;
+  auto *logo = window.findChild<QLabel *>(QStringLiteral("brandLogo"));
+  QVERIFY(logo != nullptr);
+  QVERIFY(!logo->pixmap().isNull());
+  QCOMPARE(logo->accessibleName(), QStringLiteral("AwaCode logo"));
+  QVERIFY(logo->pixmap().width() >= 48);
+  QVERIFY(logo->pixmap().height() >= 48);
+}
+
+void MainWindowTest::rendersUserAndAssistantBubblesWithDistinctBrandAndNeutralSurfaces() {
+  MainWindow window;
+  window.resize(1280, 800);
+  window.receiveResponse("session/load", QJsonObject{{"messages", QJsonArray{
+    QJsonObject{{"role", "user"}, {"payload", QJsonObject{{"text", "User message"}}}},
+    QJsonObject{{"role", "assistant"}, {"payload", QJsonObject{{"text", "Assistant message"}}}},
+  }}});
+  window.show();
+  QCoreApplication::processEvents();
+
+  QFrame *userBubble = nullptr;
+  QFrame *assistantBubble = nullptr;
+  for (QFrame *bubble : window.findChildren<QFrame *>(QStringLiteral("messageBubble"))) {
+    if (bubble->property("messageRole") == QStringLiteral("user")) userBubble = bubble;
+    if (bubble->property("messageRole") == QStringLiteral("assistant")) assistantBubble = bubble;
+  }
+  QVERIFY(userBubble != nullptr);
+  QVERIFY(assistantBubble != nullptr);
+  const QImage userImage = userBubble->grab().toImage();
+  const QImage assistantImage = assistantBubble->grab().toImage();
+  const QColor userColor = userImage.pixelColor(userImage.width() - 8, userImage.height() / 2);
+  const QColor assistantColor = assistantImage.pixelColor(assistantImage.width() - 8, assistantImage.height() / 2);
+  QVERIFY(userColor.blue() > userColor.red() + 20);
+  QVERIFY(qAbs(assistantColor.red() - assistantColor.green()) < 8);
+  QVERIFY(qAbs(assistantColor.green() - assistantColor.blue()) < 8);
+  QVERIFY(assistantColor.lightness() > 210);
+  QVERIFY(userColor != assistantColor);
+}
 
 void MainWindowTest::disablesRunUntilConfigured() {
   MainWindow window;
