@@ -86,6 +86,14 @@ $env:AWACODE_NODE_PATH = "C:\path\to\node24.exe"
 
 首次打开时可浏览历史，但没有完整模型配置就不能运行任务。桌面端显示计划、流式文本、工具时间线和 Core stderr，支持取消与手动重启 Core；它不直接调用模型或执行工具。发布给另一台 Windows 机器时使用同一 kit 的 `windeployqt` 收集 Qt DLL，同时随发布目录提供已构建的 `core/dist/`、`core/node_modules/` 与可配置的 Node 24 运行时；完整清单见 [部署说明](docs/DEPLOYMENT.md)。
 
+完成一次 Core 依赖安装和 Qt 构建后，可直接双击仓库根目录的 `start-awacode.cmd`。脚本会寻找 Node 24、重新编译 Core、检查已部署的 Qt 客户端，然后启动桌面端；桌面端再通过 `QProcess` 启动并管理 Core。只检查环境而不启动时执行：
+
+```powershell
+.\start-awacode.cmd --check
+```
+
+若系统 PATH 中的 Node 不是 24，可先设置 `AWACODE_NODE_PATH` 指向 Node 24 的 `node.exe`。脚本检测到已有 `awacode-desktop.exe` 进程时不会重复启动。
+
 ## 数据、凭据与安全边界
 
 默认数据根目录是 `%LOCALAPPDATA%\AwaCode\`，不会写进选定的代码工作区：
