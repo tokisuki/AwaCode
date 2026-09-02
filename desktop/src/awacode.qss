@@ -140,6 +140,77 @@ QPushButton#primaryAction:hover {
   border-color: #3e63d4;
 }
 
+QDialog#approvalDialog {
+  background-color: #ffffff;
+  color: #20242c;
+}
+
+QLabel#approvalTitle {
+  color: #20242c;
+  font-size: 18px;
+  font-weight: 700;
+}
+
+QLabel#approvalDescription {
+  color: #69707d;
+}
+
+QLabel#approvalSectionLabel {
+  color: #4f5663;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+QPlainTextEdit#approvalCommand {
+  padding: 11px 12px;
+  background-color: #f3f4f6;
+  border: 1px solid #d9dce3;
+  border-radius: 9px;
+  color: #20242c;
+}
+
+QFrame#approvalDetails {
+  background-color: #f8f9fb;
+  border: 1px solid #e3e5ea;
+  border-radius: 9px;
+}
+
+QFrame#approvalDetails QLabel {
+  color: #555c68;
+}
+
+QLabel#approvalCwd,
+QLabel#approvalTimeout {
+  color: #20242c;
+  font-weight: 600;
+}
+
+QLabel#approvalWarning {
+  padding: 10px 12px;
+  background-color: #f1f3f6;
+  border-left: 3px solid #7c8491;
+  color: #555c68;
+}
+
+QPushButton#approvalAllow {
+  min-width: 92px;
+  background-color: #496fe3;
+  border-color: #496fe3;
+  color: #ffffff;
+  font-weight: 700;
+}
+
+QPushButton#approvalAllow:hover {
+  background-color: #3e63d4;
+  border-color: #3e63d4;
+}
+
+QPushButton#approvalAllow:disabled {
+  background-color: #dfe2e8;
+  border-color: #dfe2e8;
+  color: #8b919b;
+}
+
 QSplitter::handle {
   background-color: transparent;
   width: 8px;

@@ -2,6 +2,8 @@
 
 #include <QLineEdit>
 #include <QDialogButtonBox>
+#include <QLabel>
+#include <QPlainTextEdit>
 #include <QPushButton>
 
 #include "ApprovalDialog.h"
@@ -16,6 +18,8 @@ private slots:
   void saveRemainsOpenUntilResponseIsPresented();
   void canExplicitlyRemoveAStoredCredential();
   void approvalDefaultsToDeny();
+  void approvalShowsTheParsedCommandInsteadOfJson();
+  void approvalCannotAllowAMissingCommand();
 };
 
 void DialogsTest::settingsUseCoreCredentialDto() {
@@ -77,6 +81,43 @@ void DialogsTest::canExplicitlyRemoveAStoredCredential() {
 
 void DialogsTest::approvalDefaultsToDeny() {
   ApprovalDialog dialog(QJsonObject{{"title", "Run test"}, {"preview", QJsonObject{}}});
+  QCOMPARE(dialog.decision(), QStringLiteral("deny"));
+}
+
+void DialogsTest::approvalShowsTheParsedCommandInsteadOfJson() {
+  ApprovalDialog dialog(QJsonObject{
+    {"kind", "command"},
+    {"title", "Run shell command"},
+    {"preview", QJsonObject{
+      {"command", "npm test -- --runInBand"},
+      {"cwd", "packages/core"},
+      {"timeoutMs", 60000},
+      {"warning", "This command runs with current-user permissions and may access paths outside the workspace."},
+    }},
+  });
+  auto *command = dialog.findChild<QPlainTextEdit *>(QStringLiteral("approvalCommand"));
+  auto *cwd = dialog.findChild<QLabel *>(QStringLiteral("approvalCwd"));
+  auto *timeout = dialog.findChild<QLabel *>(QStringLiteral("approvalTimeout"));
+  auto *allow = dialog.findChild<QPushButton *>(QStringLiteral("approvalAllow"));
+  QVERIFY(command != nullptr);
+  QVERIFY(cwd != nullptr);
+  QVERIFY(timeout != nullptr);
+  QVERIFY(allow != nullptr);
+  QCOMPARE(command->toPlainText(), QStringLiteral("npm test -- --runInBand"));
+  QCOMPARE(cwd->text(), QStringLiteral("packages/core"));
+  QCOMPARE(timeout->text(), QStringLiteral("60 seconds"));
+  QVERIFY(allow->isEnabled());
+}
+
+void DialogsTest::approvalCannotAllowAMissingCommand() {
+  ApprovalDialog dialog(QJsonObject{
+    {"kind", "command"},
+    {"title", "Run shell command"},
+    {"preview", QJsonObject{{"cwd", "."}, {"timeoutMs", 60000}}},
+  });
+  auto *allow = dialog.findChild<QPushButton *>(QStringLiteral("approvalAllow"));
+  QVERIFY(allow != nullptr);
+  QVERIFY(!allow->isEnabled());
   QCOMPARE(dialog.decision(), QStringLiteral("deny"));
 }
 
