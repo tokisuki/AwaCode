@@ -257,6 +257,50 @@ test("Plan and serial tools commit the first tool-free Execute response without 
   }
 });
 
+test("Execute explicitly replaces Plan's read-only tool boundary before asking the model to act", async () => {
+  const f = await fixture("execute-tool-transition");
+  const order: string[] = [];
+  const registry = new ToolRegistry();
+  registry.register(scriptedTool("run_command", order));
+  let turn = 0;
+  const provider: ModelProvider = {
+    async stream(request) {
+      turn += 1;
+      if (turn === 1) return response("The Plan phase has no command tool.");
+      if (turn === 2) {
+        const system = request.messages
+          .filter((message) => message.role === "system")
+          .map((message) => message.content)
+          .join("\n");
+        const advertised = request.tools?.map((tool) => tool.function.name) ?? [];
+        if (/Plan.*read-only.*ended/is.test(system) && system.includes("run_command") && advertised.includes("run_command")) {
+          return response("", [{ id: "command-after-plan", name: "run_command", arguments: "{\"value\":\"git status\"}" }]);
+        }
+        return response("I cannot run commands because Plan had no command tool.");
+      }
+      return response("The command was executed.");
+    },
+  };
+  const orchestrator = new AgentOrchestrator({
+    store: f.store,
+    provider,
+    tools: registry,
+    permissionClient: allowPermission,
+    workspace: f.workspace,
+    contextLimit: 32_768,
+    maxOutputTokens: 4_096,
+  });
+
+  try {
+    const result = await orchestrator.run({ sessionId: f.sessionId, prompt: "Run git status" });
+    assert.equal(result.finalText, "The command was executed.");
+    assert.equal(result.toolCalls, 1);
+    assert.deepEqual(order, ["run_command:start:git status", "run_command:end:git status"]);
+  } finally {
+    f.connection.close();
+  }
+});
+
 test("Plan exhausts its read turns by forcing one tool-free plan before Execute", async () => {
   const f = await fixture("plan-finalization");
   const order: string[] = [];

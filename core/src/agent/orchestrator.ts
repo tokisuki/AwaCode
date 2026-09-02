@@ -115,7 +115,10 @@ interface ExecuteOutcome {
 
 const PLAN_PROMPT = "Inspect the workspace with the available read-only tools when useful, then return a concise actionable plan.";
 const PLAN_FINAL_PROMPT = "Read-only exploration is finished. Do not call tools. Return a concise actionable plan now.";
-const EXECUTE_PROMPT = "Execute the coding task using tools when useful. Return the final answer when work is complete.";
+const executePrompt = (definitions: readonly FunctionToolDefinition[]) => {
+  const names = definitions.map((definition) => definition.function.name).join(", ") || "none";
+  return `The Plan phase's read-only tool restriction has ended. The current Execute tools are: ${names}. Execute the coding task using these current tools when useful; do not rely on Plan statements that a current tool was unavailable. Return the final answer when work is complete.`;
+};
 const PLAN_TOOL_NAMES = new Set(["list_files", "read_file", "search_text"]);
 const MAX_PLAN_TURNS = 12;
 const MAX_EXECUTE_TURNS = 12;
@@ -393,6 +396,8 @@ export class AgentOrchestrator {
     sessionId: string,
     currentUserMessageId: string,
   ): Promise<ExecuteOutcome> {
+    const definitions = toolDefinitions(this.options.tools);
+    const instruction = executePrompt(definitions);
     while (true) {
       if (this.executeTurns >= MAX_EXECUTE_TURNS) {
         return { turn: await this.closingTurn(sessionId, currentUserMessageId, "execute_turn_limit"), stopReason: "execute_turn_limit" };
@@ -402,8 +407,8 @@ export class AgentOrchestrator {
         sessionId,
         currentUserMessageId,
         "execute",
-        toolDefinitions(this.options.tools),
-        EXECUTE_PROMPT,
+        definitions,
+        instruction,
         true,
       );
       if (turn.response.toolCalls.length === 0) {
