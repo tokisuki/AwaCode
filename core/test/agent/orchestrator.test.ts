@@ -881,30 +881,94 @@ test("a run atomically binds non-secret model metadata to its session and persis
   } finally { f.connection.close(); }
 });
 
-test("unexpected Plan tool calls are rejected but first settled into complete history", async () => {
+test("an unavailable Plan tool is returned to the model as a failure without ending the run", async () => {
   const f = await fixture("plan-tool-call");
+  const registry = new ToolRegistry();
+  registry.register(runCommandTool);
+  let permissionRequests = 0;
   const provider = new ScriptedProvider([
-    response("", [{ id: "plan-call", name: "missing_tool", arguments: "{}" }]),
+    response("", [{ id: "plan-call", name: "run_command", arguments: "{\"command\":\"echo never\"}" }]),
+    response("Inspect the project using read-only tools, then explain it."),
+    response("The project has been inspected."),
   ]);
   const orchestrator = new AgentOrchestrator({
     store: f.store,
     provider,
-    tools: new ToolRegistry(),
-    permissionClient: allowPermission,
+    tools: registry,
+    permissionClient: {
+      async requestPermission() {
+        permissionRequests += 1;
+        return "allow_once";
+      },
+    },
     workspace: f.workspace,
     contextLimit: 32_768,
     maxOutputTokens: 4_096,
   });
 
   try {
-    await assert.rejects(orchestrator.run({ sessionId: f.sessionId, prompt: "Plan" }),
-      (error: unknown) => error instanceof Error && error.message === "Plan returned an unavailable tool call.");
+    const result = await orchestrator.run({ sessionId: f.sessionId, prompt: "Plan" });
+    assert.equal(result.status, "completed");
+    assert.equal(result.finalText, "The project has been inspected.");
+    assert.equal(permissionRequests, 0);
     const loaded = f.store.loadSession(f.sessionId);
-    assert.equal(loaded.session.status, "error");
+    assert.equal(loaded.session.status, "completed");
     assert.deepEqual(loaded.toolCalls.map((call) => [call.callId, call.status, call.result !== null]), [
       ["plan-call", "failure", true],
     ]);
-    assert.equal(provider.requests.length, 1);
+    assert.equal(provider.requests.length, 3);
+    assert.equal(provider.requests[1]!.messages.some((message) => message.role === "tool"
+      && message.toolCallId === "plan-call"
+      && message.content.includes("unavailable during Plan")), true);
+  } finally {
+    f.connection.close();
+  }
+});
+
+test("a mixed Plan tool block executes read-only calls and rejects only unavailable calls", async () => {
+  const f = await fixture("mixed-plan-tool-call");
+  await writeFile(join(f.workspace.rootPath, "README.md"), "AwaCode fixture", "utf8");
+  const registry = new ToolRegistry();
+  registry.register(readFileTool);
+  registry.register(runCommandTool);
+  const provider = new ScriptedProvider([
+    response("", [
+      { id: "plan-read", name: "read_file", arguments: "{\"path\":\"README.md\"}" },
+      { id: "plan-command", name: "run_command", arguments: "{\"command\":\"echo never\"}" },
+    ]),
+    response("Use the README content to explain the project."),
+    response("AwaCode fixture is a coding-agent project."),
+  ]);
+  const orchestrator = new AgentOrchestrator({
+    store: f.store,
+    provider,
+    tools: registry,
+    permissionClient: {
+      async requestPermission() {
+        throw new Error("Plan must not request command approval");
+      },
+    },
+    workspace: f.workspace,
+    contextLimit: 32_768,
+    maxOutputTokens: 4_096,
+  });
+
+  try {
+    const result = await orchestrator.run({ sessionId: f.sessionId, prompt: "Describe the project" });
+    assert.equal(result.status, "completed");
+    assert.equal(result.toolCalls, 1);
+    const loaded = f.store.loadSession(f.sessionId);
+    assert.deepEqual(loaded.toolCalls.map((call) => [call.callId, call.status]), [
+      ["plan-read", "success"],
+      ["plan-command", "failure"],
+    ]);
+    const followUp = provider.requests[1]!.messages;
+    assert.equal(followUp.some((message) => message.role === "tool"
+      && message.toolCallId === "plan-read"
+      && message.content.includes("AwaCode fixture")), true);
+    assert.equal(followUp.some((message) => message.role === "tool"
+      && message.toolCallId === "plan-command"
+      && message.content.includes("unavailable during Plan")), true);
   } finally {
     f.connection.close();
   }

@@ -372,10 +372,6 @@ export class AgentOrchestrator {
         });
         return null;
       }
-      if (plan.response.toolCalls.some((call) => !availableNames.has(call.name))) {
-        await this.persistRejectedToolCalls(plan, sessionId, "Only advertised read-only tools are allowed during Plan.");
-        throw new AgentRunError("Plan returned an unavailable tool call.");
-      }
       this.options.store.finalizeStreamingAssistantWithToolCalls({
         messageId: plan.message.id,
         payload: this.messagePayload(plan.response.content, "plan", this.reasoningPayload(plan.response)),
@@ -388,6 +384,10 @@ export class AgentOrchestrator {
       });
       let limitReached = false;
       for (const [ordinal, call] of plan.response.toolCalls.entries()) {
+        if (!availableNames.has(call.name)) {
+          await this.settleUnavailablePlanTool(call.id, ordinal, call.name, [...availableNames]);
+          continue;
+        }
         if (this.executedToolCalls >= MAX_TOOL_EXECUTIONS) {
           limitReached = true;
           await this.settleNonExecuted(call.id, ordinal, call.name, "tool_call_limit");
@@ -528,6 +528,27 @@ export class AgentOrchestrator {
   ): Promise<void> {
     await this.emit("tool/start", { callId, ordinal, name });
     const result = failureResult("Tool call was not executed because the agent reached a safety bound.", reason);
+    transitionToolCall(this.options.store, {
+      callId,
+      expectedStatus: "pending",
+      status: "failure",
+      result,
+    });
+    await this.toolEnd(callId, ordinal, name, result);
+  }
+
+  private async settleUnavailablePlanTool(
+    callId: string,
+    ordinal: number,
+    name: string,
+    availableNames: readonly string[],
+  ): Promise<void> {
+    await this.emit("tool/start", { callId, ordinal, name });
+    const available = availableNames.length === 0 ? "none" : availableNames.join(", ");
+    const result = failureResult(
+      `Tool '${name}' is unavailable during Plan. Available read-only tools: ${available}. Return a plan or use one of these tools.`,
+      "tool_unavailable_in_plan",
+    );
     transitionToolCall(this.options.store, {
       callId,
       expectedStatus: "pending",
