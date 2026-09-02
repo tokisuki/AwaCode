@@ -7,4 +7,4 @@ AwaCode：本地桌面编程智能体
 
 会话、消息、工具状态和上下文快照持久化到 SQLite，桌面端支持新建、切换和删除会话。崩溃后未完成调用会收敛为 interrupted，历史可以恢复，但不会自动重放写文件或命令。上下文按用户配置的窗口预算构建，超限时生成替换式滚动摘要。长期记忆分为项目级和全局级，仅在用户明确要求记住、更新或忘记时写入，项目记忆优先，避免自动提炼造成污染。Qt 界面还展示流式纯文本回复、工具时间线、取消和 Core 重启状态。
 
-限制：目前仅验证 Windows、Node 24 和 Qt 6.8.3+ MinGW 13.1；只支持 OpenAI-compatible Chat Completions；没有 MCP、插件、子 Agent、远程执行或系统级沙箱，命令仍以当前用户权限运行。
+限制：目前仅支持 Windows、Node 24 和 Qt 6.8.3+ MinGW 13.1；只支持 OpenAI-compatible Chat Completions
